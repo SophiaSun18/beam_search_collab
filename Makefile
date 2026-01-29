@@ -7,8 +7,10 @@ CXXSTD    := c++20
 NVFLAGS   := -std=$(CXXSTD) -O3 -arch=$(ARCH)
 INCLUDES  := -I.
 
+HEADERS_DIR := include/
+
 SOURCES   := main.cu beam_gpu_base.cu
-HEADERS   := index.hpp utils.cuh search_bitonic.cuh
+HEADERS   := $(HEADERS_DIR)index.hpp $(HEADERS_DIR)utils.cuh $(HEADERS_DIR)search_bitonic.cuh
 
 .PHONY: all debug clean test_siftsmall test_sift1m
 
