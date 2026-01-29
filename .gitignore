@@ -1,2 +1,5 @@
 # ignore local dataset directory
 data/
+
+*.log
+*.out
