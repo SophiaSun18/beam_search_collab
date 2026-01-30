@@ -67,9 +67,10 @@ static __global__ void BeamSearch(
     INDEX_T* NEXT_EXPANDERS = (INDEX_T*)(HASH_TABLE + hashtable_getsize(BITLEN));
 
     // initialize the block-wise total distance computation count
-    // __shared__ size_t local_dist_cmps;
-    // if (tid == 0) local_dist_cmps = CANDIDATE_BUFFER_SIZE;
-    // __syncthreads();
+    __shared__ gpu_long_t block_dist_comp;
+    if (tid == 0) block_dist_comp = 0;
+    __syncthreads();
+    gpu_long_t warp_dist_comp = 0;
 
     // initialize the hash table to record visited (computed) nodes
     hashtable_init(HASH_TABLE, BITLEN);
@@ -85,6 +86,7 @@ static __global__ void BeamSearch(
         CANDIDATE_INDEX[i] = d_starting_points[i];
         DISTANCE_T dist = warp_l2_distance(dim, query, d_data + CANDIDATE_INDEX[i] * dim);
         if (lane_id == 0) {     // warp computes, only lane 0 writes
+            warp_dist_comp++;
             hashtable_insert(HASH_TABLE, BITLEN, CANDIDATE_INDEX[i]);
             CANDIDATE_DISTANCE[i] = dist;
         }
@@ -144,7 +146,10 @@ static __global__ void BeamSearch(
 
             // if current node is new in hash table, compute and store its distance
             DISTANCE_T dist = warp_l2_distance(dim, query, d_data + n * dim);
-            if (lane_id == 0) CANDIDATE_DISTANCE[i] = dist;
+            if (lane_id == 0) {
+                warp_dist_comp++;
+                CANDIDATE_DISTANCE[i] = dist;
+            }
         }
         __syncthreads();
 
@@ -157,4 +162,8 @@ static __global__ void BeamSearch(
     for (int i = tid; i < K; i += blockDim.x) {
         d_results[query_id * K + i] = TOP_K_INDEX[i] & ~0x80000000;
     }
+
+    if (lane_id == 0) atomicAdd(&block_dist_comp, warp_dist_comp);
+    __syncthreads();
+    if (tid == 0) atomicAdd(d_total_count_dc, block_dist_comp);
 }
