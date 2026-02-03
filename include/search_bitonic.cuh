@@ -2,7 +2,7 @@
 #include "utils.cuh"
 #include "distance.cuh"
 #include <cuda_runtime.h>
-#define BEAM_SIZE       100
+#define BEAM_SIZE       128
 #define INTERNAL_TOPK   128
 #define SEARCH_WIDTH    1     // MAX: 2 nodes * 32 degree = 64 neighbors = CANDIDATE_BUFFER_SIZE
 #define BITLEN          10

@@ -5,31 +5,13 @@
 #include <chrono>
 
 #include "include/index.hpp"
+#include "include/utils.hpp"
 #include "include/search_bitonic.cuh"
-
-float compute_recall(const vid_t* results, const int* groundtruth, 
-                     int nq, int k, int gt_k) {
-    int64_t correct = 0;
-    
-    for (int q = 0; q < nq; q++) {
-        for (int i = 0; i < k; i++) {
-            int res_id = results[q * k + i];
-            for (int j = 0; j < k && j < gt_k; j++) {
-                if (res_id == groundtruth[q * gt_k + j]) {
-                    correct++;
-                    break;
-                }
-            }
-        }
-    }
-    
-    return (float)correct / (nq * k);
-}
 
 int main(int argc, char** argv) {
     if (argc < 5) {
         std::cerr << "Usage: " << argv[0] 
-                  << " <data.fvecs> <query.fvecs> <gt.ivecs> <graph_prefix> [K=100] [beam_size=64]\n";
+                  << " <data.fvecs> <query.fvecs> <gt.ivecs> <graph_prefix> [K=100] [beam_size=128]\n";
         return 1;
     }
     
@@ -58,7 +40,8 @@ int main(int argc, char** argv) {
     IndexGraph<float> index;
     
     std::cout << "Loading graph...\n";
-    index.load_graph(graph_prefix);
+    // index.load_graph(graph_prefix);
+    index.load_graph_index(graph_prefix);
     
     std::cout << "Loading data...\n";
     index.load_data(data_file);

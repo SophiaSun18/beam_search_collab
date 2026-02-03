@@ -5,6 +5,7 @@
 #include <cassert>
 #include <cstdint>
 #include <string>
+#include "utils.hpp"
 
 typedef uint32_t vid_t;
 
@@ -24,6 +25,21 @@ public:
 
     // Get data pointer
     T* get_data_ptr() { return data.data(); }
+
+    // Load graph file (.bin built from ScaleANN)
+    void load_graph_index(const char* gFile) {
+        size_t nt = 0, deg = 0;
+        vid_t* edge_data = read_bin<vid_t>(gFile, nt, deg);
+
+        ntotal = nt;
+        maxDeg = deg;
+        edges.assign(edge_data, edge_data + ntotal * maxDeg);
+
+        std::cout << "Loaded graph index from " << gFile 
+                  << ": ntotal = " << ntotal << ", maxDeg = " << maxDeg << std::endl;
+
+        delete[] edge_data;
+    }
 
     // Load graph file (.meta.txt + .edge.bin format)
     void load_graph(const std::string& prefix) {
