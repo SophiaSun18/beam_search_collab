@@ -35,7 +35,7 @@ public:
         maxDeg = deg;
         edges.assign(edge_data, edge_data + ntotal * maxDeg);
 
-        std::cout << "Loaded graph index from " << gFile 
+        std::cout << "Loading graph index from " << gFile 
                   << ": ntotal = " << ntotal << ", maxDeg = " << maxDeg << std::endl;
 
         delete[] edge_data;
@@ -118,7 +118,6 @@ public:
         }
         f.close();
         
-        std::cout << "Data loaded: " << ntotal << " vectors" << std::endl;
     }
 
     // Load query vectors
@@ -180,6 +179,8 @@ public:
             f.read(reinterpret_cast<char*>(&gt[i * k]), k * sizeof(int));
         }
         f.close();
+
+        std::cout << "Loading ground truth: nq=" << nq << ", k=" << k << std::endl;
         
         return gt;
     }
