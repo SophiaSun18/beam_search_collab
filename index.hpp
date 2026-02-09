@@ -17,6 +17,7 @@ public:
     int d;                   // vector dimension
     int maxDeg;              // maximum degree
     MetricType metric;       // distance metric type
+    std::string graph_prefix; // graph path prefix (for sidecar files)
     std::vector<vid_t> edges; // adjacency list (ntotal * maxDeg)
     std::vector<T> data;     // data vectors (ntotal * d)
 
@@ -27,6 +28,7 @@ public:
 
     // Load graph file (.meta.txt + .edge.bin format)
     void load_graph(const std::string& prefix) {
+        graph_prefix = prefix;
         // Read meta file
         std::string meta_file = prefix + ".meta.txt";
         std::ifstream f_meta(meta_file);

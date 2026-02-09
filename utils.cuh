@@ -11,16 +11,11 @@
 #define WARP_SIZE     32
 #define LOG_WARP_SIZE 5
 #define WARPS_PER_BLOCK (BLOCK_SIZE / WARP_SIZE)
-//#define FLT_MAX 3.40282347e+38
-
 #define MAX_INDEX UINT_MAX
-
 #define SHFL_DOWN(val, offset) __shfl_down_sync(FULL_MASK, val, offset)
 #define SHFL(val, lane) __shfl_sync(FULL_MASK, val, lane)
 #define SHFL_XOR(val, mask) __shfl_xor_sync(FULL_MASK, val, mask)
-
 typedef unsigned long long gpu_long_t; // for counters
-
 #define CUDA_RT_CALL(call)                                                                  \
     {                                                                                       \
         cudaError_t cudaStatus = call;                                                      \
@@ -33,7 +28,6 @@ typedef unsigned long long gpu_long_t; // for counters
             exit( cudaStatus );                                                             \
         }                                                                                   \
     }
-
 #  define CUDA_SAFE_CALL_NO_SYNC( call) {                                      \
     cudaError err = call;                                                      \
     if( cudaSuccess != err) {                                                  \
@@ -50,23 +44,23 @@ typedef unsigned long long gpu_long_t; // for counters
         fprintf(stderr, "Cuda error in file '%s' in line %i : %s.\n",          \
                 __FILE__, __LINE__, cudaGetErrorString( err) );                \
     } }
-
 template <typename T>
 class GraphGPU {
-typedef uint32_t vid_t;
+  using vid_t = uint32_t;
 protected:
-  vid_t nv;           // number of vertices
-  vid_t maxDeg;       // maximun degree
-  vid_t *d_edges;
+  vid_t nv{0};           // number of vertices
+  vid_t maxDeg{0};       // maximum degree
+  vid_t* d_edges{nullptr};
 public:
-  GraphGPU(int n, int d, vid_t *h_edges) : nv(n), maxDeg(d) {
-    CUDA_SAFE_CALL(cudaMalloc((void **)&d_edges, n * d * sizeof(vid_t)));
-    CUDA_SAFE_CALL(cudaMemcpy(d_edges, h_edges, n * d * sizeof(vid_t), cudaMemcpyHostToDevice));
-    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+  GraphGPU() = default;
+  __host__ __forceinline__ GraphGPU(vid_t n, vid_t d, vid_t* d_edges_in)
+      : nv(n), maxDeg(d), d_edges(d_edges_in) {}
+
+  inline __device__ __host__ vid_t V() const { return nv; }
+  inline __device__ __host__ vid_t get_max_degree() const { return maxDeg; }
+  inline __device__ __host__ vid_t* N(vid_t vid) const {
+    return d_edges + static_cast<size_t>(vid) * static_cast<size_t>(maxDeg);
   }
-  inline __device__ __host__ vid_t V() { return nv; }
-  inline __device__ __host__ vid_t get_max_degree() { return maxDeg; }
-  inline __device__ __host__ vid_t* N(vid_t vid) { return d_edges + vid * maxDeg; }
 };
 
 template <typename T = float>
@@ -83,6 +77,49 @@ __device__ __forceinline__ T warp_l2_distance(int dim, const T* a, const T* b) {
   sum += SHFL_DOWN(sum, 1); 
   sum  = SHFL(sum, 0); 
   return sum;
+}
+__device__ __forceinline__ float warp_l2_distance_128(const float* __restrict__ a,
+                                                      const float* __restrict__ b) {
+  const int lane = threadIdx.x & (WARP_SIZE - 1);
+  const float4 av = reinterpret_cast<const float4*>(a)[lane];
+  const float4 bv = reinterpret_cast<const float4*>(b)[lane];
+  float dx0 = av.x - bv.x;
+  float dx1 = av.y - bv.y;
+  float dx2 = av.z - bv.z;
+  float dx3 = av.w - bv.w;
+  float sum = fmaf(dx0, dx0, fmaf(dx1, dx1, fmaf(dx2, dx2, dx3 * dx3)));
+  sum += __shfl_down_sync(FULL_MASK, sum, 16);
+  sum += __shfl_down_sync(FULL_MASK, sum, 8);
+  sum += __shfl_down_sync(FULL_MASK, sum, 4);
+  sum += __shfl_down_sync(FULL_MASK, sum, 2);
+  sum += __shfl_down_sync(FULL_MASK, sum, 1);
+  return __shfl_sync(FULL_MASK, sum, 0);
+}
+__device__ __forceinline__ float subwarp8_l2_distance_128_leader(const float* __restrict__ a,
+                                                                 const float* __restrict__ b) {
+  const int lane = threadIdx.x & (WARP_SIZE - 1);
+  const int sublane = lane & 7;               // 0..7 within each 8-lane group
+  const int base = sublane * 16;              // 16 floats per thread
+  const float4* ap = reinterpret_cast<const float4*>(a + base);
+  const float4* bp = reinterpret_cast<const float4*>(b + base);
+  float sum = 0.0f;
+  #pragma unroll
+  for (int i = 0; i < 4; i++) {
+    const float4 av = ap[i];
+    const float4 bv = bp[i];
+    const float dx0 = av.x - bv.x;
+    const float dx1 = av.y - bv.y;
+    const float dx2 = av.z - bv.z;
+    const float dx3 = av.w - bv.w;
+    sum = fmaf(dx0, dx0, sum);
+    sum = fmaf(dx1, dx1, sum);
+    sum = fmaf(dx2, dx2, sum);
+    sum = fmaf(dx3, dx3, sum);
+  }
+  sum += __shfl_down_sync(FULL_MASK, sum, 4, 8);
+  sum += __shfl_down_sync(FULL_MASK, sum, 2, 8);
+  sum += __shfl_down_sync(FULL_MASK, sum, 1, 8);
+  return sum;  // only valid for sublane==0
 }
 
 /*-------------------------------------------- sort --------------------------------------------*/
@@ -380,7 +417,9 @@ __device__ inline void print_buffer(T* buffer, uint32_t buffer_size, uint32_t in
     printf("\n");
 }
 
+#ifndef SMALL_HASH_RESET_INTERVAL
 #define SMALL_HASH_RESET_INTERVAL 16
+#endif
 
 __host__ __device__ inline uint32_t hashtable_getsize(const uint32_t bitlen) {
   return 1 << bitlen;
@@ -394,29 +433,33 @@ __device__ inline void hashtable_init(INDEX_T* const table, const unsigned bitle
 }
 
 __device__ inline uint32_t hashtable_insert(INDEX_T* const table, const unsigned bitlen, const INDEX_T key) {
-    // Open addressing is used for collision resolution
     const uint32_t size     = hashtable_getsize(bitlen);
     const uint32_t bit_mask = size - 1;
-
-    // Linear probing
-    INDEX_T index             = (key ^ (key >> bitlen)) & bit_mask;
-    constexpr uint32_t stride = 1;
-
+    uint32_t h = static_cast<uint32_t>(key);
+    h ^= h >> 16;
+    h *= 0x85ebca6bu;
+    h ^= h >> 13;
+    h *= 0xc2b2ae35u;
+    h ^= h >> 16;
+    uint32_t index = h & bit_mask;
+    uint32_t stride = ((h >> bitlen) | 1u);  // odd stride => full period for power-of-two table
+    #pragma unroll 1
     for (unsigned i = 0; i < size; i++) {
-        const INDEX_T old = atomicCAS(&table[index], ~static_cast<INDEX_T>(0), key);
-        if (old == ~static_cast<INDEX_T>(0)) {
-            return 1;
-        } else if (old == key) {
-            return 0;
+        const INDEX_T cur = table[index];
+        if (cur == key) return 0;
+        if (cur == MAX_INDEX) {
+            const INDEX_T old = atomicCAS(&table[index], MAX_INDEX, key);
+            if (old == MAX_INDEX) return 1;
+            if (old == key) return 0;
         }
         index = (index + stride) & bit_mask;
     }
-  return 0;
+    return 0;
 }
 
 __device__ inline void hashtable_restore(   
     INDEX_T* const table, 
-    const unsigned BITLEN,
+    const unsigned bitlen,
     const INDEX_T* itopk_indices,
     const uint32_t itopk_size,
     const uint32_t first_tid = 0) {
@@ -424,11 +467,10 @@ __device__ inline void hashtable_restore(
   if (threadIdx.x < first_tid) return;
   for (unsigned i = threadIdx.x - first_tid; i < itopk_size; i += blockDim.x - first_tid) {
     auto key = itopk_indices[i] & ~index_msb_1_mask;  // clear most significant bit
-    hashtable_insert(table, BITLEN, key);
+    hashtable_insert(table, bitlen, key);
   }
 }
 
-// select top-N un-expanded nodes in the priority queue of size M
 static __device__ uint32_t pick_expanders(int N, INDEX_T* output_list, int M, INDEX_T* pri_queue) {
   uint32_t num_exp = 0; // number of expanders actually seleceted; must be <= N
   constexpr INDEX_T index_msb_1_mask = 0x80000000;
@@ -448,8 +490,6 @@ static __device__ uint32_t pick_expanders(int N, INDEX_T* output_list, int M, IN
       const auto i = __popc(ballot_mask & ((1 << threadIdx.x) - 1)) + num_exp;
       if (i < N) {
         output_list[i] = j;
-        //if (blockIdx.x == 0) printf("pick %d-th node %d as the %d-th parent\n", j, pri_queue[j], i);
-        // set most significant bit as used node
         pri_queue[j] |= index_msb_1_mask;
       }
     }
