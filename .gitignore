@@ -1,4 +1,6 @@
 # ignore local dataset directory
+bin/
+result/
 data/
 
 *.log

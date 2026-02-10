@@ -1,43 +1,64 @@
-NVCC      := nvcc
-TARGET    := beam_search_gpu.out
+# Compiler for CPU
+CXX = g++
+CXXFLAGS = -O3 -fopenmp -mfma -mavx512f
 
+# Compiler for GPU
+NVCC      := nvcc
 ARCH      = sm_89
 CXXSTD    := c++20
-
 NVFLAGS   := -std=$(CXXSTD) -O3 -arch=$(ARCH)
 INCLUDES  := -I.
-
 HEADERS_DIR := include/
 
-SOURCES   := main.cu beam_gpu_base.cu
-HEADERS   := $(HEADERS_DIR)index.hpp $(HEADERS_DIR)utils.cuh $(HEADERS_DIR)search_bitonic.cuh
+# Directories
+SRC_DIR = src
+BIN_DIR = bin
+$(shell mkdir -p $(BIN_DIR))   # ensure bin exists
 
-.PHONY: all debug clean test_siftsmall test_sift1m
+# CPU source files
+SRC_BASE = $(SRC_DIR)/beam_cpu_base.cpp
+SRC_PATHW = $(SRC_DIR)/beam_cpu_pathw.cpp
 
-all: $(TARGET)
+# CPU executables
+CPU_TARGETS = cpu_base cpu_pathw
 
-$(TARGET): $(SOURCES) $(HEADERS)
-	$(NVCC) $(NVFLAGS) $(INCLUDES) -o $@ $(SOURCES)
+# GPU source files
+GPU_SOURCES = main.cu beam_gpu_base.cu
+GPU_HEADERS = $(HEADERS_DIR)index.hpp $(HEADERS_DIR)utils.h $(HEADERS_DIR)search_bitonic.cuh
+GPU_TARGET = gpu_base
 
-debug:
-	$(NVCC) -std=$(CXXSTD) -g -G -arch=$(ARCH) $(INCLUDES) \
-	        -o $(TARGET)_debug $(SOURCES)
+.PHONY: all cpu gpu clean
 
+# --------------------------------------------
+# Default target: build all CPU and GPU binaries
+# --------------------------------------------
+all: cpu gpu
+
+# --------------------------------------------
+# CPU build
+# --------------------------------------------
+cpu: $(CPU_TARGETS)
+
+cpu_base: $(SRC_BASE)
+	$(CXX) $(CXXFLAGS) $^ -o $@
+	mv $@ $(BIN_DIR)/
+
+cpu_pathw: $(SRC_PATHW)
+	$(CXX) $(CXXFLAGS) $^ -o $@
+	mv $@ $(BIN_DIR)/
+
+# --------------------------------------------
+# GPU build
+# --------------------------------------------
+gpu: $(GPU_TARGET)
+
+$(GPU_TARGET): $(GPU_SOURCES) $(GPU_HEADERS)
+	$(NVCC) $(NVFLAGS) $(INCLUDES) -o $@ $(GPU_SOURCES)
+	mv $@ $(BIN_DIR)/
+
+# --------------------------------------------
+# Clean all binaries
+# --------------------------------------------
 clean:
-	rm -f $(TARGET) $(TARGET)_debug
-
-SIFTSMALL_DIR := data/siftsmall
-SIFT1M_DIR    := data/sift
-K 			  := 100
-
-test_siftsmall: $(TARGET)
-	./$(TARGET) $(SIFTSMALL_DIR)/siftsmall_base.fvecs \
-	            $(SIFTSMALL_DIR)/siftsmall_query.fvecs \
-	            $(SIFTSMALL_DIR)/siftsmall_groundtruth.ivecs \
-	            $(SIFTSMALL_DIR)/graph-d32 $(K)
-
-test_sift1m: $(TARGET)
-	./$(TARGET) $(SIFT1M_DIR)/sift_base.fvecs \
-	            $(SIFT1M_DIR)/sift_query.fvecs \
-	            $(SIFT1M_DIR)/sift_groundtruth.ivecs \
-	            $(SIFT1M_DIR)/graph-d32 $(K)
+	rm -f $(CPU_TARGETS) $(BIN_DIR)/cpu_base $(BIN_DIR)/cpu_pathw \
+	      $(BIN_DIR)/$(GPU_TARGET) *.o
