@@ -15,7 +15,6 @@ using namespace std;
 
 int K = 100;
 int BEAM_SIZE = 128;
-int MAX_SEARCH = 10000;
 int MAX_DEGREE = 32;
 int DIM = 128;
 
@@ -27,7 +26,6 @@ SearchResult beam_cpu_base(
     // initialize the search environment
     hash_filter<vidType> is_visited(BEAM_SIZE * BEAM_SIZE);     // hash table to store visited nodes
     size_t dist_cmps = 0;                                       // number of distance computations
-    int count_expanded = 0;                                     // number of expanded nodes
     new_pqueue_t<vidType> frontier(BEAM_SIZE);                  // current frontier to hold all candidates
 
     // initialize the current frontier with randomly picked starting points and compute their distances
@@ -46,13 +44,12 @@ SearchResult beam_cpu_base(
     is_visited.add(start_node);
 
     int iter = 0;
-    while (frontier.has_unexpanded() && count_expanded < MAX_SEARCH) {    
+    while (frontier.has_unexpanded()) {    
         iter++;
         // get the closest unexpanded node in the frontier
         int idx = frontier.get_next_index();
         g.prefetch_node(frontier[idx]);
         frontier.set_front_expanded();
-        count_expanded++;
 
         // expand the current node
         const vidType* neighbors = g.get_neighbors(frontier[idx]);
