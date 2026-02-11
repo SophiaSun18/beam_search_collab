@@ -112,7 +112,7 @@ SearchResult beam_cpu_pathw(
 
 RunStats run_ann_experiment_pathw(
     Graph& g, int K, size_t n_base, size_t n_query, size_t dim,
-    const float* base_vectors, const float* query_vectors, const int* groundtruth, uint32_t* signbit_table
+    const float* base_vectors, const float* query_vectors, const int* groundtruth, size_t dim_gt, uint32_t* signbit_table
 ) {
     int actual_threads = 0;
     #pragma omp parallel
@@ -152,7 +152,7 @@ RunStats run_ann_experiment_pathw(
     stats.runtime = t.Seconds();
     stats.latency = stats.runtime / n_query * 1000.0;
     stats.throughput = double(n_query) / stats.runtime;
-    stats.recall = compute_avg_recall(all_results, groundtruth, n_query, K);
+    stats.recall = compute_avg_recall(all_results, groundtruth, n_query, K, dim_gt);
     stats.total_dc = total_count_dc;
     stats.total_iter = total_hop;
 
@@ -232,7 +232,7 @@ int main(int argc, char** argv) {
     cout << "Signbit table loaded. Prune ratio = " << PRUNE_RATIO << "\n";
 
     // Run experiment
-    RunStats stats = run_ann_experiment_pathw(g, K, n_base, n_query, dim_base, base_vectors, query_vectors, groundtruth, signbit_table);
+    RunStats stats = run_ann_experiment_pathw(g, K, n_base, n_query, dim_base, base_vectors, query_vectors, groundtruth, dim_gt, signbit_table);
 
     return 0;
 }

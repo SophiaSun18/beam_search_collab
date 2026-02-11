@@ -267,11 +267,11 @@ inline int get_matching_bits(const uint32_t* a, const uint32_t* b, size_t words)
 }
 
 // compute recall@K for a single query
-inline float recall_at_k(const vector<int>& ann_result, const int* gt_ptr, int K) {
+inline float recall_at_k(const vector<int>& ann_result, const int* gt_ptr, int K, int gt_k) {
     unordered_set<int> ann_set(ann_result.begin(), ann_result.begin() + K);
 
     int hit = 0;
-    for (int i = 0; i < K; i++) {
+    for (int i = 0; i < gt_k; i++) {
         if (ann_set.count(gt_ptr[i])) hit++;
     }
     return float(hit) / K;
@@ -279,11 +279,11 @@ inline float recall_at_k(const vector<int>& ann_result, const int* gt_ptr, int K
 
 // compute average recall for all queries
 inline float compute_avg_recall(const vector<std::vector<int>>& all_results,
-                                const int* all_groundtruth, size_t n_query, int K) {
+                                const int* all_groundtruth, size_t n_query, int K, int gt_k) {
     float total_recall = 0.0f;
     for (size_t q = 0; q < n_query; q++) {
-        const int* gt_ptr = all_groundtruth + q * K;
-        total_recall += recall_at_k(all_results[q], gt_ptr, K);
+        const int* gt_ptr = all_groundtruth + q * gt_k;
+        total_recall += recall_at_k(all_results[q], gt_ptr, K, gt_k);
     }
     return total_recall / n_query;
 }

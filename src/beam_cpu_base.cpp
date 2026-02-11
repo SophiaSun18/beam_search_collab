@@ -87,7 +87,7 @@ SearchResult beam_cpu_base(
 
 RunStats run_ann_experiment_base(
     Graph& g, int K, size_t n_base, size_t n_query, size_t dim,
-    const float* base_vectors, const float* query_vectors, const int* groundtruth
+    const float* base_vectors, const float* query_vectors, const int* groundtruth, size_t dim_gt
 ) {
     int actual_threads = 0;
     #pragma omp parallel
@@ -123,7 +123,7 @@ RunStats run_ann_experiment_base(
     stats.runtime = t.Seconds();
     stats.latency = stats.runtime / n_query * 1000.0;
     stats.throughput = double(n_query) / stats.runtime;
-    stats.recall = compute_avg_recall(all_results, groundtruth, n_query, K);
+    stats.recall = compute_avg_recall(all_results, groundtruth, n_query, K, dim_gt);
     stats.total_dc = total_count_dc;
     stats.total_iter = total_hop;
 
@@ -191,7 +191,7 @@ int main(int argc, char** argv) {
     g.load_graph_index(graph_file.c_str());
 
     // Run experiment
-    RunStats stats = run_ann_experiment_base(g, K, n_base, n_query, dim_base, base_vectors, query_vectors, groundtruth);
+    RunStats stats = run_ann_experiment_base(g, K, n_base, n_query, dim_base, base_vectors, query_vectors, groundtruth, dim_gt);
     
     return 0;
 }
