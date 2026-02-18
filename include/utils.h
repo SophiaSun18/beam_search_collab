@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cassert>
 #include <cstring>
+#include <filesystem>
 #include <immintrin.h>
 
 using namespace std;
@@ -286,4 +287,46 @@ inline float compute_avg_recall(const vector<std::vector<int>>& all_results,
         total_recall += recall_at_k(all_results[q], gt_ptr, K, gt_k);
     }
     return total_recall / n_query;
+}
+
+inline void append_stats_to_csv(const std::string& filename,
+    int k, int beam, float prune_ratio, float warm_ratio, float cool_ratio,
+    int max_iter, const RunStats& stats)
+{
+    bool file_exists = std::filesystem::exists(filename);
+
+    std::ofstream out(filename, std::ios::app);
+    if (!out.is_open()) {
+        std::cerr << "Error: cannot open CSV file " << filename << "\n";
+        return;
+    }
+
+    // Write header only if file does not exist
+    if (!file_exists) {
+        out << "TopK,"
+            << "Beam,"
+            << "Prune_ratio,"
+            << "Warm_ratio,"
+            << "Cool_ratio,"
+            << "Max_iter,"
+            << "Recall,"
+            << "Runtime,"
+            << "Throughput,"
+            << "Total_dist_comp,"
+            << "Total_iter\n";
+    }
+
+    out << k << ","
+        << beam << ","
+        << prune_ratio << ","
+        << warm_ratio << ","
+        << cool_ratio << ","
+        << max_iter << ","
+        << stats.recall << ","
+        << stats.runtime << ","
+        << stats.throughput << ","
+        << stats.total_dc << ","
+        << stats.total_iter << "\n";
+
+    out.close();
 }

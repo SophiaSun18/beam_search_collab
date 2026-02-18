@@ -13,11 +13,14 @@
 #include "../include/hash_filter.hpp"
 using namespace std;
 
-int K = 100;
+// Default config. Updated during the search to use test script input.
+int K = 10;
 int BEAM_SIZE = 128;
-int MAX_DEGREE = 32;
-int DIM = 128;
 float PRUNE_RATIO = 0.125;
+float WARM_RATIO = 0.0;
+float COOL_RATIO = 0.1;
+int MAX_ITER = 1.5 * BEAM_SIZE;
+int ADJUST_PARAM = 2;
 
 SearchResult beam_cpu_pathw(
     Graph& g, int K, int npoints,
@@ -69,30 +72,47 @@ SearchResult beam_cpu_pathw(
             g.prefetch_node(frontier[idx2]);
         }
 
-        // count the matching bits for each neighbor's direction
-        for (size_t i = 0; i < g.degree; i++) {
-            vidType n = neighbors[i];
-            if (is_visited.contains(n)) continue;   // skip if already computed
-            const uint32_t* neighbor_dir = cur_node_table + i * packed_dim;
-            int matching_bits = get_matching_bits(query_dir.data(), neighbor_dir, packed_dim);
-            matching_score.emplace_back(n, matching_bits);
-        }
+        // if (iter >= MAX_ITER * WARM_RATIO) {
+        // if (iter < MAX_ITER * (1.0 - COOL_RATIO)) {
+        if (iter % ADJUST_PARAM != 0) {
+            // count the matching bits for each neighbor's direction
+            for (size_t i = 0; i < g.degree; i++) {
+                vidType n = neighbors[i];
+                if (is_visited.contains(n)) continue;   // skip if already computed
+                const uint32_t* neighbor_dir = cur_node_table + i * packed_dim;
+                int matching_bits = get_matching_bits(query_dir.data(), neighbor_dir, packed_dim);
+                matching_score.emplace_back(n, matching_bits);
+            }
 
-        // partial sort instead of full vector sort, truncate only for early iterations
-        if (iter < 128) {
-            size_t num_kept = g.degree * PRUNE_RATIO; 
-            nth_element(matching_score.begin(), matching_score.begin() + num_kept, matching_score.end());
-            matching_score.resize(num_kept);
-        }
+            // partial sort instead of full vector sort, truncate only for early iterations
+            // if (iter < 128) {
+                size_t num_kept = g.degree * PRUNE_RATIO; 
+                nth_element(matching_score.begin(), matching_score.begin() + num_kept, matching_score.end());
+                matching_score.resize(num_kept);
+            // }
 
-        // l2 distance computation for top 2 neighbors
-        for (auto node : matching_score) {
-            vidType n = node.first;
-            float dist = compute_distance_vec512(dim, d_query, d_data + n * dim);
-            is_visited.add(n);
-            dist_cmps++;
-            if (frontier.size() < BEAM_SIZE || dist < frontier.get_tail_dist()) {
-                frontier.push(n, dist);
+            // l2 distance computation for top 2 neighbors
+            for (auto node : matching_score) {
+                vidType n = node.first;
+                float dist = compute_distance_vec512(dim, d_query, d_data + n * dim);
+                is_visited.add(n);
+                dist_cmps++;
+                if (frontier.size() < BEAM_SIZE || dist < frontier.get_tail_dist()) {
+                    frontier.push(n, dist);
+                }
+            }
+        } else {    // enter the warm up or cool down stage
+            // count the exact l2 distance for each neighbor's direction
+            for (size_t i = 0; i < g.degree; i++) {
+                vidType n = neighbors[i];
+                if (is_visited.contains(n)) continue;   // skip if already computed
+                
+                float dist = compute_distance_vec512(dim, d_query, d_data + n * dim);
+                is_visited.add(n);
+                dist_cmps++;
+                if (frontier.size() < BEAM_SIZE || dist < frontier.get_tail_dist()) {
+                    frontier.push(n, dist);
+                }
             }
         }
     }
@@ -170,14 +190,24 @@ RunStats run_ann_experiment_pathw(
 int main(int argc, char** argv) {
     if (argc < 2) {
         cerr << "Usage:\n" << argv[0]
-        << " -base <base.fvecs>" << " -query <query.fvecs>" << " -gt <groundtruth.ivecs>"
-        << " -graph <graph_index>\n" << " [-signbit <signbit.bin>]"
-        << " [-beam <int>]" << " [-p_ratio <float>]\n";
+             << " -base <base.fvecs>"
+             << " -query <query.fvecs>"
+             << " -gt <groundtruth.ivecs>"
+             << " -graph <graph_index>\n"
+             << " [-signbit <signbit.bin>]"
+             << " [-topK <int>]"
+             << " [-beam <int>]"
+             << " [-p_ratio <float>]"
+             << " [-warm_ratio <float>]"
+             << " [-cool_ratio <float>]"
+             << " [-max_iter <int>]"
+             << " [-csv <output.csv>]\n";
         return 1;
     }
 
     // required input files
     string base_file, query_file, gt_file, graph_file, signbit_file;
+    string csv_file;
 
     for (int i = 1; i < argc; ++i) {
         string arg = argv[i];
@@ -197,11 +227,26 @@ int main(int argc, char** argv) {
         else if (arg == "-signbit" && i + 1 < argc) {
             signbit_file = argv[++i];
         }
+        else if (arg == "-topK" && i + 1 < argc) {
+            K = atoi(argv[++i]);
+        }
         else if (arg == "-beam" && i + 1 < argc) {
             BEAM_SIZE = atoi(argv[++i]);
         }
         else if (arg == "-p_ratio" && i + 1 < argc) {
             PRUNE_RATIO = atof(argv[++i]);
+        }
+        else if (arg == "-warm_ratio" && i + 1 < argc) {
+            WARM_RATIO = atof(argv[++i]);
+        }
+        else if (arg == "-cool_ratio" && i + 1 < argc) {
+            COOL_RATIO = atof(argv[++i]);
+        }
+        else if (arg == "-max_iter" && i + 1 < argc) {
+            MAX_ITER = atoi(argv[++i]);
+        }
+        else if (arg == "-csv" && i + 1 < argc) {
+            csv_file = argv[++i];
         }
         else {
             cerr << "Unknown or incomplete argument: " << arg << "\n";
@@ -229,10 +274,17 @@ int main(int argc, char** argv) {
     uint32_t* signbit_table = nullptr;
     size_t n_loaded, sign_bit_vector_size;
     signbit_table = read_bin<uint32_t>(signbit_file.c_str(), n_loaded, sign_bit_vector_size);
-    cout << "Signbit table loaded. Prune ratio = " << PRUNE_RATIO << "\n";
+    cout << "Parameters:\n";
+    cout << "  PRUNE_RATIO = " << PRUNE_RATIO << "\n";
+    cout << "  WARM_RATIO  = " << WARM_RATIO << "\n";
+    cout << "  COOL_RATIO  = " << COOL_RATIO << "\n";
+    cout << "  MAX_ITER    = " << MAX_ITER << "\n";
 
     // Run experiment
     RunStats stats = run_ann_experiment_pathw(g, K, n_base, n_query, dim_base, base_vectors, query_vectors, groundtruth, dim_gt, signbit_table);
 
+    if (!csv_file.empty()) {
+        append_stats_to_csv(csv_file, K, BEAM_SIZE, PRUNE_RATIO, WARM_RATIO, COOL_RATIO, MAX_ITER, stats);
+    }
     return 0;
 }

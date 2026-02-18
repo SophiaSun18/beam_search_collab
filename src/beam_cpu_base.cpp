@@ -15,8 +15,10 @@ using namespace std;
 
 int K = 100;
 int BEAM_SIZE = 128;
-int MAX_DEGREE = 32;
-int DIM = 128;
+float PRUNE_RATIO = 0.0;
+float WARM_RATIO = 0.0;
+float COOL_RATIO = 0.0;
+int MAX_ITER = 0;
 
 SearchResult beam_cpu_base(
     Graph& g, int K, int npoints,
@@ -58,7 +60,7 @@ SearchResult beam_cpu_base(
             g.prefetch_node(frontier[idx2]);
         }
 
-        // count the matching bits for each neighbor's direction
+        // count the exact l2 distance for each neighbor's direction
         for (size_t i = 0; i < g.degree; i++) {
             vidType n = neighbors[i];
             if (is_visited.contains(n)) continue;   // skip if already computed
@@ -141,13 +143,19 @@ RunStats run_ann_experiment_base(
 int main(int argc, char** argv) {
     if (argc < 2) {
         cerr << "Usage:\n" << argv[0]
-        << " -base <base.fvecs>" << " -query <query.fvecs>" << " -gt <groundtruth.ivecs>"
-        << " -graph <graph_index>\n" << " [-beam <int>]\n";
+             << " -base <base.fvecs>"
+             << " -query <query.fvecs>"
+             << " -gt <groundtruth.ivecs>"
+             << " -graph <graph_index>\n"
+             << " [-topK <int>]"
+             << " [-beam <int>]"
+             << " [-csv <output.csv>]\n";
         return 1;
     }
 
     // receive all required input files from arg
     string base_file, query_file, gt_file, graph_file;
+    string csv_file;
 
     for (int i = 1; i < argc; ++i) {
         string arg = argv[i];
@@ -164,8 +172,14 @@ int main(int argc, char** argv) {
         else if (arg == "-graph" && i + 1 < argc) {
             graph_file = argv[++i];
         }
+        else if (arg == "-topK" && i + 1 < argc) {
+            K = atoi(argv[++i]);
+        }
         else if (arg == "-beam" && i + 1 < argc) {
             BEAM_SIZE = atoi(argv[++i]);
+        }
+        else if (arg == "-csv" && i + 1 < argc) {
+            csv_file = argv[++i];
         }
         else {
             cerr << "Unknown or incomplete argument: " << arg << "\n";
@@ -193,5 +207,8 @@ int main(int argc, char** argv) {
     // Run experiment
     RunStats stats = run_ann_experiment_base(g, K, n_base, n_query, dim_base, base_vectors, query_vectors, groundtruth, dim_gt);
     
+    if (!csv_file.empty()) {
+        append_stats_to_csv(csv_file, K, BEAM_SIZE, PRUNE_RATIO=0, WARM_RATIO=0, COOL_RATIO=0, MAX_ITER=0, stats);
+    }
     return 0;
 }
