@@ -21,7 +21,7 @@ int main(int argc, char** argv) {
     const char* gt_file = argv[3];
     const char* graph_prefix = argv[4];
     int K = (argc >= 6) ? atoi(argv[5]) : 100;
-    int beam_size = (argc >= 7) ? atoi(argv[6]) : BEAM_SIZE;
+    int beam_size = (argc >= 7) ? atoi(argv[6]) : 128;
     
     cout << "========================================\n";
     cout << "GPU Beam Search Loading from: \n";
@@ -61,14 +61,15 @@ int main(int argc, char** argv) {
     vector<vid_t> results(nq * K);
     vector<float> distances(nq * K);
     
-    // Execute the search
-    cout << "\nStarting GPU beam search...\n";
-    auto start = chrono::high_resolution_clock::now();
+    // // Execute the search
+    // cout << "\nStarting GPU beam search...\n";
+    // auto start = chrono::high_resolution_clock::now();
     
-    index.search(nq, queries.data(), K, distances.data(), results.data(), beam_size);
+    double elapsed;
+    index.search(nq, queries.data(), K, distances.data(), results.data(), beam_size, elapsed);
     
-    auto end = chrono::high_resolution_clock::now();
-    double elapsed = chrono::duration<double>(end - start).count();
+    // auto end = chrono::high_resolution_clock::now();
+    // double elapsed = chrono::duration<double>(end - start).count();
     
     // Compute the performance metrics
     double qps = nq / elapsed;

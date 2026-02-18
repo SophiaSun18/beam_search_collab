@@ -8,15 +8,19 @@
 #include "include/search_bitonic.cuh"
 #endif
 
+#include <chrono>
+
+#define BEAM_SIZE       128
 #define NUM_START BEAM_SIZE // number of starting nodes
 
 template <typename T>
-void IndexGraph<T>::search(int nq, const T* queries, int K, T *result_vec, vid_t *result_idx, int beam_sz) {
+void IndexGraph<T>::search(int nq, const T* queries, int K, T *result_vec, vid_t *result_idx, int beam_sz, double& elapsed) {
   // bool use_ip = (this->metric == METRIC_IP);
   auto dim = this->d;
   auto npoints = this->ntotal;
   auto max_degree = this->maxDeg;
-  assert(beam_sz <= BEAM_SIZE); // todo: set BEAM_SIZE as user specified
+  // assert(beam_sz <= BEAM_SIZE); // todo: set BEAM_SIZE as user specified
+  BEAM_SIZE = beam_sz;
   printf("Beam search on GPU: K=%d, nq=%d, dim=%d, npoints=%ld, beam_size=%d\n", K, nq, dim, npoints, BEAM_SIZE);
 
   size_t num_threads = BLOCK_SIZE;
@@ -94,8 +98,16 @@ void IndexGraph<T>::search(int nq, const T* queries, int K, T *result_vec, vid_t
     CUDA_SAFE_CALL(cudaMalloc((void **)&d_sign_bit, sign_bit_size * sizeof(uint32_t)));
     CUDA_SAFE_CALL(cudaMemcpy(d_sign_bit, h_sign_bit, sign_bit_size * sizeof(uint32_t), cudaMemcpyHostToDevice));
   }
+
+  // Execute the search
+  printf("\nStarting GPU beam search...\n");
+  auto start = std::chrono::high_resolution_clock::now();
   BeamSearch<T><<<num_blocks, num_threads, shm_size>>>(K, nq, dim, npoints, d_queries, d_data, d_results, 
-                                                       d_total_count_dc, d_starting_points, d_seed_map, d_sign_bit, gg);
+                                                       d_total_count_dc, d_total_hops, d_starting_points, d_seed_map, d_sign_bit, gg);
+  cudaDeviceSynchronize();
+  auto end = std::chrono::high_resolution_clock::now();
+  elapsed = std::chrono::duration<double>(end - start).count();
+
 #endif
 
   CUDA_SAFE_CALL(cudaDeviceSynchronize());

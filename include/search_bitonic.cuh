@@ -2,19 +2,20 @@
 #include "utils.cuh"
 #include "distance.cuh"
 #include <cuda_runtime.h>
-#define BEAM_SIZE       128
+// #define BEAM_SIZE       128
 #define INTERNAL_TOPK   128
 #define SEARCH_WIDTH    1     // MAX: 2 nodes * 32 degree = 64 neighbors = CANDIDATE_BUFFER_SIZE
 #define BITLEN          10
 #define MAX_ITERATIONS  1024
-#define MAX_DEGREE      32
+// #define MAX_DEGREE      64
 #define TEAM_SIZE       8
 // #define HASH_SIZE       MAX_ITERATIONS * SEARCH_WIDTH * MAX_DEGREE * 2
 #define USE_SEED        0
 #define PRUNE_CONFIG    0
 #define THRESHOLD_CONFIG    0
 #define HASH_TABLE_CONFIG   1
-#define CANDIDATE_BUFFER_SIZE SEARCH_WIDTH * MAX_DEGREE
+// #define CANDIDATE_BUFFER_SIZE SEARCH_WIDTH * MAX_DEGREE
+#define CANDIDATE_BUFFER_SIZE 64
 #define RESULT_BUFFER_SIZE INTERNAL_TOPK + CANDIDATE_BUFFER_SIZE
 
 static __host__ inline uint32_t calculate_shared_mem_size(int dim, int topk, int max_deg, 
@@ -25,7 +26,7 @@ static __host__ inline uint32_t calculate_shared_mem_size(int dim, int topk, int
     size += RESULT_BUFFER_SIZE * sizeof(DISTANCE_T);        // top k and candidate distance
     size += SEARCH_WIDTH * sizeof(INDEX_T);                 // next expanders / parent buffer
     size += dim * 4;                                        // query buffer size
-    size += 1 * 4;                                          // terminate flag and counter
+    size += 2 * 4;                                          // terminate flag and counter
     printf("shared memory size: %ld\n", size);
     return size;
 }
@@ -46,6 +47,7 @@ static __global__ void BeamSearch(
     const T* __restrict__ d_data,
     vid_t* __restrict__ d_results,
     gpu_long_t* d_total_count_dc,
+    gpu_long_t* d_total_hops,
     vid_t* d_starting_points,
     vid_t* d_seed_map,
     uint32_t* d_sign_bit,
@@ -53,7 +55,7 @@ static __global__ void BeamSearch(
 ) {
     // basic information about this block and thread
     const int query_id = blockIdx.x;
-    if (query_id >= nq) return;
+    if (query_id > nq) return;
     const T* query = d_queries + query_id * dim;
     const uint32_t maxDegree = gg.get_max_degree();
     INDEX_T* d_graph_ptr = gg.N(0);
@@ -76,10 +78,14 @@ static __global__ void BeamSearch(
     INDEX_T* PARENT_LIST = (INDEX_T*)(HASH_TABLE + hashtable_getsize(BITLEN));
     DATA_T* QUERY_BUFFER = (DATA_T*)(PARENT_LIST + SEARCH_WIDTH);
     uint32_t* counter = (uint32_t*)(QUERY_BUFFER + dim);
+    uint32_t* hops = (uint32_t*)(counter + 1);
 
     // initialize the block-wise total distance computation count
     __shared__ uint32_t keep_expanding;
-    if (tid == 0) counter[0] = 0;
+    if (tid == 0) {
+        counter[0] = 0;
+        hops[0] = 0;
+    }
 
     // initialize the hash table to record visited (computed) nodes
     if (HASH_TABLE_CONFIG) hashtable_init(HASH_TABLE, BITLEN);
@@ -131,7 +137,12 @@ static __global__ void BeamSearch(
             keep_expanding = pick_expanders(SEARCH_WIDTH, PARENT_LIST, INTERNAL_TOPK, TOP_K_INDEX);
         }
         __syncthreads();
-        if (!keep_expanding) break;
+        if (!keep_expanding) {
+            if (tid == 0) {
+                hops[0] = iter;
+            }
+            break;
+        }
 
         // collect the neighbors of the expanding node and add into candidate list if not visited before
         // make sure to mark the invalid neighbor using dummy large values
@@ -177,5 +188,8 @@ static __global__ void BeamSearch(
     for (int i = tid; i < K; i += blockDim.x) {
         d_results[query_id * K + i] = TOP_K_INDEX[i] & ~0x80000000;
     }
-    if (tid == 0) atomicAdd(d_total_count_dc, gpu_long_t(counter[0]));
+    if (tid == 0) {
+        atomicAdd(d_total_count_dc, gpu_long_t(counter[0]));
+        atomicAdd(d_total_hops, gpu_long_t(hops[0]));
+    }
 }

@@ -187,5 +187,5 @@ public:
 
     // GPU search function declaration (implemented in beam_gpu_base.cu)
     void search(int nq, const T* queries, int K, T* result_vec, 
-                vid_t* result_idx, int beam_sz);
+                vid_t* result_idx, int beam_sz, double& elapsed);
 };

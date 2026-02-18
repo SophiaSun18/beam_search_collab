@@ -1,5 +1,7 @@
 # ignore local dataset directory
 bin/
+collect-result/
+csv/
 result/
 data/
 
