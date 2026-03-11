@@ -11,7 +11,9 @@
 #include <cassert>
 #include <cstring>
 #include <filesystem>
+#if defined(__AVX512F__) || defined(__AVX2__) || defined(__SSE2__)
 #include <immintrin.h>
+#endif
 
 using namespace std;
 typedef uint32_t vidType;
@@ -90,13 +92,21 @@ struct RunStats {
     double throughput;
     double recall;
     int64_t total_dc;
+    int64_t total_ds;
     int64_t total_iter;
+    int64_t total_pruned;
+    int64_t total_neighbor_pruned;
+    int64_t total_visited_pruned;
 };
 
 struct SearchResult {
     vector<int> neighbors;
     size_t dist_cmps;
+    size_t dist_est;
     size_t iters;
+    size_t pruned;
+    size_t neighbor_pruned;
+    size_t visited_pruned;
 };
 
 inline int* read_ivecs(const char* filename, size_t& n_out, size_t& d_out) {
@@ -189,6 +199,17 @@ inline void write_ibin(const char* filename, const int* data, size_t n, size_t d
     }
 }
 
+// ─── Scalar fallback distance ───────────────────────────────────────
+inline float compute_distance_scalar(int dim, const float* __restrict__ a, const float* __restrict__ b) {
+    float sum = 0.0f;
+    for (int i = 0; i < dim; i++) {
+        float d = a[i] - b[i];
+        sum += d * d;
+    }
+    return sum;
+}
+
+#ifdef __AVX2__
 // from DiskANN
 static inline float _mm256_reduce_add_ps(__m256 x) {
     /* ( x3+x7, x2+x6, x1+x5, x0+x4 ) */
@@ -202,9 +223,6 @@ static inline float _mm256_reduce_add_ps(__m256 x) {
 }
 
 inline float compute_distance_vec256(int dim, const float* __restrict__ a, const float* __restrict__ b) {
-    // a = (const float *)__builtin_assume_aligned(a, 32);
-    // b = (const float *)__builtin_assume_aligned(b, 32);
-
     // assume size is divisible by 8
     uint16_t niters = (uint16_t)(dim / 8);
     __m256 sum = _mm256_setzero_ps();
@@ -215,21 +233,18 @@ inline float compute_distance_vec256(int dim, const float* __restrict__ a, const
         _mm_prefetch((char *)(b + 8 * (j + 1)), _MM_HINT_T0);
         }
         __m256 a_vec = _mm256_loadu_ps(a + 8 * j);
-        // load b_vec
         __m256 b_vec = _mm256_loadu_ps(b + 8 * j);
-        // a_vec - b_vec
         __m256 tmp_vec = _mm256_sub_ps(a_vec, b_vec);
         sum = _mm256_fmadd_ps(tmp_vec, tmp_vec, sum);
     }
     // horizontal add sum
     return _mm256_reduce_add_ps(sum);
 }
+#endif // __AVX2__
 
+#ifdef __AVX512F__
 // adapted from DiskANN
 inline float compute_distance_vec512(int dim, const float* __restrict__ a, const float* __restrict__ b) {
-    // a = (const float *)__builtin_assume_aligned(a, 32);
-    // b = (const float *)__builtin_assume_aligned(b, 32);
-
     // assume size is divisible by 16
     uint16_t niters = (uint16_t)(dim / 16);
     __m512 sum = _mm512_setzero_ps();
@@ -246,6 +261,18 @@ inline float compute_distance_vec512(int dim, const float* __restrict__ a, const
     }
     // horizontal add sum
     return _mm512_reduce_add_ps(sum);
+}
+#endif // __AVX512F__
+
+// ─── Best-available distance function ───────────────────────────────
+inline float compute_distance(int dim, const float* __restrict__ a, const float* __restrict__ b) {
+#ifdef __AVX512F__
+    return compute_distance_vec512(dim, a, b);
+#elif defined(__AVX2__)
+    return compute_distance_vec256(dim, a, b);
+#else
+    return compute_distance_scalar(dim, a, b);
+#endif
 }
 
 inline void get_sign_bit_vec(const float* n1, const float* n2, uint32_t* out, size_t dim) {
@@ -267,6 +294,18 @@ inline int get_matching_bits(const uint32_t* a, const uint32_t* b, size_t words)
     return dist;
 }
 
+template <typename T>
+void write_bin(const char* filename, const T* data, size_t n, size_t d) {
+    std::ofstream output(filename, std::ios::binary);
+    if (!output) throw std::runtime_error("Cannot open output bin file");
+    int32_t nn = static_cast<int32_t>(n);
+    int32_t dd = static_cast<int32_t>(d);
+    output.write(reinterpret_cast<const char*>(&nn), sizeof(int32_t));
+    output.write(reinterpret_cast<const char*>(&dd), sizeof(int32_t));
+    output.write(reinterpret_cast<const char*>(data), sizeof(T) * n * d);
+    if (!output) throw std::runtime_error("Error writing bin data");
+}
+
 // compute recall@K for a single query
 inline float recall_at_k(const vector<int>& ann_result, const int* gt_ptr, int K, int gt_k) {
     unordered_set<int> ann_set(ann_result.begin(), ann_result.begin() + K);
@@ -286,12 +325,12 @@ inline float compute_avg_recall(const vector<std::vector<int>>& all_results,
         const int* gt_ptr = all_groundtruth + q * gt_k;
         total_recall += recall_at_k(all_results[q], gt_ptr, K, gt_k);
     }
-    return total_recall / n_query;
+    return total_recall / n_query * 100.0f;
 }
 
 inline void append_stats_to_csv(const std::string& filename,
-    int k, int beam, float prune_ratio, float warm_ratio, float cool_ratio,
-    int max_iter, const RunStats& stats)
+    int k, int beam, float prune_ratio, float approx_ratio,
+    const RunStats& stats)
 {
     bool file_exists = std::filesystem::exists(filename);
 
@@ -304,29 +343,35 @@ inline void append_stats_to_csv(const std::string& filename,
     // Write header only if file does not exist
     if (!file_exists) {
         out << "TopK,"
-            << "Beam,"
+            << "Beam_size,"
             << "Prune_ratio,"
-            << "Warm_ratio,"
-            << "Cool_ratio,"
-            << "Max_iter,"
-            << "Recall,"
+            << "Approx_ratio,"
             << "Runtime,"
+            << "Latency,"
             << "Throughput,"
+            << "Recall,"
             << "Total_dist_comp,"
-            << "Total_iter\n";
+            << "Total_dist_est,"
+            << "Total_iter,"
+            << "Total_pruned,"
+            << "Total_neighbor_pruned,"
+            << "Total_visited_pruned\n";
     }
 
     out << k << ","
         << beam << ","
         << prune_ratio << ","
-        << warm_ratio << ","
-        << cool_ratio << ","
-        << max_iter << ","
-        << stats.recall << ","
+        << approx_ratio << ","
         << stats.runtime << ","
+        << stats.latency << ","
         << stats.throughput << ","
+        << stats.recall << ","
         << stats.total_dc << ","
-        << stats.total_iter << "\n";
+        << stats.total_ds << ","
+        << stats.total_iter << ","
+        << stats.total_pruned << ","
+        << stats.total_neighbor_pruned << ","
+        << stats.total_visited_pruned << "\n";
 
     out.close();
 }
