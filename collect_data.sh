@@ -41,127 +41,118 @@ echo "Build done."
 # --------------------------------------------
 # Configurations
 # --------------------------------------------
-THREADS=(16)   
-TOPK=(100)                    
-# BEAM_SIZES=(32 64 96 128 160 192 224 256)  
-BEAM_SIZES=(128 192 256 320 384 448 512)                 
-PRUNE_RATIOS=(0.125 0.25 0.375 0.5 0.625 0.75)    
-# PRUNE_RATIOS=(0.125)       
-WARM_RATIOS=(0)
-# WARM_RATIOS=(0.1 0.2 0.3 0.4 0.5)
-COOL_RATIOS=(0)
-# COOL_RATIOS=(0.3 0.4 0.5 0.6 0.7)
-MAX_ITERS=(0)
-# MAX_ITERS=(64 128 192)    
-TRIALS=3                    
-
-LOG_ROOT="result/gpu_base_pathW_graph_beam_sizes"
-mkdir -p "$LOG_ROOT"
+THREADS=(16)
+TOPK=100
+BEAM_SIZES=(128 256 512)
+# PRUNE_RATIOS=(0 0.125 0.25 0.375 0.5 0.625 0.75 0.875)
+PRUNE_RATIOS=(0)
+# APPROX_RATIOS=(0 0.1 0.2 0.3 0.4 0.5)
+APPROX_RATIOS=(1)
+TRIALS=3                 
 
 BIN_DIR="bin"
+RESULT_ROOT="result/3.10"
 
 # --------------------------------------------
 # List of dataset prefixes and K values
 # --------------------------------------------
 # DATASETS=("gist" 32 "gist" 64 "sift" 32 "sift" 64 "sift10m" 32 "deep10m" 32 "deep10m" 64)
 # DATASETS=("sift" 32 "sift" 64 "gist" 32 "deep1M" 32 "deep10m" 64 "sift10m" 32)
-DATASETS=("sift" 64)
+DATASETS=("sift" 32 "sift" 64)
 
-# --------------------------------------------
-# Function to run CPU base
-# --------------------------------------------
+# ============================================================
+# Function: CPU BASE (with approx ratios)
+# ============================================================
 run_cpu_base() {
     BINARY="$BIN_DIR/cpu_base"
-    BIN_NAME=$(basename "$BINARY")
+    BIN_NAME="cpu_base"
 
     for t in "${THREADS[@]}"; do
         export OMP_NUM_THREADS=$t
 
-        for topk in "${TOPK[@]}"; do
-            for beam in "${BEAM_SIZES[@]}"; do
+        for beam in "${BEAM_SIZES[@]}"; do
+            for pr in "${PRUNE_RATIOS[@]}"; do
+                for ar in "${APPROX_RATIOS[@]}"; do
 
-                # Optional safety check (recommended)
-                if [ "$beam" -le "$topk" ]; then
-                    echo "Skipping beam=$beam for topK=$topk (beam must be > topK)"
-                    continue
-                fi
+                    CSV_FILE="${LOG_ROOT}/${PREFIX}_deg${K}_top${TOPK}_base.csv"
+                    LOG_FILE="${LOG_ROOT_2}/${BIN_NAME}_beam${beam}_threads${t}_pr${pr}_a${ar}_base.log"
+                    > "$LOG_FILE"
 
-                LOG_FILE="${LOG_DIR}/${BIN_NAME}_beam${beam}_topk${topk}_threads${t}.log"
-                > "$LOG_FILE"
+                    for ((trial=1; trial<=TRIALS; trial++)); do
+                        echo "=== Trial $trial/$TRIALS ===" >> "$LOG_FILE"
 
-                CSV_FILE="${LOG_DIR}/summary.csv"
+                        echo "$BINARY" \
+                            -base "$BASE_FILE" \
+                            -query "$QUERY_FILE" \
+                            -gt "$GT_FILE" \
+                            -graph "$GRAPH_FILE" \
+                            -beam $beam \
+                            -p_ratio $pr \
+                            -a_ratio $ar \
+                            -csv "$CSV_FILE" >> "$LOG_FILE" 2>&1
 
-                for ((trial=1; trial<=TRIALS; trial++)); do
-                    echo "=== Trial $trial/$TRIALS ===" >> "$LOG_FILE"
-                    echo "Running $BIN_NAME, dataset=$PREFIX, topK=$topk, beam=$beam, threads=$t, trial=$trial" >> "$LOG_FILE"
+                        "$BINARY" \
+                            -base "$BASE_FILE" \
+                            -query "$QUERY_FILE" \
+                            -gt "$GT_FILE" \
+                            -graph "$GRAPH_FILE" \
+                            -beam $beam \
+                            -p_ratio $pr \
+                            -a_ratio $ar \
+                            -csv "$CSV_FILE" >> "$LOG_FILE" 2>&1
 
-                    "$BINARY" \
-                        -base "$BASE_FILE" \
-                        -query "$QUERY_FILE" \
-                        -gt "$GT_FILE" \
-                        -graph "$GRAPH_FILE" \
-                        -topK $topk \
-                        -beam $beam \
-                        -csv "$CSV_FILE" >> "$LOG_FILE" 2>&1
-
-                    echo >> "$LOG_FILE"
+                        echo >> "$LOG_FILE"
+                    done
                 done
             done
         done
     done
 }
 
-# --------------------------------------------
-# Function to run CPU pathw
-# --------------------------------------------
+# ============================================================
+# Function: CPU PATHW (with approx ratios)
+# ============================================================
 run_cpu_pathw() {
     BINARY="$BIN_DIR/cpu_pathw"
-    BIN_NAME=$(basename "$BINARY")
+    BIN_NAME="cpu_pathw"
 
     for t in "${THREADS[@]}"; do
         export OMP_NUM_THREADS=$t
 
         for beam in "${BEAM_SIZES[@]}"; do
-            for topk in "${TOPK[@]}"; do
-                # Skip invalid combinations
-                if [ "$beam" -le "$topk" ]; then
-                    echo "Skipping beam=$beam for topK=$topk (beam must be > topK)"
-                    continue
-                fi
+            for pr in "${PRUNE_RATIOS[@]}"; do
+                for ar in "${APPROX_RATIOS[@]}"; do
 
-                for pr in "${PRUNE_RATIOS[@]}"; do
-                    for warm in "${WARM_RATIOS[@]}"; do
-                        for cool in "${COOL_RATIOS[@]}"; do
-                            for max_iter in "${MAX_ITERS[@]}"; do
+                    CSV_FILE="${LOG_ROOT}/${PREFIX}_deg${K}_top${TOPK}_signbit.csv"
+                    LOG_FILE="${LOG_ROOT_2}/${BIN_NAME}_beam${beam}_threads${t}_pr${pr}_a${ar}_signbit.log"
+                    > "$LOG_FILE"
 
-                                LOG_FILE="${LOG_DIR}/${BIN_NAME}_beam${beam}_topk${topk}_threads${t}_pr${pr}_warm${warm}_cool${cool}_iter${max_iter}.log"
-                                > "$LOG_FILE"
+                    for ((trial=1; trial<=TRIALS; trial++)); do
+                        echo "=== Trial $trial/$TRIALS ===" >> "$LOG_FILE"
 
-                                CSV_FILE="${LOG_DIR}/summary.csv"
+                        echo "$BINARY" \
+                            -base "$BASE_FILE" \
+                            -query "$QUERY_FILE" \
+                            -gt "$GT_FILE" \
+                            -graph "$GRAPH_FILE" \
+                            -signbit "$SIGNBIT_FILE" \
+                            -beam $beam \
+                            -p_ratio $pr \
+                            -a_ratio $ar \
+                            -csv "$CSV_FILE" >> "$LOG_FILE" 2>&1
 
-                                for ((trial=1; trial<=TRIALS; trial++)); do
-                                    echo "=== Trial $trial/$TRIALS ===" >> "$LOG_FILE"
-                                    echo "Running $BIN_NAME, dataset=$PREFIX, topK=$topk, beam=$beam, threads=$t, prune_ratio=$pr, warm_ratio=$warm, cool_ratio=$cool, max_iter=$max_iter, trial=$trial" >> "$LOG_FILE"
+                        "$BINARY" \
+                            -base "$BASE_FILE" \
+                            -query "$QUERY_FILE" \
+                            -gt "$GT_FILE" \
+                            -graph "$GRAPH_FILE" \
+                            -signbit "$SIGNBIT_FILE" \
+                            -beam $beam \
+                            -p_ratio $pr \
+                            -a_ratio $ar \
+                            -csv "$CSV_FILE" >> "$LOG_FILE" 2>&1
 
-                                    "$BINARY" \
-                                        -base "$BASE_FILE" \
-                                        -query "$QUERY_FILE" \
-                                        -gt "$GT_FILE" \
-                                        -graph "$GRAPH_FILE" \
-                                        -signbit "$SIGNBIT_FILE" \
-                                        -topK $topk \
-                                        -beam $beam \
-                                        -p_ratio $pr \
-                                        -warm_ratio $warm \
-                                        -cool_ratio $cool \
-                                        -max_iter $max_iter \
-                                        -csv "$CSV_FILE" >> "$LOG_FILE" 2>&1
-
-                                    echo >> "$LOG_FILE"
-                                done
-
-                            done
-                        done
+                        echo >> "$LOG_FILE"
                     done
                 done
             done
@@ -214,12 +205,14 @@ while [ $i -lt ${#DATASETS[@]} ]; do
     BASE_FILE="$DATA_PATH/${PREFIX}_base.fvecs"
     QUERY_FILE="$DATA_PATH/${PREFIX}_query.fvecs"
     GT_FILE="$DATA_PATH/${PREFIX}_groundtruth.ivecs"
-    GRAPH_FILE="$DATA_PATH/graph-d${K}-pathW.graph"
+    GRAPH_FILE="$DATA_PATH/graph-d${K}"
     SIGNBIT_FILE="$DATA_PATH/graph-d${K}.ref.signbit.bin"
 
     # create a separate log folder for this dataset/K
-    LOG_DIR="${LOG_ROOT}/${PREFIX}_K${K}"
-    mkdir -p "$LOG_DIR"
+    LOG_ROOT="${RESULT_ROOT}/${PREFIX}_K${K}"
+    LOG_ROOT_2="${LOG_ROOT}/log"
+    mkdir -p "$LOG_ROOT"
+    mkdir -p "$LOG_ROOT_2"
 
     # run target
     case "$RUN_TARGET" in
