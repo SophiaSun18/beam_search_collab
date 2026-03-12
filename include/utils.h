@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cassert>
 #include <cstring>
+#include <cfloat>
 #include <filesystem>
 #if defined(__AVX512F__) || defined(__AVX2__) || defined(__SSE2__)
 #include <immintrin.h>
@@ -21,6 +22,7 @@ typedef uint32_t vidType;
 template <typename T = float>
 T* read_bin(const char* filename, size_t& n_out, size_t& d_out) {
     std::ifstream input(filename, std::ios::binary);
+    printf("Reading bin file: %s\n", filename);
     if (!input) throw std::runtime_error("Cannot open bin file");
     int32_t num = 0, dim = 0;
     input.read(reinterpret_cast<char*>(&num), sizeof(int32_t));
@@ -374,4 +376,135 @@ inline void append_stats_to_csv(const std::string& filename,
         << stats.total_visited_pruned << "\n";
 
     out.close();
+}
+
+// Fast Walsh-Hadamard Transform (in-place, power-of-2 B, B >= 8)
+inline void fwht_inplace(float* data, size_t B) {
+    for (size_t len = 1; len < B; len <<= 1) {
+        for (size_t i = 0; i < B; i += len << 1) {
+            for (size_t j = 0; j < len; j++) {
+                float u = data[i + j];
+                float v = data[i + j + len];
+                data[i + j]       = u + v;
+                data[i + j + len] = u - v;
+            }
+        }
+    }
+}
+
+inline void rotate_vector(const float* src, float* dst, const float* signs, 
+                         size_t dim, size_t padded_dim) {
+    for (size_t i = 0; i < dim; ++i) {
+        dst[i] = src[i] * signs[i];
+    }
+    if (padded_dim > dim) {
+        std::fill(dst + dim, dst + padded_dim, 0.0f);
+    }
+    fwht_inplace(dst, padded_dim);
+}
+
+// adapted from SymphonyQG
+inline auto compute_centroid(
+    const float* data, size_t num_points, size_t dim, size_t num_threads)
+{
+    std::vector<std::vector<double>> all_results(num_threads, std::vector<double>(dim, 0));
+
+    #pragma omp parallel for schedule(dynamic)
+    for (size_t i = 0; i < num_points; ++i) {
+        auto tid = omp_get_thread_num();
+        std::vector<double>& cur_results = all_results[tid];
+        const float* cur_data = data + (dim * i);
+        for (size_t k = 0; k < dim; ++k) {
+            cur_results[k] += cur_data[k];
+        }
+    }
+
+    std::vector<double> centroid_d(dim, 0);
+    std::vector<float> centroid(dim, 0);
+    for (auto& one_res : all_results) {
+        for (size_t i = 0; i < dim; ++i) {
+            centroid_d[i] += one_res[i];
+        }
+    }
+    double inv_num_points = 1.0 / static_cast<double>(num_points);
+    for (size_t i = 0; i < dim; ++i) {
+        centroid[i] = static_cast<float>(centroid_d[i] * inv_num_points);
+    }
+
+    return centroid;
+}
+
+inline vidType exact_nn(const float* data, const float* query, size_t num_points,
+    size_t dim, size_t num_threads)
+{
+    std::vector<std::pair<vidType, float>> best_entries(num_threads, {0, FLT_MAX});
+
+    #pragma omp parallel for schedule(dynamic)
+    for (size_t i = 0; i < num_points; ++i) {
+        auto tid = omp_get_thread_num();
+        auto& cur_entry = best_entries[tid];
+        const float* cur_data = data + (dim * i);
+
+        float distance = compute_distance(dim, cur_data, query);
+        if (distance < cur_entry.second) {
+            cur_entry.first = static_cast<vidType>(i);
+            cur_entry.second = distance;
+        }
+    }
+
+    vidType nearest_neighbor = 0;
+    float min_dist = FLT_MAX;
+    for (auto& candi : best_entries) {
+        if (candi.second < min_dist) {
+            nearest_neighbor = candi.first;
+            min_dist = candi.second;
+        }
+    }
+    return nearest_neighbor;
+}
+
+template <typename T>
+void dump_bin_to_txt(const std::string& bin_file, const std::string& txt_file) {
+    // Open the binary file for reading
+    std::ifstream input(bin_file, std::ios::binary);
+    if (!input) {
+        throw std::runtime_error("Cannot open binary file: " + bin_file);
+    }
+
+    // Read the dimensions from the binary file
+    int32_t n, d;
+    input.read(reinterpret_cast<char*>(&n), sizeof(int32_t));
+    input.read(reinterpret_cast<char*>(&d), sizeof(int32_t));
+
+    if (n <= 0 || d <= 0) {
+        throw std::runtime_error("Invalid dimensions in binary file");
+    }
+
+    // Read the data
+    std::vector<T> data(n * d);
+    input.read(reinterpret_cast<char*>(data.data()), sizeof(T) * n * d);
+    if (!input) {
+        throw std::runtime_error("Error reading binary data");
+    }
+    input.close();
+
+    // Open the text file for writing
+    std::ofstream output(txt_file);
+    if (!output) {
+        throw std::runtime_error("Cannot open text file: " + txt_file);
+    }
+
+    // Write the data to the text file
+    for (int i = 0; i < n; ++i) {
+        for (int j = 0; j < d; ++j) {
+            output << data[i * d + j];
+            if (j < d - 1) {
+                output << " ";
+            }
+        }
+        output << "\n";
+    }
+    output.close();
+
+    std::cout << "Dumped binary file " << bin_file << " to text file " << txt_file << "\n";
 }
