@@ -1,6 +1,6 @@
 # Compiler for CPU
 CXX = g++
-CXXFLAGS = -O3 -fopenmp -mfma -mavx512f
+CXXFLAGS = -O3 -march=native -fopenmp
 
 # Compiler for GPU
 NVCC      := nvcc

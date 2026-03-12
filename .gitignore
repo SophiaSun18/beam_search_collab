@@ -3,7 +3,9 @@ bin/
 collect-result/
 csv/
 result/
+profile_result/
 data/
+scripts/
 
 *.log
 *.out

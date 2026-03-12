@@ -30,10 +30,14 @@ T* read_bin(const char* filename, size_t& n_out, size_t& d_out) {
     if (num <= 0 || dim <= 0)
         throw std::runtime_error("Invalid dimensions read from file");
     size_t total = static_cast<size_t>(num) * dim;
+    size_t row_bytes = dim * sizeof(T);
     T *data;
-    if ((dim*sizeof(T)) % 32 == 0)
-        data = (T*)aligned_alloc(32, sizeof(T) * total); // for SIMD
-    else data = new T[total];
+    if (row_bytes % 64 == 0)
+        data = static_cast<T*>(std::aligned_alloc(64, sizeof(T) * total));
+    else if (row_bytes % 32 == 0)
+        data = static_cast<T*>(std::aligned_alloc(32, sizeof(T) * total));
+    else
+        data = new T[total];
     input.read(reinterpret_cast<char*>(data), sizeof(T) * total);
     //for (size_t i = 0; i < num; i++) in.read((char*)(data+i*dim), sizeof(T)*dim);
     if (!input) throw std::runtime_error("Error reading bin vector data");
@@ -380,6 +384,112 @@ inline void append_stats_to_csv(const std::string& filename,
 
 // Fast Walsh-Hadamard Transform (in-place, power-of-2 B, B >= 8)
 inline void fwht_inplace(float* data, size_t B) {
+#ifdef __AVX512F__
+    // ---- AVX-512: 16 floats per register ----
+
+    // len=1: butterfly on adjacent pairs
+    for (size_t i = 0; i < B; i += 16) {
+        __m512 v = _mm512_load_ps(data + i);
+        __m512 s = _mm512_permute_ps(v, 0xB1); // [1,0,3,2,...,15,14]
+        __m512 add = _mm512_add_ps(v, s);
+        __m512 sub = _mm512_sub_ps(s, v);
+        __m512 r = _mm512_mask_blend_ps(0xAAAA, add, sub);
+        _mm512_store_ps(data + i, r);
+    }
+
+    // len=2: butterfly on pairs 2 apart
+    for (size_t i = 0; i < B; i += 16) {
+        __m512 v = _mm512_load_ps(data + i);
+        __m512 s = _mm512_permute_ps(v, 0x4E); // [2,3,0,1,6,7,4,5,...]
+        __m512 add = _mm512_add_ps(v, s);
+        __m512 sub = _mm512_sub_ps(s, v);
+        __m512 r = _mm512_mask_blend_ps(0xCCCC, add, sub);
+        _mm512_store_ps(data + i, r);
+    }
+
+    // len=4: butterfly on pairs 4 apart (swap 128-bit lanes pairwise)
+    for (size_t i = 0; i < B; i += 16) {
+        __m512 v = _mm512_load_ps(data + i);
+        __m512 s = _mm512_shuffle_f32x4(v, v, 0xB1); // swap 128-bit lane pairs
+        __m512 add = _mm512_add_ps(v, s);
+        __m512 sub = _mm512_sub_ps(s, v);
+        __m512 r = _mm512_mask_blend_ps(0xF0F0, add, sub);
+        _mm512_store_ps(data + i, r);
+    }
+
+    // len=8: butterfly on pairs 8 apart (swap 256-bit halves)
+    for (size_t i = 0; i < B; i += 16) {
+        __m512 v = _mm512_load_ps(data + i);
+        __m512 s = _mm512_shuffle_f32x4(v, v, 0x4E); // swap 256-bit halves
+        __m512 add = _mm512_add_ps(v, s);
+        __m512 sub = _mm512_sub_ps(s, v);
+        __m512 r = _mm512_mask_blend_ps(0xFF00, add, sub);
+        _mm512_store_ps(data + i, r);
+    }
+
+    // len >= 16: pairs in separate registers
+    for (size_t len = 16; len < B; len <<= 1) {
+        for (size_t i = 0; i < B; i += len << 1) {
+            for (size_t j = 0; j < len; j += 16) {
+                __m512 u = _mm512_load_ps(data + i + j);
+                __m512 v = _mm512_load_ps(data + i + j + len);
+                _mm512_store_ps(data + i + j,       _mm512_add_ps(u, v));
+                _mm512_store_ps(data + i + j + len,  _mm512_sub_ps(u, v));
+            }
+        }
+    }
+
+    // // Scale by 1/sqrt(B)
+    // __m512 sc = _mm512_set1_ps(1.0f / std::sqrt(static_cast<float>(B)));
+    // for (size_t i = 0; i < B; i += 16)
+    //     _mm512_store_ps(data + i, _mm512_mul_ps(_mm512_load_ps(data + i), sc));
+
+#elif defined(__AVX2__)
+    // ---- AVX2: 8 floats per register ----
+
+    // len=1: butterfly on adjacent pairs
+    for (size_t i = 0; i < B; i += 8) {
+        __m256 v = _mm256_load_ps(data + i);
+        __m256 s = _mm256_permute_ps(v, 0xB1); // [1,0,3,2,5,4,7,6]
+        __m256 r = _mm256_blend_ps(_mm256_add_ps(v, s), _mm256_sub_ps(s, v), 0xAA);
+        _mm256_store_ps(data + i, r);
+    }
+
+    // len=2: butterfly on pairs 2 apart
+    for (size_t i = 0; i < B; i += 8) {
+        __m256 v = _mm256_load_ps(data + i);
+        __m256 s = _mm256_permute_ps(v, 0x4E); // [2,3,0,1,6,7,4,5]
+        __m256 r = _mm256_blend_ps(_mm256_add_ps(v, s), _mm256_sub_ps(s, v), 0xCC);
+        _mm256_store_ps(data + i, r);
+    }
+
+    // len=4: butterfly on pairs 4 apart (swap 128-bit halves)
+    for (size_t i = 0; i < B; i += 8) {
+        __m256 v = _mm256_load_ps(data + i);
+        __m256 s = _mm256_permute2f128_ps(v, v, 0x01);
+        __m256 r = _mm256_blend_ps(_mm256_add_ps(v, s), _mm256_sub_ps(s, v), 0xF0);
+        _mm256_store_ps(data + i, r);
+    }
+
+    // len >= 8: pairs in separate registers
+    for (size_t len = 8; len < B; len <<= 1) {
+        for (size_t i = 0; i < B; i += len << 1) {
+            for (size_t j = 0; j < len; j += 8) {
+                __m256 u = _mm256_load_ps(data + i + j);
+                __m256 v = _mm256_load_ps(data + i + j + len);
+                _mm256_store_ps(data + i + j,       _mm256_add_ps(u, v));
+                _mm256_store_ps(data + i + j + len,  _mm256_sub_ps(u, v));
+            }
+        }
+    }
+
+    // Scale by 1/sqrt(B)
+    // __m256 sc = _mm256_set1_ps(1.0f / std::sqrt(static_cast<float>(B)));
+    // for (size_t i = 0; i < B; i += 8)
+    //     _mm256_store_ps(data + i, _mm256_mul_ps(_mm256_load_ps(data + i), sc));
+
+#else
+    // ---- Scalar fallback ----
     for (size_t len = 1; len < B; len <<= 1) {
         for (size_t i = 0; i < B; i += len << 1) {
             for (size_t j = 0; j < len; j++) {
@@ -390,13 +500,30 @@ inline void fwht_inplace(float* data, size_t B) {
             }
         }
     }
+    // float scale = 1.0f / std::sqrt(static_cast<float>(B));
+    // for (size_t i = 0; i < B; i++) data[i] *= scale;
+#endif
 }
 
 inline void rotate_vector(const float* src, float* dst, const float* signs, 
                          size_t dim, size_t padded_dim) {
-    for (size_t i = 0; i < dim; ++i) {
+#ifdef __AVX512F__
+    for (size_t i = 0; i + 16 <= dim; i += 16) {
+        __m512 v_src   = _mm512_load_ps(src + i);
+        __m512 v_signs = _mm512_loadu_ps(signs + i);
+        _mm512_store_ps(dst + i, _mm512_mul_ps(v_src, v_signs));
+    }
+#elif defined(__AVX2__)
+    for (size_t i = 0; i + 8 <= dim; i += 8) {
+        __m256 v_src   = _mm256_load_ps(src + i);
+        __m256 v_signs = _mm256_loadu_ps(signs + i);
+        _mm256_store_ps(dst + i, _mm256_mul_ps(v_src, v_signs));
+    }
+#else
+    for (size_t i = 0; i < dim; i++) {
         dst[i] = src[i] * signs[i];
     }
+#endif
     if (padded_dim > dim) {
         std::fill(dst + dim, dst + padded_dim, 0.0f);
     }

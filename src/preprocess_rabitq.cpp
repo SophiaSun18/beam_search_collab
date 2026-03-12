@@ -65,17 +65,23 @@ int main(int argc, char** argv) {
     // Main preprocessing loop
     #pragma omp parallel for schedule(dynamic, 1)
     for (size_t u = 0; u < g.n; u++) {
-        std::vector<float> u_rotated(padded_dim);
-        rotate_vector(base_vectors + u * dim, u_rotated.data(), signs.data(), dim, padded_dim);
+        alignas(64) float u_rotated[padded_dim] = {};
+        for (size_t i = 0; i < padded_dim; i++) {
+            u_rotated[i] = base_vectors[u * dim + i];
+        }
+        rotate_vector(u_rotated, u_rotated, signs, dim, padded_dim);
 
         const uint32_t* neighbors = g.get_neighbors(u);
         for (size_t i = 0; i < g.degree; i++) {
             uint32_t v = neighbors[i];
-            std::vector<float> v_rotated(padded_dim);
-            rotate_vector(base_vectors + v * dim, v_rotated.data(), signs.data(), dim, padded_dim);
+           alignas(64) float v_rotated[padded_dim] = {};
+            for (size_t i = 0; i < padded_dim; i++) {
+                v_rotated[i] = base_vectors[v * dim + i];
+            }
+            rotate_vector(v_rotated, v_rotated, signs.data(), dim, padded_dim);
 
             // Compute residual
-            std::vector<float> residual(dim);
+            alignas(64) float residual[dim] = {};
             float sqr_r = 0.0f; 
             for (size_t d = 0; d < dim; d++) {
                 residual[d] = v_rotated[d] - u_rotated[d];

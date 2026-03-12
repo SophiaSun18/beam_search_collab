@@ -71,6 +71,7 @@ SearchResult beam_cpu_rabitq(
 
         // expand the current node
         const vidType* neighbors = g.get_neighbors(cur_node);
+        filter.prefetch_nbr(cur_node);
         current_candidate.clear();
 
         if (frontier.has_unexpanded()) {
@@ -129,13 +130,13 @@ SearchResult beam_cpu_rabitq(
             // Debug: Print current state of the frontier
             std::cout << "Frontier state (size = " << frontier.size() << "):\n";
             for (int i = 0; i < frontier.size(); i++) {
-                std::cout << "  Node: " << frontier[i] << "\n";
+                std::cout << "  Node: " << frontier[i] << " Dist: " << frontier.get_dist(i) << "\n";
             }
 
             // Debug: Print current state of the result pool
             std::cout << "Result pool state (size = " << result_pool.size() << "):\n";
             for (int i = 0; i < result_pool.size(); i++) {
-                std::cout << "  Node: " << result_pool[i] << "\n";
+                std::cout << "  Node: " << result_pool[i] << " Dist: " << result_pool.get_dist(i) << "\n";
             }
         }
     }
