@@ -126,7 +126,15 @@ SearchResult beam_cpu_rabitq(
             dist_est++;
             float est = filter.estimated_distance(qf, nf, exact_dist);
             t_dist_est += lap();
-            current_candidate.emplace_back(neighbors[i], est);
+            uint32_t est_bits;
+            memcpy(&est_bits, &est, sizeof(est_bits));
+            if ((est_bits & 0x7F800000u) == 0x7F800000u && (est_bits & 0x007FFFFFu) != 0) {
+                // printf("Warning: estimated distance is NaN for neighbor %lu of node %lu\n", neighbors[i], cur_node);
+                current_candidate.emplace_back(neighbors[i], -1);
+            } else {
+                // printf("current neighbor has estimated distance: %f\n", est);
+                current_candidate.emplace_back(neighbors[i], est);
+            }
             t_other += lap();
 
             // float gt = compute_distance(dim, d_query, d_data + neighbors[i] * dim);
