@@ -171,6 +171,8 @@ struct RunStats {
     double recall;
     int64_t total_dc;
     int64_t total_ds;
+    int64_t total_extra_dc;
+    int64_t total_full_dc;
     int64_t total_iter;
     int64_t total_pruned;
     int64_t total_neighbor_pruned;
@@ -181,6 +183,7 @@ struct SearchResult {
     vector<int> neighbors;
     size_t dist_cmps;
     size_t dist_est;
+    size_t extra_dist_cmps;
     size_t iters;
     size_t pruned;
     size_t neighbor_pruned;
@@ -430,6 +433,8 @@ inline void append_stats_to_csv(const std::string& filename,
             << "Recall,"
             << "Total_dist_comp,"
             << "Total_dist_est,"
+            << "Total_extra_dist_comp,"
+            << "Total_full_dist_comp,"
             << "Total_iter,"
             << "Total_pruned,"
             << "Total_neighbor_pruned,"
@@ -446,6 +451,8 @@ inline void append_stats_to_csv(const std::string& filename,
         << stats.recall << ","
         << stats.total_dc << ","
         << stats.total_ds << ","
+        << stats.total_extra_dc << ","
+        << stats.total_full_dc << ","
         << stats.total_iter << ","
         << stats.total_pruned << ","
         << stats.total_neighbor_pruned << ","

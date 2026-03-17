@@ -36,6 +36,7 @@ SearchResult beam_cpu_rabitq(
     size_t pruned = 0;
     size_t neighbor_pruned = 0;
     size_t visited_pruned = 0;
+    size_t extra_dist_cmps = 0;
 
     // push the starting point to the frontier with max distance
     frontier.push(entry_point, FLT_MAX);
@@ -50,6 +51,12 @@ SearchResult beam_cpu_rabitq(
         vidType cur_node = frontier[idx];
         g.prefetch_node(cur_node);
         frontier.set_front_expanded();
+
+        if (is_visited.contains(cur_node)) {
+            visited_pruned++;
+            pruned++;
+            continue;
+        }
 
         float exact_dist = compute_distance(dim, d_query, d_data + cur_node * dim);
         dist_cmps++;
@@ -159,15 +166,36 @@ SearchResult beam_cpu_rabitq(
         }
     }
 
+    // update results: expand result pool by visiting neighbors of current results
+    int pool_size = result_pool.size();
+    if (pool_size != K) {
+        for (int i = 0; i < pool_size; i++) {
+            vidType data_id = result_pool[i];
+            const vidType* neighbors = g.get_neighbors(data_id);
+            for (size_t j = 0; j < g.degree; j++) {
+                vidType cur_neighbor = neighbors[j];
+                if (!is_visited.contains(cur_neighbor)) {
+                    is_visited.add(cur_neighbor);
+                    float dist = compute_distance(dim, d_query, d_data + cur_neighbor * dim);
+                    extra_dist_cmps++;
+                    result_pool.push(cur_neighbor, dist);
+                }
+            }
+            if (result_pool.size() == K) {
+                break;
+            }
+        }
+    }
+
     // collect the top-K results from candidates and return with distance computation count
     vector<int> result;
-    int topK = min(K, (int)result_pool.size());
-    for (int i = 0; i < topK; i++)
+    // int topK = min(K, (int)result_pool.size());
+    for (int i = 0; i < K; i++)
         result.push_back(result_pool[i]);
 
     if (DEBUG) {
         std::cout << "Final Results:\n";
-        for (int i = 0; i < topK; i++) {
+        for (int i = 0; i < K; i++) {
             std::cout << "  Neighbor ID: " << result[i] << "\n";
         }
     }
@@ -176,6 +204,7 @@ SearchResult beam_cpu_rabitq(
     res.neighbors = move(result);
     res.dist_cmps = dist_cmps;
     res.dist_est = dist_est;
+    res.extra_dist_cmps = extra_dist_cmps;
     res.iters = iter;
     res.pruned = pruned;
     res.neighbor_pruned = neighbor_pruned;
@@ -196,6 +225,7 @@ RunStats run_ann_experiment_rabitq(
 
     int64_t total_count_dc = 0;
     int64_t total_count_ds = 0;
+    int64_t total_extra_count_dc = 0;
     int64_t total_hop = 0;
     int64_t total_pruned = 0;
     int64_t total_neighbor_pruned = 0;
@@ -217,6 +247,7 @@ RunStats run_ann_experiment_rabitq(
         all_results[q] = result.neighbors;
         total_count_dc += result.dist_cmps;
         total_count_ds += result.dist_est;
+        total_extra_count_dc += result.extra_dist_cmps;
         total_hop += result.iters;
         total_pruned += result.pruned;
         total_neighbor_pruned += result.neighbor_pruned;
@@ -232,6 +263,8 @@ RunStats run_ann_experiment_rabitq(
     stats.recall = compute_avg_recall(all_results, groundtruth, n_query, K, dim_gt);
     stats.total_dc = total_count_dc;
     stats.total_ds = total_count_ds;
+    stats.total_extra_dc = total_extra_count_dc;
+    stats.total_full_dc = total_count_dc + total_extra_count_dc;
     stats.total_iter = total_hop;
     stats.total_pruned = total_pruned;
     stats.total_neighbor_pruned = total_neighbor_pruned;
@@ -240,8 +273,8 @@ RunStats run_ann_experiment_rabitq(
     printf("runtime: %.6f sec, recall@%d: %.6f\n", stats.runtime, K, stats.recall);
     printf("avg latency: %.6f ms/query, throughput: %.6f queries/sec\n",
            stats.latency, stats.throughput);
-    cout << "total # distance computation: " << stats.total_dc << "\n";
-    cout << "average # distance computation: " << stats.total_dc / n_query << "\n";
+    cout << "total # distance computation: " << stats.total_full_dc << "\n";
+    cout << "average # distance computation: " << stats.total_full_dc / n_query << "\n";
     cout << "total # iteration: " << stats.total_iter << "\n";
     cout << "average # iteration: " << stats.total_iter / n_query << "\n";
     cout << "total # pruned neighbors: " << stats.total_pruned << "\n";
