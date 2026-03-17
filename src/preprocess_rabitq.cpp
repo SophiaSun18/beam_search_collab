@@ -38,21 +38,55 @@ int main(int argc, char** argv) {
     assert(dim % 64 == 0);
 
     Graph g;
-    g.load_graph_index(graph_file.c_str());
+    // g.load_graph_index(graph_file.c_str());
+    g.load_qg_index(graph_file.c_str(), n_base, dim);
     std::cout << "Loaded graph with " << g.n << " nodes, degree=" << g.degree << "\n";
 
     // Initialize the random signs table
     size_t padded_dim = 1ULL << (size_t)std::ceil(std::log2(dim));
-    std::vector<float> signs(padded_dim);
+    // std::vector<float> signs(padded_dim);
     float scale = 1.0f / std::sqrt(static_cast<float>(padded_dim));
+    
+    // hardcoded sign table for now to match SymQG
+    std::vector<float> signs = {
+        0.0883883f, -0.0883883f, 0.0883883f, -0.0883883f, 0.0883883f, 0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, 0.0883883f, 
+        0.0883883f, 0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, 0.0883883f, -0.0883883f, 0.0883883f, -0.0883883f, 
+        -0.0883883f, 0.0883883f, -0.0883883f, -0.0883883f, 0.0883883f, 0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, 
+        0.0883883f, 0.0883883f, 0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, 0.0883883f, -0.0883883f, 0.0883883f, 
+        0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, 0.0883883f, 0.0883883f, 0.0883883f, 
+        -0.0883883f, -0.0883883f, 0.0883883f, -0.0883883f, 0.0883883f, 0.0883883f, 0.0883883f, 0.0883883f, 0.0883883f, 0.0883883f, 
+        0.0883883f, 0.0883883f, 0.0883883f, 0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, 0.0883883f, -0.0883883f, 
+        0.0883883f, -0.0883883f, -0.0883883f, 0.0883883f, 0.0883883f, 0.0883883f, 0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, 
+        0.0883883f, 0.0883883f, -0.0883883f, -0.0883883f, 0.0883883f, 0.0883883f, 0.0883883f, -0.0883883f, 0.0883883f, -0.0883883f, 
+        -0.0883883f, 0.0883883f, 0.0883883f, -0.0883883f, 0.0883883f, 0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, 
+        -0.0883883f, -0.0883883f, 0.0883883f, -0.0883883f, 0.0883883f, 0.0883883f, -0.0883883f, 0.0883883f, 0.0883883f, -0.0883883f, 
+        -0.0883883f, 0.0883883f, -0.0883883f, -0.0883883f, 0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, 
+        0.0883883f, 0.0883883f, 0.0883883f, -0.0883883f, 0.0883883f, 0.0883883f, 0.0883883f, 0.0883883f
+    };
 
-    std::uniform_int_distribution<int> bernoulli(0, 1);
-    std::random_device rdd;
-    std::mt19937_64 gen(rdd());
-    for (size_t i = 0; i < padded_dim; ++i) {
-        signs[i] = static_cast<float>((2 * bernoulli(gen)) - 1) /
-                    std::sqrt(static_cast<float>(padded_dim));
-    }
+    // std::vector<float> signs = {
+    //     -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, 
+    //     -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, 
+    //     -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, 
+    //     -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, 
+    //     -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, 
+    //     -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, 
+    //     -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, 
+    //     -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, 
+    //     -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, 
+    //     -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, 
+    //     -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, 
+    //     -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, 
+    //     -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f, -0.0883883f
+    // };
+
+    // std::uniform_int_distribution<int> bernoulli(0, 1);
+    // std::random_device rdd;
+    // std::mt19937_64 gen(rdd());
+    // for (size_t i = 0; i < padded_dim; ++i) {
+    //     signs[i] = static_cast<float>((2 * bernoulli(gen)) - 1) /
+    //                 std::sqrt(static_cast<float>(padded_dim));
+    // }
 
     // Config the table: [bitcode_words][triple_x][factor_dq][factor_vq]
     int bitcode_words = dim / 64; 
@@ -69,7 +103,7 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < padded_dim; i++) {
             u_rotated[i] = base_vectors[u * dim + i];
         }
-        rotate_vector(u_rotated, u_rotated, signs, dim, padded_dim);
+        rotate_vector(u_rotated, u_rotated, signs.data(), dim, padded_dim);
 
         const uint32_t* neighbors = g.get_neighbors(u);
         for (size_t i = 0; i < g.degree; i++) {
@@ -129,8 +163,8 @@ int main(int argc, char** argv) {
     std::cout << "Wrote rabitQ table to " << out_file << "\n";
     std::cout << "Wrote signs to " << signs_file << "\n";
 
-    // dump_bin_to_txt<uint16_t>(out_file.c_str(), "table.txt");
-    // dump_bin_to_txt<float>(signs_file.c_str(), "signs.txt");
+    dump_rabitq_table(out_file, "table.txt", dim, g.degree, 20);
+    dump_bin_to_txt<float>(signs_file.c_str(), "signs.txt");
 
     delete[] base_vectors;
     return 0;

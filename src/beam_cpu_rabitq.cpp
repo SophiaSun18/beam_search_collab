@@ -300,6 +300,7 @@ int main(int argc, char** argv) {
 
     Graph g;
     g.load_graph_index(graph_file.c_str());
+    // g.load_qg_index(graph_file.c_str(), n_base, dim_base, 32);
 
     // initialize the filter
     RaBitQFilter filter(dim_base, g.degree, rabitq_table, signs_table, 6);  // 6 bits for quantization as SymQG

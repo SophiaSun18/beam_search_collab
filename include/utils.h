@@ -12,6 +12,7 @@
 #include <cstring>
 #include <cfloat>
 #include <filesystem>
+#include <iomanip>
 #if defined(__AVX512F__) || defined(__AVX2__) || defined(__SSE2__)
 #include <immintrin.h>
 #endif
@@ -77,6 +78,75 @@ struct Graph {
                   << ": ntotal = " << n << ", maxDeg = " << degree << std::endl;
 
         delete[] edge_data;
+    }
+
+    void load_qg_index(const char* filename,
+                       size_t num_points, size_t dimension, size_t degree_bound=32,
+                       float* data_out = nullptr)
+    {
+        // Reproduce QG offset computation
+        auto next_pow2 = [](size_t v) -> size_t {
+            size_t p = 1;
+            while (p < v) p <<= 1;
+            return p;
+        };
+        size_t padded_dim    = next_pow2(dimension);
+        size_t code_offset   = dimension;  // in floats
+        size_t factor_offset = code_offset + padded_dim / 64 * 2 * degree_bound;
+        size_t neighbor_offset = factor_offset + 3 * degree_bound; // sizeof(Factor)=3 floats
+        size_t row_offset    = neighbor_offset + degree_bound;
+
+        size_t data_bytes = sizeof(float) * num_points * row_offset;
+        size_t rotator_bytes = sizeof(float) * padded_dim;
+        size_t expected_size = sizeof(vidType) + data_bytes + rotator_bytes;
+
+        std::ifstream input(filename, std::ios::binary);
+        if (!input) throw std::runtime_error("Cannot open QG index file");
+
+        // Verify file size
+        input.seekg(0, std::ios::end);
+        size_t file_size = input.tellg();
+        input.seekg(0, std::ios::beg);
+        if (file_size != expected_size) {
+            throw std::runtime_error(
+                "QG index file size mismatch: expected " + std::to_string(expected_size) +
+                " but got " + std::to_string(file_size) +
+                ". Check num_points/dimension/degree_bound.");
+        }
+
+        // 1. Read entry point (stored but we just note it)
+        vidType entry_point = 0;
+        input.read(reinterpret_cast<char*>(&entry_point), sizeof(vidType));
+        std::cout << "QG entry point: " << entry_point << "\n";
+
+        // 2. Read rows, extracting only raw vectors and neighbor IDs
+        n = num_points;
+        degree = degree_bound;
+        edges.resize(n * degree);
+
+        size_t row_bytes = row_offset * sizeof(float);
+        std::vector<char> row_buf(row_bytes);
+
+        for (size_t i = 0; i < n; ++i) {
+            input.read(row_buf.data(), row_bytes);
+
+            // Extract raw vector if requested
+            if (data_out) {
+                std::memcpy(data_out + i * dimension,
+                            row_buf.data(),
+                            dimension * sizeof(float));
+            }
+
+            // Extract neighbor IDs (stored as PID/uint32_t reinterpreted in the float array)
+            std::memcpy(edges.data() + i * degree,
+                        row_buf.data() + neighbor_offset * sizeof(float),
+                        degree * sizeof(vidType));
+        }
+
+        input.close();
+        std::cout << "Loaded QG index from " << filename
+                  << ": n=" << n << ", degree=" << degree
+                  << ", dim=" << dimension << "\n";
     }
 
     void prefetch_node(vidType node) {
@@ -634,4 +704,72 @@ void dump_bin_to_txt(const std::string& bin_file, const std::string& txt_file) {
     output.close();
 
     std::cout << "Dumped binary file " << bin_file << " to text file " << txt_file << "\n";
+}
+
+// Dump a rabitq table (.bin) with per-neighbor breakdown:
+//   bits as hex, popcount, and the 3 factor floats (triple_x, factor_dq, factor_vq)
+inline void dump_rabitq_table(const std::string& bin_file, const std::string& txt_file,
+                              int dim, int degree, int max_nodes = 0) {
+    int bitcode_words = dim / 64;
+    int words_per_neighbor = bitcode_words + 2;
+    int words_per_node = degree * words_per_neighbor;
+
+    std::ifstream input(bin_file, std::ios::binary);
+    if (!input) throw std::runtime_error("Cannot open: " + bin_file);
+
+    int32_t n, d;
+    input.read(reinterpret_cast<char*>(&n), sizeof(int32_t));
+    input.read(reinterpret_cast<char*>(&d), sizeof(int32_t));
+    if (d != words_per_node)
+        throw std::runtime_error("words_per_node mismatch: header=" + std::to_string(d) +
+                                 " expected=" + std::to_string(words_per_node));
+
+    std::vector<uint64_t> data(static_cast<size_t>(n) * d);
+    input.read(reinterpret_cast<char*>(data.data()), sizeof(uint64_t) * n * d);
+    input.close();
+
+    int dump_n = (max_nodes > 0 && max_nodes < n) ? max_nodes : n;
+
+    std::ofstream out(txt_file);
+    if (!out) throw std::runtime_error("Cannot open: " + txt_file);
+
+    out << "# " << bin_file << "\n";
+    out << "# n=" << n << " words_per_node=" << d
+        << " dim=" << dim << " degree=" << degree << "\n";
+    out << "# Per neighbor: [" << bitcode_words << " bitcode u64] "
+        << "[2 factor u64 = 3 floats: tx, dq, vq]\n\n";
+
+    for (int i = 0; i < dump_n; ++i) {
+        out << "=== Node " << i << " ===\n";
+        const uint64_t* node_ptr = data.data() + static_cast<size_t>(i) * words_per_node;
+
+        for (int j = 0; j < degree; ++j) {
+            const uint64_t* nbr_ptr = node_ptr + j * words_per_neighbor;
+
+            // Popcount across all bitcode words
+            int popcount = 0;
+            for (int w = 0; w < bitcode_words; ++w)
+                popcount += __builtin_popcountll(nbr_ptr[w]);
+
+            // Factors: 3 floats packed in 2 uint64_t
+            const float* f = reinterpret_cast<const float*>(nbr_ptr + bitcode_words);
+
+            out << "  nbr[" << std::setw(2) << j << "]: bits=[";
+            for (int w = 0; w < bitcode_words; ++w) {
+                if (w > 0) out << " ";
+                out << "0x" << std::hex << std::setfill('0')
+                    << std::setw(16) << nbr_ptr[w] << std::dec;
+            }
+            out << "] popcount=" << std::setw(3) << popcount
+                << " tx=" << std::setw(12) << std::fixed << std::setprecision(6) << f[0]
+                << " dq=" << std::setw(12) << f[1]
+                << " vq=" << std::setw(12) << f[2] << "\n";
+        }
+        out << "\n";
+    }
+    if (dump_n < n) out << "... (" << (n - dump_n) << " more nodes)\n";
+    out.close();
+
+    std::cout << "Dumped rabitq table " << bin_file << " to " << txt_file
+              << " (" << dump_n << "/" << n << " nodes)\n";
 }
