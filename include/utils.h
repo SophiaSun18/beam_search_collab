@@ -177,6 +177,12 @@ struct RunStats {
     int64_t total_pruned;
     int64_t total_neighbor_pruned;
     int64_t total_visited_pruned;
+    double time_dist_comp = 0;
+    double time_dist_est = 0;
+    double time_queue = 0;
+    double time_hash_filter = 0;
+    double time_other = 0;
+    double time_total = 0;
 };
 
 struct SearchResult {
@@ -188,6 +194,12 @@ struct SearchResult {
     size_t pruned;
     size_t neighbor_pruned;
     size_t visited_pruned;
+    double time_dist_comp = 0;      // exact distance computations (seconds)
+    double time_dist_est = 0;       // estimated distance computations (seconds)
+    double time_queue = 0;          // queue/frontier management (seconds)
+    double time_hash_filter = 0;    // hash filter checks and updates (seconds)
+    double time_other = 0;          // everything else (seconds)
+    double time_total = 0;          // wall-clock time of entire search call (seconds)
 };
 
 inline int* read_ivecs(const char* filename, size_t& n_out, size_t& d_out) {
@@ -438,7 +450,13 @@ inline void append_stats_to_csv(const std::string& filename,
             << "Total_iter,"
             << "Total_pruned,"
             << "Total_neighbor_pruned,"
-            << "Total_visited_pruned\n";
+            << "Total_visited_pruned,"
+            << "Time_dist_comp,"
+            << "Time_dist_est,"
+            << "Time_queue,"
+            << "Time_hash_filter,"
+            << "Time_other,"
+            << "Time_total\n";
     }
 
     out << k << ","
@@ -456,7 +474,13 @@ inline void append_stats_to_csv(const std::string& filename,
         << stats.total_iter << ","
         << stats.total_pruned << ","
         << stats.total_neighbor_pruned << ","
-        << stats.total_visited_pruned << "\n";
+        << stats.total_visited_pruned << ","
+        << stats.time_dist_comp << ","
+        << stats.time_dist_est << ","
+        << stats.time_queue << ","
+        << stats.time_hash_filter << ","
+        << stats.time_other << ","
+        << stats.time_total << "\n";
 
     out.close();
 }
