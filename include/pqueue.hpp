@@ -276,7 +276,7 @@ public:
     const auto loc = std::lower_bound(queue_start, queue_start + queue_size, dist);
     auto insert_loc = loc - queue_start;
     if (insert_loc < queue_size) {
-      if (vid_queue[insert_loc] == vid) return; // duplicate
+      // if (vid_queue[insert_loc] == vid) return; // duplicate
       auto num = queue_size - insert_loc;
       memmove(reinterpret_cast<char *>(&vid_queue[insert_loc + 1]),
               reinterpret_cast<char *>(&vid_queue[insert_loc]),
