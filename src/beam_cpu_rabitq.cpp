@@ -61,10 +61,23 @@ SearchResult beam_cpu_rabitq(
             std::cout << "\n=== Iteration " << iter << " ===\n";
             std::cout << "Expanding node: " << cur_node << " with exact distance: " << exact_dist << "\n";
 
+            // Debug: Print the current sign table
+            std::cout << "Sign table: ";
+            for (size_t d = 0; d < dim; d++) {
+                std::cout << filter.get_signs_ptr()[d] << " ";
+            }
+            std::cout << "\n";
+
             // Debug: Print the rotated query and quantized query
             std::cout << "Rotated query: ";
             for (size_t d = 0; d < dim; d++) {
                 std::cout << qf.rotated_query[d] << " ";
+            }
+            std::cout << "\n";
+
+            std::cout << "Quantized query: ";
+            for (size_t d = 0; d < dim; d++) {
+                std::cout << static_cast<int>(qf.quantized_query[d]) << " ";
             }
             std::cout << "\n";
         }
@@ -88,16 +101,21 @@ SearchResult beam_cpu_rabitq(
 
             if (DEBUG) {
                 // Debug: Print neighbor details
-                std::cout << "  Neighbor ID: " << neighbors[i]
+                std::cout << std::fixed << std::setprecision(6)
+                        << "  Neighbor ID: " << neighbors[i]
                         << ", Estimated Distance: " << est
+                        // << ", Exact Distance: " << gt
+                        // << ", Error : " << (est - gt) / gt
                         // << ", Code[0]: " << nf.bits[0]
                         // << ", Code[1]: " << nf.bits[1]
                         << ", Factors: [tx: " << nf.triple_x
                         << ", dq: " << nf.factor_dq
                         << ", vq: " << nf.factor_vq
+                        << ", sum q: " << qf.sum_q
                         << ", width: " << qf.width
                         << ", low_val: " << qf.low_val
-                        << ", high_val: " << qf.high_val
+                        // << ", raw_sum: " << raw_sum
+                        // << ", result_float: " << result_float
                         << "]\n";
             }
         }
@@ -130,7 +148,7 @@ SearchResult beam_cpu_rabitq(
             // Debug: Print current state of the frontier
             std::cout << "Frontier state (size = " << frontier.size() << "):\n";
             for (int i = 0; i < frontier.size(); i++) {
-                std::cout << "  Node: " << frontier[i] << " Dist: " << frontier.get_dist(i) << "\n";
+                std::cout << "  Node: " << frontier[i] << " Dist: " << frontier.get_dist(i) << " Visited: " << (is_visited.contains(frontier[i]) ? "Yes" : "No") << "\n";
             }
 
             // Debug: Print current state of the result pool
@@ -303,7 +321,7 @@ int main(int argc, char** argv) {
     // g.load_qg_index(graph_file.c_str(), n_base, dim_base, 32);
 
     // initialize the filter
-    RaBitQFilter filter(dim_base, g.degree, rabitq_table, signs_table, 6);  // 6 bits for quantization as SymQG
+    RaBitQFilter filter(dim_base, g.degree, rabitq_table, signs_table);  // 6 bits for quantization as SymQG
 
     // Run experiment
     RunStats stats = run_ann_experiment_rabitq(g, K, n_base, n_query, dim_base, base_vectors, query_vectors, groundtruth, dim_gt, filter);

@@ -1,4 +1,5 @@
 #include <iostream>
+#include <iomanip>
 #include <vector>
 #include <cmath>
 #include <cstdint>
@@ -26,8 +27,8 @@ public:
         float factor_vq;
     };
 
-    RaBitQFilter(size_t dim, int degree, const std::string& table_path, const std::string& signs_path, int qbits) 
-        : dim_(dim), degree_(degree), QG_BQUERY(qbits) {
+    RaBitQFilter(size_t dim, int degree, const std::string& table_path, const std::string& signs_path) 
+        : dim_(dim), degree_(degree) {
         
         padded_dim_ = 1ULL << (size_t)std::ceil(std::log2(dim_));
         bitcode_words_ = dim_ / 64;
@@ -58,14 +59,18 @@ public:
             qf.high_val = std::max(qf.high_val, tmp);
         }
         qf.width = (qf.high_val - qf.low_val) / ((1 << QG_BQUERY) - 1);
+        // std::cout << std::fixed << std::setprecision(20) << "Query data range: [" << qf.low_val << ", " << qf.high_val << "], width: " << qf.width << " QG_BQUERY: " << QG_BQUERY << "\n";
+        // std::cout << std::fixed << std::setprecision(20) << "high - low: " << (qf.high_val - qf.low_val) << " divisor: " << ((1 << QG_BQUERY) - 1) << "\n";
 
         // quantize the query 
         float inv_width = 1.0F / qf.width;
         int32_t sum = 0;
+        // std::cout << "1/width: " << std::fixed << std::setprecision(20) << inv_width << "\n";
         for (size_t i = 0; i < dim_; ++i) {
             uint8_t cur = static_cast<uint8_t>(std::lround(((qf.rotated_query[i] - qf.low_val) * inv_width) + 0.5));
             qf.quantized_query[i] = cur;
             sum += cur;
+            // std::cout << "i: " << i << " rotated: " << std::fixed << std::setprecision(20) << qf.rotated_query[i] << " quantized: " << static_cast<uint32_t>(qf.quantized_query[i]) << " sum: " << sum << "\n";
         }
         qf.sum_q = sum;
 
@@ -165,9 +170,13 @@ public:
             __builtin_prefetch(base + off, 0, 0);
     }
 
+    float* get_signs_ptr() const {
+        return signs_ptr_;
+    }
+
 private:
     size_t dim_, padded_dim_;
-    int degree_, bitcode_words_, words_per_neighbor_, QG_BQUERY;
+    int degree_, bitcode_words_, words_per_neighbor_;
     size_t words_per_node_;
 
     // Pointers to data loaded via read_bin

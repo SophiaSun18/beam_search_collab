@@ -20,6 +20,8 @@
 using namespace std;
 typedef uint32_t vidType;
 
+#define QG_BQUERY 6
+
 template <typename T = float>
 T* read_bin(const char* filename, size_t& n_out, size_t& d_out) {
     std::ifstream input(filename, std::ios::binary);
