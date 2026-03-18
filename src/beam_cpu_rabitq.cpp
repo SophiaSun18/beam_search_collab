@@ -70,18 +70,19 @@ SearchResult beam_cpu_rabitq(
         if (is_visited.contains(cur_node)) {
             visited_pruned++;
             pruned++;
-            t_queue += lap();
+            t_hash_filter += lap();
             continue;
         }
-        t_queue += lap();
+        t_hash_filter += lap();
 
         float exact_dist = compute_distance(dim, d_query, d_data + cur_node * dim);
         dist_cmps++;
         t_dist_comp += lap();
 
         result_pool.push(cur_node, exact_dist);
-        is_visited.add(cur_node);
         t_queue += lap();
+        is_visited.add(cur_node);
+        t_hash_filter += lap();
 
         if (DEBUG) {
             // Debug: Print current node being expanded
@@ -137,25 +138,17 @@ SearchResult beam_cpu_rabitq(
             }
             t_other += lap();
 
-            // float gt = compute_distance(dim, d_query, d_data + neighbors[i] * dim);
-
             if (DEBUG) {
                 // Debug: Print neighbor details
                 std::cout << std::fixed << std::setprecision(6)
                         << "  Neighbor ID: " << neighbors[i]
                         << ", Estimated Distance: " << est
-                        // << ", Exact Distance: " << gt
-                        // << ", Error : " << (est - gt) / gt
-                        // << ", Code[0]: " << nf.bits[0]
-                        // << ", Code[1]: " << nf.bits[1]
                         << ", Factors: [tx: " << nf.triple_x
                         << ", dq: " << nf.factor_dq
                         << ", vq: " << nf.factor_vq
                         << ", sum q: " << qf.sum_q
                         << ", width: " << qf.width
                         << ", low_val: " << qf.low_val
-                        // << ", raw_sum: " << raw_sum
-                        // << ", result_float: " << result_float
                         << "]\n";
             }
         }
@@ -178,9 +171,10 @@ SearchResult beam_cpu_rabitq(
             if (is_visited.contains(node.first)) {
                 visited_pruned++;
                 pruned++;
-                t_queue += lap();
+                t_hash_filter += lap();
                 continue;
             }   // skip if already computed
+            t_hash_filter += lap();
             if (frontier.size() < BEAM_SIZE || node.second < frontier.get_tail_dist()) {
                 frontier.push(node.first, node.second);
             }
@@ -214,14 +208,14 @@ SearchResult beam_cpu_rabitq(
                 t_other += lap();
                 if (!is_visited.contains(cur_neighbor)) {
                     is_visited.add(cur_neighbor);
-                    t_queue += lap();
+                    t_hash_filter += lap();
                     float dist = compute_distance(dim, d_query, d_data + cur_neighbor * dim);
                     extra_dist_cmps++;
                     t_dist_comp += lap();
                     result_pool.push(cur_neighbor, dist);
                     t_queue += lap();
                 } else {
-                    t_queue += lap();
+                    t_hash_filter += lap();
                 }
             }
             if (result_pool.size() == K) {
@@ -260,6 +254,8 @@ SearchResult beam_cpu_rabitq(
     res.time_queue = t_queue;
     res.time_hash_filter = t_hash_filter;
     res.time_other = t_other;
+    res.hash_inserts = is_visited.get_total_inserts();
+    res.hash_collisions = is_visited.get_total_collisions();
     if constexpr (TIMING_ENABLED)
         res.time_total = std::chrono::duration<double>(clock::now() - t_search_start).count();
     return res;
@@ -284,6 +280,7 @@ RunStats run_ann_experiment_rabitq(
     int64_t total_neighbor_pruned = 0;
     int64_t total_visited_pruned = 0;
     double total_time_dist_comp = 0, total_time_dist_est = 0, total_time_queue = 0, total_time_hash_filter = 0, total_time_other = 0, total_time_total = 0;
+    int64_t total_hash_inserts = 0, total_hash_collisions = 0;
     vector<vector<int>> all_results(n_query, vector<int>(K));
 
     vector<float> centroid = compute_centroid(base_vectors, n_base, dim, actual_threads);
@@ -294,7 +291,7 @@ RunStats run_ann_experiment_rabitq(
     Timer t;
     t.Start();
 
-    #pragma omp parallel for schedule(dynamic, 1) reduction(+:total_count_dc) reduction(+:total_count_ds) reduction(+:total_extra_count_dc) reduction(+:total_hop) reduction(+:total_pruned) reduction(+:total_neighbor_pruned) reduction(+:total_visited_pruned) reduction(+:total_time_dist_comp) reduction(+:total_time_dist_est) reduction(+:total_time_queue) reduction(+:total_time_hash_filter) reduction(+:total_time_other) reduction(+:total_time_total)
+    #pragma omp parallel for schedule(dynamic, 1) reduction(+:total_count_dc) reduction(+:total_count_ds) reduction(+:total_extra_count_dc) reduction(+:total_hop) reduction(+:total_pruned) reduction(+:total_neighbor_pruned) reduction(+:total_visited_pruned) reduction(+:total_time_dist_comp) reduction(+:total_time_dist_est) reduction(+:total_time_queue) reduction(+:total_time_hash_filter) reduction(+:total_time_other) reduction(+:total_time_total) reduction(+:total_hash_inserts) reduction(+:total_hash_collisions)
     for (int q = 0; q < actual_query; q++) {
         const float* query_ptr = query_vectors + q * dim;
 
@@ -314,6 +311,8 @@ RunStats run_ann_experiment_rabitq(
         total_time_hash_filter += result.time_hash_filter;
         total_time_other += result.time_other;
         total_time_total += result.time_total;
+        total_hash_inserts += result.hash_inserts;
+        total_hash_collisions += result.hash_collisions;
     }
 
     t.Stop();
@@ -337,6 +336,8 @@ RunStats run_ann_experiment_rabitq(
     stats.time_hash_filter = total_time_hash_filter;
     stats.time_other = total_time_other;
     stats.time_total = total_time_total;
+    stats.total_hash_inserts = total_hash_inserts;
+    stats.total_hash_collisions = total_hash_collisions;
 
     printf("runtime: %.6f sec, recall@%d: %.6f\n", stats.runtime, K, stats.recall);
     printf("avg latency: %.6f ms/query, throughput: %.6f queries/sec\n",
@@ -357,6 +358,11 @@ RunStats run_ann_experiment_rabitq(
     printf("  other:                %.6f sec (%.1f%%)\n", stats.time_other, stats.time_other / t_total * 100);
     printf("  sum:                  %.6f sec\n", t_total);
     printf("  total (wall-clock):   %.6f sec\n", stats.time_total);
+    printf("--- Hash collision stats ---\n");
+    printf("  total inserts:    %ld\n", stats.total_hash_inserts);
+    printf("  total collisions: %ld\n", stats.total_hash_collisions);
+    printf("  collision ratio:  %.4f%%\n", stats.total_hash_inserts > 0 ? (double)stats.total_hash_collisions / stats.total_hash_inserts * 100 : 0.0);
+    printf("  avg collisions per query: %.1f\n", (double)stats.total_hash_collisions / n_query);
 
     return stats;
 }

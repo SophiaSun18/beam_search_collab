@@ -183,6 +183,8 @@ struct RunStats {
     double time_hash_filter = 0;
     double time_other = 0;
     double time_total = 0;
+    int64_t total_hash_inserts = 0;
+    int64_t total_hash_collisions = 0;
 };
 
 struct SearchResult {
@@ -200,6 +202,8 @@ struct SearchResult {
     double time_hash_filter = 0;    // hash filter checks and updates (seconds)
     double time_other = 0;          // everything else (seconds)
     double time_total = 0;          // wall-clock time of entire search call (seconds)
+    size_t hash_inserts = 0;
+    size_t hash_collisions = 0;
 };
 
 inline int* read_ivecs(const char* filename, size_t& n_out, size_t& d_out) {
@@ -456,7 +460,10 @@ inline void append_stats_to_csv(const std::string& filename,
             << "Time_queue,"
             << "Time_hash_filter,"
             << "Time_other,"
-            << "Time_total\n";
+            << "Time_total,"
+            << "Hash_inserts,"
+            << "Hash_collisions,"
+            << "Hash_collision_ratio\n";
     }
 
     out << k << ","
@@ -480,7 +487,10 @@ inline void append_stats_to_csv(const std::string& filename,
         << stats.time_queue << ","
         << stats.time_hash_filter << ","
         << stats.time_other << ","
-        << stats.time_total << "\n";
+        << stats.time_total << ","
+        << stats.total_hash_inserts << ","
+        << stats.total_hash_collisions << ","
+        << (stats.total_hash_inserts > 0 ? (double)stats.total_hash_collisions / stats.total_hash_inserts : 0.0) << "\n";
 
     out.close();
 }
