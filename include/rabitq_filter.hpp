@@ -86,6 +86,8 @@ public:
     }
 
     float estimated_distance(const QueryFactors& qf, const NeighborFactors& nf, float exact_dist) const {
+        if (nf.triple_x == FLT_MAX) return 0.0f;
+        
         int32_t raw_sum = 0;
         const uint8_t* q = qf.quantized_query;
         const uint64_t* bits = nf.bits;

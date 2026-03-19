@@ -28,12 +28,6 @@ inline uint64_t hash64_2(uint64_t x) {
 
 public:
   hash_filter(int L) {
-    // bits = std::__lg(L)+1; // round up to power of 2
-    // L = (1 << bits);
-    // capacity = L;
-    // seen.resize(L);
-    // fill(seen.begin(),seen.end(),-1); 
-
     int bit_size = 0;
     int tmp = L;
     while (tmp != 0) { bit_size++; tmp >>= 1; }
@@ -46,29 +40,14 @@ public:
     //return hasher(thing) & ((1 << bits)-1);
     return thing & ((1 << bits)-1);
   }
-  
-  // old methods (lossy, no collision handling)
-  bool contains(T thing) {
-    int h = get_hash(thing);
-    return (seen[h] == thing);
-  }
-  bool add(T thing) { // returns true if successfully added
-    int h = get_hash(thing);
-    if (seen[h] == thing) return false;
-    total_inserts++;
-    if (seen[h] != -1) total_collisions++;  // slot occupied by different ID
-    seen[h] = thing;
-    return true;
-  }
 
-  // new methods (lossless, with stl_hash_ overflow)
-  bool contains_new(T thing) {
+  bool contains(T thing) {
     T val = seen[get_hash(thing)];
     if (val == thing) return true;
     if (val == -1) return false;
     return stl_hash_.find(thing) != stl_hash_.end();
   }
-  bool add_new(T thing) {
+  bool add(T thing) {
     T& val = seen[get_hash(thing)];
     if (val == thing) return false;
     total_inserts++;
