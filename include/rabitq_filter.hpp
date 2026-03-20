@@ -31,7 +31,7 @@ public:
         : dim_(dim), degree_(degree) {
         
         padded_dim_ = 1ULL << (size_t)std::ceil(std::log2(dim_));
-        bitcode_words_ = dim_ / 64;
+        bitcode_words_ = padded_dim_ / 64;
         words_per_neighbor_ = bitcode_words_ + 2;
         words_per_node_ = degree_ * words_per_neighbor_;
 
@@ -53,7 +53,7 @@ public:
         rotate_vector(query_raw, qf.rotated_query, signs_ptr_, dim_, padded_dim_);
 
         // data range: find the lowest and highest dimension in the rotated query
-        for (size_t i = 0; i < dim_; ++i) {
+        for (size_t i = 0; i < padded_dim_; ++i) {
             float tmp = qf.rotated_query[i];
             qf.low_val = std::min(qf.low_val, tmp);
             qf.high_val = std::max(qf.high_val, tmp);
@@ -66,7 +66,7 @@ public:
         float inv_width = 1.0F / qf.width;
         int32_t sum = 0;
         // std::cout << "1/width: " << std::fixed << std::setprecision(20) << inv_width << "\n";
-        for (size_t i = 0; i < dim_; ++i) {
+        for (size_t i = 0; i < padded_dim_; ++i) {
             uint8_t cur = static_cast<uint8_t>(std::lround(((qf.rotated_query[i] - qf.low_val) * inv_width) + 0.5));
             qf.quantized_query[i] = cur;
             sum += cur;
