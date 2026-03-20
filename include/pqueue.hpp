@@ -299,4 +299,48 @@ public:
     else if (insert_loc <= next_idx2) next_idx2 = insert_loc;
     //_check_invariant();
   }
+
+  void push_update(T vid, float dist) {
+    if ((queue_size == queue_capacity) && (dist > distances[queue_size-1]))
+      return;
+
+    int existing_loc = -1;    // check for existing entry's location
+    for (int i = 0; i < queue_size; i++) {
+      if (vid_queue[i] == vid) { existing_loc = i; break; }
+    }
+    if (existing_loc < 0) return;
+
+    if (distances[existing_loc] <= dist) return; // existing entry is already closer
+
+    // find where the new entry should go
+    auto queue_start = &distances[0];
+    int insert_loc = std::lower_bound(queue_start, queue_start + existing_loc, dist) - queue_start;
+    
+    auto num = existing_loc - insert_loc;
+    if (num > 0) {
+      memmove(reinterpret_cast<char *>(&vid_queue[insert_loc + 1]),
+              reinterpret_cast<char *>(&vid_queue[insert_loc]),
+              num * sizeof(T));
+      memmove(reinterpret_cast<char *>(&distances[insert_loc + 1]),
+              reinterpret_cast<char *>(&distances[insert_loc]),
+              num * sizeof(float));
+      memmove(reinterpret_cast<char *>(&expanded[insert_loc + 1]),
+              reinterpret_cast<char *>(&expanded[insert_loc]),
+              num * sizeof(uint8_t));
+    }
+    vid_queue[insert_loc] = vid;
+    distances[insert_loc] = dist;
+    expanded[insert_loc] = 0;
+
+    // Recompute next_idx/next_idx2 since the shift may have moved them
+    next_idx = queue_size;
+    next_idx2 = queue_size;
+    for (int k = 0; k < queue_size; k++) {
+      if (!expanded[k]) {
+        if (next_idx == queue_size) next_idx = k;
+        else { next_idx2 = k; break; }
+      }
+    }
+    //_check_invariant();
+  }
 };

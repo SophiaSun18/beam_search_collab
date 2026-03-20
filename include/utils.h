@@ -185,6 +185,8 @@ struct RunStats {
     double time_total = 0;
     int64_t total_hash_inserts = 0;
     int64_t total_hash_collisions = 0;
+    int64_t total_pushes = 0;
+    int64_t total_duplicate_pushes = 0;
 };
 
 struct SearchResult {
@@ -204,6 +206,8 @@ struct SearchResult {
     double time_total = 0;          // wall-clock time of entire search call (seconds)
     size_t hash_inserts = 0;
     size_t hash_collisions = 0;
+    size_t pushes = 0;
+    size_t duplicate_pushes = 0;
 };
 
 inline int* read_ivecs(const char* filename, size_t& n_out, size_t& d_out) {
@@ -463,7 +467,9 @@ inline void append_stats_to_csv(const std::string& filename,
             << "Time_total,"
             << "Hash_inserts,"
             << "Hash_collisions,"
-            << "Hash_collision_ratio\n";
+            << "Hash_collision_ratio,"
+            << "Pushes,"
+            << "Duplicate_pushes\n";
     }
 
     out << k << ","
@@ -490,7 +496,9 @@ inline void append_stats_to_csv(const std::string& filename,
         << stats.time_total << ","
         << stats.total_hash_inserts << ","
         << stats.total_hash_collisions << ","
-        << (stats.total_hash_inserts > 0 ? (double)stats.total_hash_collisions / stats.total_hash_inserts : 0.0) << "\n";
+        << (stats.total_hash_inserts > 0 ? (double)stats.total_hash_collisions / stats.total_hash_inserts : 0.0) << ","
+        << stats.total_pushes << ","
+        << stats.total_duplicate_pushes << "\n";
 
     out.close();
 }

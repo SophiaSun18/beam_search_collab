@@ -20,7 +20,8 @@ int BEAM_SIZE = 128;
 float PRUNE_RATIO = 0.0;
 float APPROX_RATIO = 0.0;
 bool DEBUG = false;
-constexpr bool TIMING_ENABLED = true;  // set to false to disable all timing overhead at compile time
+constexpr bool TIMING_ENABLED = false;  // set to false to disable all timing overhead at compile time
+constexpr bool DUP_HANDLING_ENABLED = false;  // set to true to enable duplicate handling
 
 SearchResult beam_cpu_rabitq(
     Graph& g, int K, int npoints,
@@ -29,6 +30,7 @@ SearchResult beam_cpu_rabitq(
 {
     // initialize the search environment
     hash_filter<vidType> is_visited(BEAM_SIZE * BEAM_SIZE);
+    hash_filter<vidType> is_added(DUP_HANDLING_ENABLED ? BEAM_SIZE * BEAM_SIZE : 1);
     vector<pair<vidType, float>> current_candidate(g.degree);
     new_pqueue_t<vidType> frontier(BEAM_SIZE);
     new_pqueue_t<vidType> result_pool(K);
@@ -39,6 +41,8 @@ SearchResult beam_cpu_rabitq(
     size_t neighbor_pruned = 0;
     size_t visited_pruned = 0;
     size_t extra_dist_cmps = 0;
+    size_t pushes = 0;
+    size_t duplicate_pushes = 0;
 
     // timing accumulators
     using clock = std::chrono::high_resolution_clock;
@@ -50,6 +54,8 @@ SearchResult beam_cpu_rabitq(
 
     // push the starting point to the frontier with max distance
     frontier.push(entry_point, FLT_MAX);
+    if constexpr (DUP_HANDLING_ENABLED) is_added.add(entry_point);
+    pushes++;
     t_queue += lap();
 
     // quantize the query once to avoid redundant computations
@@ -176,7 +182,19 @@ SearchResult beam_cpu_rabitq(
             }   // skip if already computed
             t_hash_filter += lap();
             if (frontier.size() < BEAM_SIZE || node.second < frontier.get_tail_dist()) {
-                frontier.push(node.first, node.second);
+                if constexpr (DUP_HANDLING_ENABLED) {
+                    if (is_added.add(node.first)) {
+                        frontier.push(node.first, node.second);
+                        pushes++;
+                    } else {
+                        pushes++;
+                        duplicate_pushes++;
+                        frontier.push_update(node.first, node.second);
+                    }
+                } else {
+                    frontier.push(node.first, node.second);
+                    pushes++;
+                }
             }
             t_queue += lap();   // frontier push, either push or not
         }
@@ -256,6 +274,8 @@ SearchResult beam_cpu_rabitq(
     res.time_other = t_other;
     res.hash_inserts = is_visited.get_total_inserts();
     res.hash_collisions = is_visited.get_total_collisions();
+    res.pushes = pushes;
+    res.duplicate_pushes = duplicate_pushes;
     if constexpr (TIMING_ENABLED)
         res.time_total = std::chrono::duration<double>(clock::now() - t_search_start).count();
     return res;
@@ -281,6 +301,8 @@ RunStats run_ann_experiment_rabitq(
     int64_t total_visited_pruned = 0;
     double total_time_dist_comp = 0, total_time_dist_est = 0, total_time_queue = 0, total_time_hash_filter = 0, total_time_other = 0, total_time_total = 0;
     int64_t total_hash_inserts = 0, total_hash_collisions = 0;
+    int64_t total_pushes = 0;
+    int64_t total_duplicate_pushes = 0;
     vector<vector<int>> all_results(n_query, vector<int>(K));
 
     vector<float> centroid = compute_centroid(base_vectors, n_base, dim, actual_threads);
@@ -291,7 +313,7 @@ RunStats run_ann_experiment_rabitq(
     Timer t;
     t.Start();
 
-    #pragma omp parallel for schedule(dynamic, 1) reduction(+:total_count_dc) reduction(+:total_count_ds) reduction(+:total_extra_count_dc) reduction(+:total_hop) reduction(+:total_pruned) reduction(+:total_neighbor_pruned) reduction(+:total_visited_pruned) reduction(+:total_time_dist_comp) reduction(+:total_time_dist_est) reduction(+:total_time_queue) reduction(+:total_time_hash_filter) reduction(+:total_time_other) reduction(+:total_time_total) reduction(+:total_hash_inserts) reduction(+:total_hash_collisions)
+    #pragma omp parallel for schedule(dynamic, 1) reduction(+:total_count_dc) reduction(+:total_count_ds) reduction(+:total_extra_count_dc) reduction(+:total_hop) reduction(+:total_pruned) reduction(+:total_neighbor_pruned) reduction(+:total_visited_pruned) reduction(+:total_time_dist_comp) reduction(+:total_time_dist_est) reduction(+:total_time_queue) reduction(+:total_time_hash_filter) reduction(+:total_time_other) reduction(+:total_time_total) reduction(+:total_hash_inserts) reduction(+:total_hash_collisions) reduction(+:total_pushes) reduction(+:total_duplicate_pushes)
     for (int q = 0; q < actual_query; q++) {
         const float* query_ptr = query_vectors + q * dim;
 
@@ -313,6 +335,8 @@ RunStats run_ann_experiment_rabitq(
         total_time_total += result.time_total;
         total_hash_inserts += result.hash_inserts;
         total_hash_collisions += result.hash_collisions;
+        total_pushes += result.pushes;
+        total_duplicate_pushes += result.duplicate_pushes;
     }
 
     t.Stop();
@@ -338,6 +362,8 @@ RunStats run_ann_experiment_rabitq(
     stats.time_total = total_time_total;
     stats.total_hash_inserts = total_hash_inserts;
     stats.total_hash_collisions = total_hash_collisions;
+    stats.total_pushes = total_pushes;
+    stats.total_duplicate_pushes = total_duplicate_pushes;
 
     printf("runtime: %.6f sec, recall@%d: %.6f\n", stats.runtime, K, stats.recall);
     printf("avg latency: %.6f ms/query, throughput: %.6f queries/sec\n",
