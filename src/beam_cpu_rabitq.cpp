@@ -35,6 +35,15 @@ SearchResult beam_cpu_rabitq(
     new_pqueue_t<vidType> frontier(BEAM_SIZE);
     new_pqueue_t<vidType> result_pool(K);
 
+    vector<float> appro_dist;
+    vector<uint16_t> raw_buf;
+    vector<float> result_f_buf;
+    if constexpr (FASTSCAN_ENABLED) {
+        appro_dist.resize(g.degree);
+        raw_buf.resize(g.degree);
+        result_f_buf.resize(g.degree);
+    }
+
     size_t dist_cmps = 0;
     size_t dist_est = 0;
     size_t pruned = 0;
@@ -54,9 +63,12 @@ SearchResult beam_cpu_rabitq(
 
     // push the starting point to the frontier with max distance
     frontier.push(entry_point, FLT_MAX);
-    if constexpr (DUP_HANDLING_ENABLED) is_added.add(entry_point);
     pushes++;
     t_queue += lap();
+    if constexpr (DUP_HANDLING_ENABLED) {
+        is_added.add(entry_point);
+        t_hash_filter += lap();
+    }
 
     // quantize the query once to avoid redundant computations
     auto qf = filter.query_prepare(d_query);
@@ -128,34 +140,37 @@ SearchResult beam_cpu_rabitq(
         t_other += lap();
 
         // compute the estimated distance for each neighbor
-        for (size_t i = 0; i < g.degree; i++) {
-            auto nf = filter.nbr_filter(cur_node, i);
-            dist_est++;
-            float est = filter.estimated_distance(qf, nf, exact_dist);
+        if constexpr (FASTSCAN_ENABLED) {
+            filter.scan_all_neighbors(cur_node, exact_dist, appro_dist.data(), qf, raw_buf.data(), result_f_buf.data(), DEBUG);
             t_dist_est += lap();
-            uint32_t est_bits;
-            memcpy(&est_bits, &est, sizeof(est_bits));
-            if ((est_bits & 0x7F800000u) == 0x7F800000u && (est_bits & 0x007FFFFFu) != 0) {
-                // printf("Warning: estimated distance is NaN for neighbor %lu of node %lu\n", neighbors[i], cur_node);
-                current_candidate.emplace_back(neighbors[i], -1);
-            } else {
-                // printf("current neighbor has estimated distance: %f\n", est);
+            for (size_t i = 0; i < g.degree; i++) {
+                float est = appro_dist[i];
+                dist_est++;
                 current_candidate.emplace_back(neighbors[i], est);
             }
             t_other += lap();
+        } else {
+            for (size_t i = 0; i < g.degree; i++) {
+                auto nf = filter.nbr_filter(cur_node, i);
+                dist_est++;
+                float est = filter.estimated_distance(qf, nf, exact_dist);
+                t_dist_est += lap();
+                current_candidate.emplace_back(neighbors[i], est);
+                t_other += lap();
 
-            if (DEBUG) {
-                // Debug: Print neighbor details
-                std::cout << std::fixed << std::setprecision(6)
-                        << "  Neighbor ID: " << neighbors[i]
-                        << ", Estimated Distance: " << est
-                        << ", Factors: [tx: " << nf.triple_x
-                        << ", dq: " << nf.factor_dq
-                        << ", vq: " << nf.factor_vq
-                        << ", sum q: " << qf.sum_q
-                        << ", width: " << qf.width
-                        << ", low_val: " << qf.low_val
-                        << "]\n";
+                if (DEBUG) {
+                    // Debug: Print neighbor details
+                    std::cout << std::fixed << std::setprecision(6)
+                            << "  Neighbor ID: " << neighbors[i]
+                            << ", Estimated Distance: " << est
+                            << ", Factors: [tx: " << nf.triple_x
+                            << ", dq: " << nf.factor_dq
+                            << ", vq: " << nf.factor_vq
+                            << ", sum q: " << qf.sum_q
+                            << ", width: " << qf.width
+                            << ", low_val: " << qf.low_val
+                            << "]\n";
+                }
             }
         }
 
