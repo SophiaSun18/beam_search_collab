@@ -8,7 +8,7 @@
 #include <omp.h>
 
 #include "../include/utils.h"
-#include "../include/timer.hpp"
+#include "../include/ctimer.h"
 #include "../include/pqueue.hpp"
 #include "../include/hash_filter.hpp"
 using namespace std;
@@ -146,8 +146,8 @@ RunStats run_ann_experiment_base(
     int64_t total_visited_pruned = 0;
     vector<vector<int>> all_results(n_query, vector<int>(K));
 
-    Timer t;
-    t.Start();
+    ctimer_t t;
+    ctimer_start(&t);
 
     #pragma omp parallel for schedule(dynamic, 1) reduction(+:total_count_dc) reduction(+:total_count_ds) reduction(+:total_hop) reduction(+:total_pruned) reduction(+:total_neighbor_pruned) reduction(+:total_visited_pruned)
     for (int q = 0; q < n_query; q++) {
@@ -167,10 +167,11 @@ RunStats run_ann_experiment_base(
         total_visited_pruned += result.visited_pruned;
     }
 
-    t.Stop();
+    ctimer_stop(&t);
+    ctimer_measure(&t);
 
     RunStats stats;
-    stats.runtime = t.Seconds();
+    stats.runtime = timespec_sec(t.elapsed);
     stats.latency = stats.runtime / n_query * 1000.0;
     stats.throughput = double(n_query) / stats.runtime;
     stats.recall = compute_avg_recall(all_results, groundtruth, n_query, K, dim_gt);
