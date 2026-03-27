@@ -6,21 +6,28 @@
 #include <fstream>
 #include <algorithm>
 #include <cassert>
+#include <sys/mman.h>
 
 #include "../include/utils.h"
 #include "../include/fastscan_impl.hpp"
 
-static constexpr bool FASTSCAN_ENABLED = false;  // set to true to use fastscan batch estimation
+static constexpr bool FASTSCAN_ENABLED = true;  // set to true to use fastscan batch estimation
 
-class RaBitQFilter {
+class QuantizationGraph {
 public:
+    struct QueryBuffers {
+        float* rotated_query = nullptr;
+        uint8_t* quantized_query = nullptr;
+        uint8_t* lut = nullptr;
+    };
+
     struct QueryFactors {
-        float* rotated_query;
-        uint8_t* quantized_query;
-        uint8_t* lut = nullptr;     // fastscan mode: packed LUT, size = padded_dim << 2
+        float* rotated_query = nullptr;
+        uint8_t* quantized_query = nullptr;
+        uint8_t* lut = nullptr;
         float low_val = 0.0f;
         float high_val = 0.0f;
-        float width = 0;
+        float width = 0.0f;
         int32_t sum_q = 0;
     };
 
@@ -31,30 +38,67 @@ public:
         float factor_vq;
     };
 
-    RaBitQFilter(size_t dim, int degree, const std::string& table_path, const std::string& signs_path)
-        : dim_(dim), degree_(degree) {
+    // SymQG codebook file layout: 
+    // entry point id
+    // for each node: raw vector | packed codes | factors | neighbor IDs
+    QuantizationGraph(size_t num_node, size_t dim, int degree, const std::string& codebook_path)
+        : num_nodes_(num_node), dim_(dim), degree_(degree) {
 
+        // pad the raw vector's dimension to the nearest power of 2 
         padded_dim_ = 1ULL << (size_t)std::ceil(std::log2(dim_));
-        bitcode_words_ = padded_dim_ / 64;
-        code_u64_per_node_ = static_cast<size_t>(degree_) * bitcode_words_;
 
-        size_t n_signs, d_signs;
-        signs_ptr_ = read_bin<float>(signs_path.c_str(), n_signs, d_signs);
-        assert(n_signs * d_signs >= padded_dim_);
+        // QG-style offsets (in units of float)
+        code_offset_     = dim_;
+        factor_offset_   = code_offset_ + padded_dim_ / 64 * 2 * degree_;   // x2 as 1 uint64_t = 64 bits = 2 floats
+        neighbor_offset_ = factor_offset_ + 3 * degree_;
+        row_offset_      = neighbor_offset_ + degree_;
 
-        size_t n_nodes, d_node_data;
-        table_ptr_ = read_bin<uint64_t>(table_path.c_str(), n_nodes, d_node_data);
-        words_per_node_ = d_node_data;
+        // load from the codebook
+        std::ifstream fin(codebook_path, std::ios::binary);
+        if (!fin) throw std::runtime_error("Cannot open codebook file: " + codebook_path);
 
-        size_t factor_floats = static_cast<size_t>(degree_) * 3;
-        size_t expected_words = code_u64_per_node_ + (factor_floats * sizeof(float) + 7) / sizeof(uint64_t);
-        assert(words_per_node_ == expected_words);
+        // load the entry point
+        fin.read(reinterpret_cast<char*>(&entry_point_), sizeof(uint32_t));
+
+        // load the data table
+        size_t total_floats = num_nodes_ * row_offset_;
+        size_t total_bytes = total_floats * sizeof(float);
+
+        constexpr size_t kHugePageAlign = 1 << 22;  // 4 MB
+        size_t alloc_bytes = (total_bytes + kHugePageAlign - 1) & ~(kHugePageAlign - 1);
+
+        data_ = static_cast<float*>(std::aligned_alloc(kHugePageAlign, alloc_bytes));
+        madvise(data_, alloc_bytes, MADV_HUGEPAGE);
+
+        fin.read(reinterpret_cast<char*>(data_), total_floats * sizeof(float));
+
+        // load the sign table
+        signs_ptr_ = static_cast<float*>(std::aligned_alloc(64, padded_dim_ * sizeof(float)));
+        fin.read(reinterpret_cast<char*>(signs_ptr_), padded_dim_ * sizeof(float));
+
+        fin.close();
+
+        // print to ensure loaded successfully
+        printf("Loaded codebook: %zu nodes, dim=%zu, degree=%d, padded_dim=%zu, row_offset=%zu floats (entry_point=%u)\n",
+               num_nodes_, dim_, degree_, padded_dim_, row_offset_, entry_point_);
     }
 
-    QueryFactors query_prepare(const float* query_raw) const {
+    ~QuantizationGraph() {
+        std::free(data_);
+        std::free(signs_ptr_);
+    }
+
+    QueryFactors query_prepare(const float* query_raw, const QueryBuffers& scratch) const {
         QueryFactors qf;
-        qf.rotated_query = static_cast<float*>(aligned_alloc(64, padded_dim_ * sizeof(float)));
-        qf.quantized_query = static_cast<uint8_t*>(aligned_alloc(64, padded_dim_ * sizeof(uint8_t)));
+        qf.rotated_query = scratch.rotated_query;
+        qf.quantized_query = scratch.quantized_query;
+        qf.lut = scratch.lut;
+
+        assert(qf.rotated_query != nullptr);
+        assert(qf.quantized_query != nullptr);
+        if constexpr (FASTSCAN_ENABLED) {
+            assert(qf.lut != nullptr);
+        }
 
         // rotate the query
         rotate_vector(query_raw, qf.rotated_query, signs_ptr_, dim_, padded_dim_);
@@ -66,23 +110,18 @@ public:
             qf.high_val = std::max(qf.high_val, tmp);
         }
         qf.width = (qf.high_val - qf.low_val) / ((1 << QG_BQUERY) - 1);
-        // std::cout << std::fixed << std::setprecision(20) << "Query data range: [" << qf.low_val << ", " << qf.high_val << "], width: " << qf.width << " QG_BQUERY: " << QG_BQUERY << "\n";
-        // std::cout << std::fixed << std::setprecision(20) << "high - low: " << (qf.high_val - qf.low_val) << " divisor: " << ((1 << QG_BQUERY) - 1) << "\n";
 
         // quantize the query 
         float inv_width = 1.0F / qf.width;
         int32_t sum = 0;
-        // std::cout << "1/width: " << std::fixed << std::setprecision(20) << inv_width << "\n";
         for (size_t i = 0; i < padded_dim_; ++i) {
             uint8_t cur = static_cast<uint8_t>(std::lround(((qf.rotated_query[i] - qf.low_val) * inv_width) + 0.5));
             qf.quantized_query[i] = cur;
             sum += cur;
-            // std::cout << "i: " << i << " rotated: " << std::fixed << std::setprecision(20) << qf.rotated_query[i] << " quantized: " << static_cast<uint32_t>(qf.quantized_query[i]) << " sum: " << sum << "\n";
         }
         qf.sum_q = sum;
 
         if constexpr (FASTSCAN_ENABLED) {
-            qf.lut = static_cast<uint8_t*>(aligned_alloc(64, padded_dim_ << 2));
             pack_lut_impl(padded_dim_, qf.quantized_query, qf.lut);
         }
 
@@ -90,9 +129,9 @@ public:
     }
 
     NeighborFactors nbr_filter(uint32_t node_idx, int neighbor_rank) const {
-        const uint64_t* node_ptr = table_ptr_ + (static_cast<size_t>(node_idx) * words_per_node_);
-        const uint64_t* bits = node_ptr + neighbor_rank * bitcode_words_;
-        const float* factors = reinterpret_cast<const float*>(node_ptr + code_u64_per_node_);
+        const uint64_t* codes = get_binary_codes(node_idx);
+        const uint64_t* bits = codes + neighbor_rank * padded_dim_ / 64;
+        const float* factors = get_factor(node_idx);
         return { bits, factors[neighbor_rank], factors[degree_ + neighbor_rank], factors[2 * degree_ + neighbor_rank] };
     }
 
@@ -185,13 +224,10 @@ public:
         bool debug_print_
     ) const {
         size_t num_blocks   = static_cast<size_t>(degree_) / kBatchSize;
-        size_t packed_bytes = num_blocks * padded_dim_ * 4;
 
-        // locate the values of the current node in the codebook
-        const uint8_t* node_data = reinterpret_cast<const uint8_t*>(
-            table_ptr_ + static_cast<size_t>(node_idx) * words_per_node_);
-        const uint8_t* packed_code = node_data;
-        const float* factors  = reinterpret_cast<const float*>(node_data + packed_bytes);
+        // locate codes and factors from the codebook row
+        const uint8_t* packed_code = reinterpret_cast<const uint8_t*>(get_row(node_idx) + code_offset_);
+        const float* factors  = get_factor(node_idx);
         const float* triple_x = factors;
         const float* fac_dq   = triple_x + degree_;
         const float* fac_vq   = fac_dq   + degree_;
@@ -202,7 +238,7 @@ public:
         }
 
         // Step 2: convert uint16 raw sums to float: result = (raw * 2) - sum_q
-#if defined(__AVX512F__)
+    #if defined(__AVX512F__)
         {
             const __m512i qq = _mm512_set1_epi32(qf.sum_q);
             for (size_t i = 0; i < static_cast<size_t>(degree_); i += 32) {
@@ -216,10 +252,10 @@ public:
                 _mm512_storeu_ps(&result_float[i + 16], _mm512_cvtepi32_ps(i32b));
             }
         }
-#else
+    #else
         for (size_t i = 0; i < degree_; ++i)
             result_float[i] = static_cast<float>((static_cast<int>(result_raw[i]) << 1) - qf.sum_q);
-#endif
+    #endif
 
         // Step 3: compute final approximate distances
         appro_dist_impl(degree_, exact_dist, qf.width, qf.low_val,
@@ -244,24 +280,47 @@ public:
     }
 
     void prefetch_nbr(uint32_t node_idx) const {
-        const char* base = reinterpret_cast<const char*>(
-            table_ptr_ + static_cast<size_t>(node_idx) * words_per_node_);
-        size_t total_bytes = words_per_node_ * sizeof(uint64_t);
-        for (size_t off = 0; off < total_bytes; off += 64)
-            __builtin_prefetch(base + off, 0, 0);
+        // prefetch raw vector + codes + factors
+        const char* base = reinterpret_cast<const char*>(get_row(node_idx));
+        size_t bytes = neighbor_offset_ * sizeof(float);
+        mem_prefetch_l2(reinterpret_cast<const char*>(base), 10);
+        // for (size_t off = 0; off < bytes; off += 64)
+        //     __builtin_prefetch(base + off, 0, 0);
     }
 
-    float* get_signs_ptr() const {
-        return signs_ptr_;
+    inline const float* get_row(uint32_t node_idx) const {
+        return data_ + static_cast<size_t>(node_idx) * row_offset_;
     }
+
+    inline const uint64_t* get_binary_codes(uint32_t node_idx) const {
+        return reinterpret_cast<const uint64_t*>(get_row(node_idx) + code_offset_);
+    }
+
+    inline const float* get_factor(uint32_t node_idx) const {
+        return get_row(node_idx) + factor_offset_;
+    }
+    
+    inline const uint32_t* get_neighbors(uint32_t node_idx) const {
+        return reinterpret_cast<const uint32_t*>(get_row(node_idx) + neighbor_offset_);
+    }
+
+    inline float* get_signs_ptr() const { return signs_ptr_; }
+    inline int get_degree() const { return degree_; }
+    inline vidType get_entry_point() const { return entry_point_; }
 
 private:
+    size_t num_nodes_;
     size_t dim_, padded_dim_;
-    int degree_, bitcode_words_;
-    size_t code_u64_per_node_;
-    size_t words_per_node_;
+    int degree_;
+    size_t bitcode_words_;
+    vidType entry_point_;
 
-    // Pointers to data loaded via read_bin
+    // QG-style offsets (in units of float)
+    size_t code_offset_;
+    size_t factor_offset_;
+    size_t neighbor_offset_;
+    size_t row_offset_;
+
+    float* data_ = nullptr;
     float* signs_ptr_ = nullptr;
-    uint64_t* table_ptr_ = nullptr;
 };
