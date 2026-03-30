@@ -2,9 +2,10 @@
 #include <fstream>
 #include <vector>
 #include <algorithm>
-#include <cmath> 
+#include <cmath>
 #include <cfloat>
-#include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <omp.h>
 
 #include "../include/utils.h"
@@ -18,37 +19,45 @@ int BEAM_SIZE = 128;
 float PRUNE_RATIO = 0.0;
 float APPROX_RATIO = 0.0;
 
+#define TIMING_ENABLED 1
+
+#if TIMING_ENABLED
+#define TSTART(tc) ctimer_start(&(tc))
+#define TSTOP(tc)  do { ctimer_stop(&(tc)); ctimer_lap(&(tc)); } while(0)
+#else
+#define TSTART(tc) ((void)0)
+#define TSTOP(tc)  ((void)0)
+#endif
+
 SearchResult beam_cpu_base(
     Graph& g, int K, int npoints,
     const float* d_data, const float* d_query, size_t dim,
-    const vector<vidType>& starting_points)
+    vidType entry_point)
 {
     // initialize the search environment
     hash_filter<vidType> is_visited(BEAM_SIZE * BEAM_SIZE);     // hash table to store visited nodes
-    int count_expanded = 0;                                     // number of expanded nodes
     new_pqueue_t<vidType> frontier(BEAM_SIZE);                  // current frontier to hold all candidates
     vector<pair<vidType, float>> curr_candidate(g.degree);      // the distance of each neighbor, used in pruning, clear after each iteration
 
     size_t dist_cmps = 0;                                       // number of distance computations
     size_t dist_est = 0;
+    size_t extra_dist_cmps = 0;
     size_t pruned = 0;                                          // number of pruned neighbor candidates
     size_t neighbor_pruned = 0;
     size_t visited_pruned = 0;
+    size_t pushes = 0;
+    size_t duplicate_pushes = 0;
 
-    // initialize the current frontier with randomly picked starting points and compute their distances
-    int start_node = -1;
-    float start_dist = FLT_MAX;
+    // fine-grained timing accumulators
+    ctimer_t tc_dist_comp, tc_queue_pop, tc_queue_push, tc_hash_filter;
+    ctimer_reset(&tc_dist_comp); ctimer_reset(&tc_queue_pop);
+    ctimer_reset(&tc_queue_push); ctimer_reset(&tc_hash_filter);
 
-    for (vidType p_id : starting_points) {
-        float dist = compute_distance(dim, d_query, d_data + p_id * dim);
-        dist_cmps++;
-        if (dist < start_dist) {
-            start_node = p_id;
-            start_dist = dist;
-        }
-    }
-    frontier.push(start_node, start_dist);
-    is_visited.add(start_node);
+    // push the fixed entry point to the frontier with max distance
+    TSTART(tc_queue_push);
+    frontier.push(entry_point, FLT_MAX);
+    pushes++;
+    TSTOP(tc_queue_push);
 
     int iter = 0;
     while (frontier.has_unexpanded()) {    
@@ -56,10 +65,11 @@ SearchResult beam_cpu_base(
         curr_candidate.clear();
 
         // get the closest unexpanded node in the frontier
+        TSTART(tc_queue_pop);
         int idx = frontier.get_next_index();
         g.prefetch_node(frontier[idx]);
         frontier.set_front_expanded();
-        count_expanded++;
+        TSTOP(tc_queue_pop);
 
         // expand the current node
         const vidType* neighbors = g.get_neighbors(frontier[idx]);
@@ -71,20 +81,29 @@ SearchResult beam_cpu_base(
         // count the exact distance between each neighbor and the query
         for (size_t i = 0; i < g.degree; i++) {
             vidType n = neighbors[i];
+            TSTART(tc_hash_filter);
             if (is_visited.contains(n)) {
                 visited_pruned++;
                 pruned++;
+                TSTOP(tc_hash_filter);
                 continue;   // skip if already computed
             }
-            
+            TSTOP(tc_hash_filter);
+
+            TSTART(tc_dist_comp);
             float dist = compute_distance(dim, d_query, d_data + n * dim);
-            is_visited.add(n);
             dist_cmps++;
+            TSTOP(tc_dist_comp);
+
+            TSTART(tc_hash_filter);
+            is_visited.add(n);
+            TSTOP(tc_hash_filter);
             curr_candidate.emplace_back(n, dist);
         }
 
         // only do pruning when current iteration is in distance approximation stage
-        if (iter > BEAM_SIZE * APPROX_RATIO) {
+        // if (iter > BEAM_SIZE * APPROX_RATIO) {
+        if (iter < 0) {
             // partial sort the neighbors by their distance to the query and prune by the ratio
             size_t num_kept = g.degree * (1 - PRUNE_RATIO);
             size_t iter_pruned = 0;
@@ -101,12 +120,15 @@ SearchResult beam_cpu_base(
         }
 
         // add the candidates after pruning into the frontier
-        for (int i = 0; i < curr_candidate.size(); i++) {
+        for (size_t i = 0; i < curr_candidate.size(); i++) {
             vidType n = curr_candidate[i].first;
             float dist = curr_candidate[i].second;
+            TSTART(tc_queue_push);
             if (frontier.size() < BEAM_SIZE || dist < frontier.get_tail_dist()) {
                 frontier.push(n, dist);
+                pushes++;
             }
+            TSTOP(tc_queue_push);
         }
     }
 
@@ -120,10 +142,19 @@ SearchResult beam_cpu_base(
     res.neighbors = move(result);
     res.dist_cmps = dist_cmps;
     res.dist_est = dist_est;
+    res.extra_dist_cmps = extra_dist_cmps;
     res.iters = iter;
     res.pruned = pruned;
     res.neighbor_pruned = neighbor_pruned;
     res.visited_pruned = visited_pruned;
+    res.time_dist_comp = timespec_sec(tc_dist_comp.elapsed);
+    res.time_queue_pop = timespec_sec(tc_queue_pop.elapsed);
+    res.time_queue_push = timespec_sec(tc_queue_push.elapsed);
+    res.time_hash_filter = timespec_sec(tc_hash_filter.elapsed);
+    res.hash_inserts = is_visited.get_total_inserts();
+    res.hash_collisions = is_visited.get_total_collisions();
+    res.pushes = pushes;
+    res.duplicate_pushes = duplicate_pushes;
     return res;
 }
 
@@ -140,31 +171,54 @@ RunStats run_ann_experiment_base(
 
     int64_t total_count_dc = 0;
     int64_t total_count_ds = 0;
+    int64_t total_extra_count_dc = 0;
     int64_t total_hop = 0;
     int64_t total_pruned = 0;
     int64_t total_neighbor_pruned = 0;
     int64_t total_visited_pruned = 0;
+    double total_time_dist_comp = 0, total_time_queue_pop = 0;
+    double total_time_queue_push = 0, total_time_hash_filter = 0;
+    int64_t total_hash_inserts = 0, total_hash_collisions = 0;
+    int64_t total_pushes = 0;
+    int64_t total_duplicate_pushes = 0;
     vector<vector<int>> all_results(n_query, vector<int>(K));
+
+    // compute fixed entry point: centroid of base vectors -> nearest neighbor
+    vector<float> centroid = compute_centroid(base_vectors, n_base, dim, actual_threads);
+    vidType entry_point = exact_nn(base_vectors, centroid.data(), n_base, dim, actual_threads);
+    cout << "Entry point: " << entry_point << "\n";
 
     ctimer_t t;
     ctimer_start(&t);
 
-    #pragma omp parallel for schedule(dynamic, 1) reduction(+:total_count_dc) reduction(+:total_count_ds) reduction(+:total_hop) reduction(+:total_pruned) reduction(+:total_neighbor_pruned) reduction(+:total_visited_pruned)
+    #pragma omp parallel for schedule(dynamic, 1) \
+        reduction(+:total_count_dc) reduction(+:total_count_ds) reduction(+:total_extra_count_dc) \
+        reduction(+:total_hop) reduction(+:total_pruned) reduction(+:total_neighbor_pruned) reduction(+:total_visited_pruned) \
+        reduction(+:total_time_dist_comp) reduction(+:total_time_queue_pop) \
+        reduction(+:total_time_queue_push) reduction(+:total_time_hash_filter) \
+        reduction(+:total_hash_inserts) reduction(+:total_hash_collisions) \
+        reduction(+:total_pushes) reduction(+:total_duplicate_pushes)
     for (int q = 0; q < n_query; q++) {
-        vector<vidType> starting_points(K);
-        for (int i = 0; i < K; i++)
-            starting_points[i] = rand() % n_base;
         const float* query_ptr = query_vectors + q * dim;
 
-        SearchResult result = beam_cpu_base(g, K, n_base, base_vectors, query_ptr, dim, starting_points);
-            
+        SearchResult result = beam_cpu_base(g, K, n_base, base_vectors, query_ptr, dim, entry_point);
+
         all_results[q] = result.neighbors;
         total_count_dc += result.dist_cmps;
         total_count_ds += result.dist_est;
+        total_extra_count_dc += result.extra_dist_cmps;
         total_hop += result.iters;
         total_pruned += result.pruned;
         total_neighbor_pruned += result.neighbor_pruned;
         total_visited_pruned += result.visited_pruned;
+        total_time_dist_comp += result.time_dist_comp;
+        total_time_queue_pop += result.time_queue_pop;
+        total_time_queue_push += result.time_queue_push;
+        total_time_hash_filter += result.time_hash_filter;
+        total_hash_inserts += result.hash_inserts;
+        total_hash_collisions += result.hash_collisions;
+        total_pushes += result.pushes;
+        total_duplicate_pushes += result.duplicate_pushes;
     }
 
     ctimer_stop(&t);
@@ -177,20 +231,49 @@ RunStats run_ann_experiment_base(
     stats.recall = compute_avg_recall(all_results, groundtruth, n_query, K, dim_gt);
     stats.total_dc = total_count_dc;
     stats.total_ds = total_count_ds;
+    stats.total_extra_dc = total_extra_count_dc;
+    stats.total_full_dc = total_count_dc + total_extra_count_dc;
     stats.total_iter = total_hop;
     stats.total_pruned = total_pruned;
     stats.total_neighbor_pruned = total_neighbor_pruned;
     stats.total_visited_pruned = total_visited_pruned;
+    stats.time_dist_comp = total_time_dist_comp;
+    stats.time_queue_pop = total_time_queue_pop;
+    stats.time_queue_push = total_time_queue_push;
+    stats.time_hash_filter = total_time_hash_filter;
+    stats.total_hash_inserts = total_hash_inserts;
+    stats.total_hash_collisions = total_hash_collisions;
+    stats.total_pushes = total_pushes;
+    stats.total_duplicate_pushes = total_duplicate_pushes;
 
     printf("runtime: %.6f sec, recall@%d: %.6f\n", stats.runtime, K, stats.recall);
     printf("avg latency: %.6f ms/query, throughput: %.6f queries/sec\n",
            stats.latency, stats.throughput);
-    cout << "total # distance computation: " << stats.total_dc << "\n";
-    cout << "average # distance computation: " << stats.total_dc / n_query << "\n";
+    cout << "total # distance computation: " << stats.total_full_dc << "\n";
+    cout << "average # distance computation: " << stats.total_full_dc / n_query << "\n";
     cout << "total # iteration: " << stats.total_iter << "\n";
     cout << "average # iteration: " << stats.total_iter / n_query << "\n";
     cout << "total # pruned neighbors: " << stats.total_pruned << "\n";
     cout << "average # pruned neighbors: " << stats.total_pruned / n_query << "\n";
+    double t_sum = stats.time_dist_comp + stats.time_nbr_filter + stats.time_dist_est
+                 + stats.time_queue_pop + stats.time_queue_push
+                 + stats.time_hash_filter + stats.time_query_prepare;
+    printf("--- Timing breakdown (total across queries) ---\n");
+    printf("  dist computation:  %.6f sec (%.1f%%)\n", stats.time_dist_comp, t_sum > 0 ? stats.time_dist_comp / t_sum * 100 : 0.0);
+    printf("  nbr filter:        %.6f sec (%.1f%%)\n", stats.time_nbr_filter, t_sum > 0 ? stats.time_nbr_filter / t_sum * 100 : 0.0);
+    printf("  est dist:          %.6f sec (%.1f%%)\n", stats.time_dist_est, t_sum > 0 ? stats.time_dist_est / t_sum * 100 : 0.0);
+    printf("  queue pop:         %.6f sec (%.1f%%)\n", stats.time_queue_pop, t_sum > 0 ? stats.time_queue_pop / t_sum * 100 : 0.0);
+    printf("  queue push:        %.6f sec (%.1f%%)\n", stats.time_queue_push, t_sum > 0 ? stats.time_queue_push / t_sum * 100 : 0.0);
+    printf("  hash filter:       %.6f sec (%.1f%%)\n", stats.time_hash_filter, t_sum > 0 ? stats.time_hash_filter / t_sum * 100 : 0.0);
+    printf("  query prepare:     %.6f sec (%.1f%%)\n", stats.time_query_prepare, t_sum > 0 ? stats.time_query_prepare / t_sum * 100 : 0.0);
+    printf("  sum:                  %.6f sec\n", t_sum);
+    printf("  wall-clock runtime:   %.6f sec\n", stats.runtime);
+    printf("  gap (unmeasured):     %.6f sec (%.1f%% of runtime)\n", stats.runtime - t_sum, stats.runtime > 0 ? (stats.runtime - t_sum) / stats.runtime * 100 : 0.0);
+    printf("--- Hash collision stats ---\n");
+    printf("  total inserts:    %ld\n", stats.total_hash_inserts);
+    printf("  total collisions: %ld\n", stats.total_hash_collisions);
+    printf("  collision ratio:  %.4f%%\n", stats.total_hash_inserts > 0 ? (double)stats.total_hash_collisions / stats.total_hash_inserts * 100 : 0.0);
+    printf("  avg collisions per query: %.1f\n", (double)stats.total_hash_collisions / n_query);
 
     return stats;
 }
