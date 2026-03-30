@@ -344,3 +344,132 @@ public:
     //_check_invariant();
   }
 };
+
+template <typename T>
+struct pqueue_entry {
+  T vid;
+  float dist;
+  uint8_t expanded;
+};
+
+// alternative: array of struct instead of struct of array
+template <typename T>
+class struct_pqueue_t {
+private:
+  int queue_size;
+  int queue_capacity;
+  int next_idx, next_idx2;
+
+  void _check_invariant() {
+    assert(queue_size <= queue_capacity);
+    assert(next_idx <= queue_size);
+    assert((next_idx == queue_size) || !entries[next_idx].expanded);
+    assert(next_idx2 <= queue_size);
+    assert((next_idx2 == queue_size) || !entries[next_idx2].expanded);
+    assert(next_idx <= next_idx2);
+    assert((next_idx == queue_size) || (next_idx < next_idx2));
+  }
+
+  std::vector<pqueue_entry<T>> entries;
+
+public:
+  struct_pqueue_t(int L) {
+    next_idx = next_idx2 = 0;
+    queue_size = 0;
+    queue_capacity = L;
+    entries.resize(L + 1);
+    for (auto& e : entries) e.expanded = 0;
+  }
+
+  T& operator[](size_t i) { return entries[i].vid; }
+  const T& operator[](size_t i) const { return entries[i].vid; }
+  int get_capacity() const { return queue_capacity; }
+  int get_next_index() const { return next_idx; }
+  int get_next_index2() const { return next_idx2; }
+  float get_tail_dist() const { return queue_size == 0 ? FLT_MAX : entries[queue_size - 1].dist; }
+  float get_dist(int idx) const { return entries[idx].dist; }
+  bool is_expanded(int idx) const { return entries[idx].expanded == 1; }
+  int size() { return queue_size; }
+  void clear() { queue_size = 0; next_idx = 0; }
+
+  bool has_unexpanded() { return next_idx < queue_size; }
+  bool has_second_unexpanded() { return next_idx2 < queue_size; }
+
+  void set_front_expanded() {
+    entries[next_idx].expanded = 1;
+    next_idx = next_idx2;
+    if (next_idx2 < queue_size) next_idx2++;
+    while ((next_idx2 < queue_size) && entries[next_idx2].expanded) next_idx2++;
+    //_check_invariant();
+  }
+
+  void push(T vid, float dist) {
+    if ((queue_size == queue_capacity) && (dist > entries[queue_size - 1].dist))
+      return;
+
+    // binary search on dist field
+    int lo = 0, hi = queue_size;
+    while (lo < hi) {
+      int mid = (lo + hi) >> 1;
+      if (entries[mid].dist < dist) lo = mid + 1;
+      else hi = mid;
+    }
+    int insert_loc = lo;
+
+    if (insert_loc < queue_size) {
+      auto num = queue_size - insert_loc;
+      memmove(reinterpret_cast<char*>(&entries[insert_loc + 1]),
+              reinterpret_cast<char*>(&entries[insert_loc]),
+              num * sizeof(pqueue_entry<T>));
+    }
+    entries[insert_loc] = {vid, dist, 0};
+    if (queue_size < queue_capacity) queue_size++;
+    if (insert_loc <= next_idx) {
+      next_idx2 = (next_idx == queue_size) ? queue_size : next_idx + 1;
+      next_idx = insert_loc;
+    }
+    else if (insert_loc <= next_idx2) next_idx2 = insert_loc;
+    //_check_invariant();
+  }
+
+  void push_update(T vid, float dist) {
+    if ((queue_size == queue_capacity) && (dist > entries[queue_size - 1].dist))
+      return;
+
+    int existing_loc = -1;
+    for (int i = 0; i < queue_size; i++) {
+      if (entries[i].vid == vid) { existing_loc = i; break; }
+    }
+    if (existing_loc < 0) return;
+
+    if (entries[existing_loc].dist <= dist) return;
+
+    // binary search up to existing_loc
+    int lo = 0, hi = existing_loc;
+    while (lo < hi) {
+      int mid = (lo + hi) >> 1;
+      if (entries[mid].dist < dist) lo = mid + 1;
+      else hi = mid;
+    }
+    int insert_loc = lo;
+
+    auto num = existing_loc - insert_loc;
+    if (num > 0) {
+      memmove(reinterpret_cast<char*>(&entries[insert_loc + 1]),
+              reinterpret_cast<char*>(&entries[insert_loc]),
+              num * sizeof(pqueue_entry<T>));
+    }
+    entries[insert_loc] = {vid, dist, 0};
+
+    // Recompute next_idx/next_idx2 since the shift may have moved them
+    next_idx = queue_size;
+    next_idx2 = queue_size;
+    for (int k = 0; k < queue_size; k++) {
+      if (!entries[k].expanded) {
+        if (next_idx == queue_size) next_idx = k;
+        else { next_idx2 = k; break; }
+      }
+    }
+    //_check_invariant();
+  }
+};

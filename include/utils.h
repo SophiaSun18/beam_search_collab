@@ -177,12 +177,14 @@ struct RunStats {
     int64_t total_pruned;
     int64_t total_neighbor_pruned;
     int64_t total_visited_pruned;
+    // fine-grained timers
     double time_dist_comp = 0;
-    double time_dist_est = 0;
-    double time_queue = 0;
-    double time_hash_filter = 0;
-    double time_other = 0;
-    double time_total = 0;
+    double time_nbr_filter = 0;       // fetching neighbor factors
+    double time_dist_est = 0;         // actual distance estimation computation
+    double time_queue_pop = 0;        // frontier pop (get_next_index + set_front_expanded)
+    double time_queue_push = 0;       // frontier + result_pool push
+    double time_hash_filter = 0;      // is_visited check + add
+    double time_query_prepare = 0;    // query_prepare
     int64_t total_hash_inserts = 0;
     int64_t total_hash_collisions = 0;
     int64_t total_pushes = 0;
@@ -198,12 +200,14 @@ struct SearchResult {
     size_t pruned;
     size_t neighbor_pruned;
     size_t visited_pruned;
-    double time_dist_comp = 0;      // exact distance computations (seconds)
-    double time_dist_est = 0;       // estimated distance computations (seconds)
-    double time_queue = 0;          // queue/frontier management (seconds)
-    double time_hash_filter = 0;    // hash filter checks and updates (seconds)
-    double time_other = 0;          // everything else (seconds)
-    double time_total = 0;          // wall-clock time of entire search call (seconds)
+    // fine-grained timers (seconds)
+    double time_dist_comp = 0;        // exact distance computations
+    double time_nbr_filter = 0;       // fetching neighbor factors
+    double time_dist_est = 0;         // actual distance estimation computation
+    double time_queue_pop = 0;        // frontier pop
+    double time_queue_push = 0;       // frontier + result_pool push
+    double time_hash_filter = 0;      // is_visited check + add
+    double time_query_prepare = 0;    // query_prepare
     size_t hash_inserts = 0;
     size_t hash_collisions = 0;
     size_t pushes = 0;
@@ -390,7 +394,7 @@ inline void get_sign_bit_vec(const float* n1, const float* n2, uint32_t* out, si
 inline int get_matching_bits(const uint32_t* a, const uint32_t* b, size_t words) {
     int dist = 0;
     // #pragma omp simd reduction(- : dist) aligned(a, b : 8)
-    for (int i = 0; i < words; ++i)
+    for (int i = 0; i < static_cast<int>(words); ++i)
         dist -= __builtin_popcount(a[i] ^ b[i]);
     return dist;
 }
@@ -460,11 +464,12 @@ inline void append_stats_to_csv(const std::string& filename,
             << "Total_neighbor_pruned,"
             << "Total_visited_pruned,"
             << "Time_dist_comp,"
+            << "Time_nbr_filter,"
             << "Time_dist_est,"
-            << "Time_queue,"
+            << "Time_queue_pop,"
+            << "Time_queue_push,"
             << "Time_hash_filter,"
-            << "Time_other,"
-            << "Time_total,"
+            << "Time_query_prepare,"
             << "Hash_inserts,"
             << "Hash_collisions,"
             << "Hash_collision_ratio,"
@@ -489,11 +494,12 @@ inline void append_stats_to_csv(const std::string& filename,
         << stats.total_neighbor_pruned << ","
         << stats.total_visited_pruned << ","
         << stats.time_dist_comp << ","
+        << stats.time_nbr_filter << ","
         << stats.time_dist_est << ","
-        << stats.time_queue << ","
+        << stats.time_queue_pop << ","
+        << stats.time_queue_push << ","
         << stats.time_hash_filter << ","
-        << stats.time_other << ","
-        << stats.time_total << ","
+        << stats.time_query_prepare << ","
         << stats.total_hash_inserts << ","
         << stats.total_hash_collisions << ","
         << (stats.total_hash_inserts > 0 ? (double)stats.total_hash_collisions / stats.total_hash_inserts : 0.0) << ","
@@ -823,4 +829,101 @@ inline void dump_rabitq_table(const std::string& bin_file, const std::string& tx
 
     std::cout << "Dumped rabitq table " << bin_file << " to " << txt_file
               << " (" << dump_n << "/" << n << " nodes)\n";
+}
+
+static inline void prefetch_l2(const void* addr) {
+#if defined(__SSE2__)
+    _mm_prefetch((const char*)addr, _MM_HINT_T1);
+#else
+    __builtin_prefetch(addr, 0, 2);
+#endif
+}
+
+inline void mem_prefetch_l2(const char* ptr, size_t num_lines) {
+    switch (num_lines) {
+        default:
+            [[fallthrough]];
+        case 20:
+            prefetch_l2(ptr);
+            ptr += 64;
+            [[fallthrough]];
+        case 19:
+            prefetch_l2(ptr);
+            ptr += 64;
+            [[fallthrough]];
+        case 18:
+            prefetch_l2(ptr);
+            ptr += 64;
+            [[fallthrough]];
+        case 17:
+            prefetch_l2(ptr);
+            ptr += 64;
+            [[fallthrough]];
+        case 16:
+            prefetch_l2(ptr);
+            ptr += 64;
+            [[fallthrough]];
+        case 15:
+            prefetch_l2(ptr);
+            ptr += 64;
+            [[fallthrough]];
+        case 14:
+            prefetch_l2(ptr);
+            ptr += 64;
+            [[fallthrough]];
+        case 13:
+            prefetch_l2(ptr);
+            ptr += 64;
+            [[fallthrough]];
+        case 12:
+            prefetch_l2(ptr);
+            ptr += 64;
+            [[fallthrough]];
+        case 11:
+            prefetch_l2(ptr);
+            ptr += 64;
+            [[fallthrough]];
+        case 10:
+            prefetch_l2(ptr);
+            ptr += 64;
+            [[fallthrough]];
+        case 9:
+            prefetch_l2(ptr);
+            ptr += 64;
+            [[fallthrough]];
+        case 8:
+            prefetch_l2(ptr);
+            ptr += 64;
+            [[fallthrough]];
+        case 7:
+            prefetch_l2(ptr);
+            ptr += 64;
+            [[fallthrough]];
+        case 6:
+            prefetch_l2(ptr);
+            ptr += 64;
+            [[fallthrough]];
+        case 5:
+            prefetch_l2(ptr);
+            ptr += 64;
+            [[fallthrough]];
+        case 4:
+            prefetch_l2(ptr);
+            ptr += 64;
+            [[fallthrough]];
+        case 3:
+            prefetch_l2(ptr);
+            ptr += 64;
+            [[fallthrough]];
+        case 2:
+            prefetch_l2(ptr);
+            ptr += 64;
+            [[fallthrough]];
+        case 1:
+            prefetch_l2(ptr);
+            ptr += 64;
+            [[fallthrough]];
+        case 0:
+            break;
+    }
 }
