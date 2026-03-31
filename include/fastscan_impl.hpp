@@ -134,6 +134,41 @@ inline void accumulate_impl(
     __m512i accu2 = _mm512_setzero_si512();
     __m512i accu3 = _mm512_setzero_si512();
 
+    auto dump_checkpoint = [&](const char* tag, size_t processed_dim) {
+        alignas(64) uint16_t tmp[32];
+
+        __m512i a0 = accu0;
+        __m512i a1 = accu1;
+        __m512i a2 = accu2;
+        __m512i a3 = accu3;
+
+        a0 = _mm512_sub_epi16(a0, _mm512_slli_epi16(a1, 8));
+        a2 = _mm512_sub_epi16(a2, _mm512_slli_epi16(a3, 8));
+
+        __m512i ret1 = _mm512_add_epi16(
+            _mm512_mask_blend_epi64(0b11110000, a0, a1),
+            _mm512_shuffle_i64x2(a0, a1, 0b01001110)
+        );
+        __m512i ret2 = _mm512_add_epi16(
+            _mm512_mask_blend_epi64(0b11110000, a2, a3),
+            _mm512_shuffle_i64x2(a2, a3, 0b01001110)
+        );
+
+        __m512i ret = _mm512_setzero_si512();
+        ret = _mm512_add_epi16(ret, _mm512_shuffle_i64x2(ret1, ret2, 0b10001000));
+        ret = _mm512_add_epi16(ret, _mm512_shuffle_i64x2(ret1, ret2, 0b11011101));
+
+        _mm512_storeu_si512(reinterpret_cast<void*>(tmp), ret);
+
+        std::cout << tag
+                << " processed_dim=" << processed_dim
+                << " lane0=" << tmp[0]
+                << " lane1=" << tmp[1]
+                << " lane2=" << tmp[2]
+                << " lane3=" << tmp[3]
+                << "\n";
+    };
+
     for (size_t i = 0; i < code_length; i += 64) {
         c   = _mm512_loadu_si512(&codes[i]);
         lut = _mm512_loadu_si512(&LUT[i]);
@@ -147,6 +182,12 @@ inline void accumulate_impl(
         accu1 = _mm512_add_epi16(accu1, _mm512_srli_epi16(res_lo, 8));
         accu2 = _mm512_add_epi16(accu2, res_hi);
         accu3 = _mm512_add_epi16(accu3, _mm512_srli_epi16(res_hi, 8));
+
+        // size_t processed_dim = (i + 64) >> 2;
+        // if (processed_dim == 1024 || processed_dim == 2048 ||
+        //     processed_dim == 3072 || processed_dim == dim) {
+        //     dump_checkpoint("checkpoint", processed_dim);
+        // }
     }
 
     accu0 = _mm512_sub_epi16(accu0, _mm512_slli_epi16(accu1, 8));
@@ -215,6 +256,34 @@ inline void accumulate_impl(
     std::cerr << "fastscan requires AVX512F or AVX2\n";
     abort();
 #endif
+}
+
+inline void accumulate_impl_32(
+    size_t dim,
+    const uint8_t* __restrict__ codes,
+    const uint8_t* __restrict__ LUT,
+    uint32_t* __restrict__ result
+) {
+    constexpr size_t kSafeChunkDim = 2048;
+    alignas(64) uint16_t partial[kBatchSize];
+
+    for (size_t i = 0; i < kBatchSize; ++i) result[i] = 0;
+
+    for (size_t d0 = 0; d0 < dim; d0 += kSafeChunkDim) {
+        size_t chunk_dim = std::min(kSafeChunkDim, dim - d0);
+        std::fill(partial, partial + kBatchSize, 0);
+
+        accumulate_impl(
+            chunk_dim,
+            codes + (d0 << 2),
+            LUT + (d0 << 2),
+            partial
+        );
+
+        for (size_t i = 0; i < kBatchSize; ++i) {
+            result[i] += static_cast<uint32_t>(partial[i]);
+        }
+    }
 }
 
 inline void appro_dist_impl(

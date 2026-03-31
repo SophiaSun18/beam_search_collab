@@ -12,6 +12,7 @@
 #include "../include/fastscan_impl.hpp"
 
 static constexpr bool FASTSCAN_ENABLED = true;  // set to true to use fastscan batch estimation
+static constexpr bool FASTSCAN_WIDE_ACCUM_ENABLED = true;   // set to true to ensure high dimension overflow can be handled
 
 class QuantizationGraph {
 public:
@@ -44,14 +45,7 @@ public:
     QuantizationGraph(size_t num_node, size_t dim, int degree, const std::string& codebook_path)
         : num_nodes_(num_node), dim_(dim), degree_(degree) {
 
-        // pad the raw vector's dimension to the nearest power of 2 
-        padded_dim_ = 1ULL << (size_t)std::ceil(std::log2(dim_));
-
-        // QG-style offsets (in units of float)
-        code_offset_     = dim_;
-        factor_offset_   = code_offset_ + padded_dim_ / 64 * 2 * degree_;   // x2 as 1 uint64_t = 64 bits = 2 floats
-        neighbor_offset_ = factor_offset_ + 3 * degree_;
-        row_offset_      = neighbor_offset_ + degree_;
+        init_layout(/*bins_mode=*/false);
 
         // load from the codebook
         std::ifstream fin(codebook_path, std::ios::binary);
@@ -83,8 +77,57 @@ public:
                num_nodes_, dim_, degree_, padded_dim_, row_offset_, entry_point_);
     }
 
+    QuantizationGraph(size_t num_node, size_t dim, int degree,
+                      const std::string& graph_file,
+                      const std::string& codes_file,
+                      const std::string& signs_file,
+                      const float* base_vectors)
+        : num_nodes_(num_node), dim_(dim), degree_(degree),
+          bins_mode_(true), base_vectors_(base_vectors) {
+
+        init_layout(/*bins_mode=*/true);
+
+        size_t graph_nodes = 0, graph_degree = 0;
+        vidType* graph_tmp = read_bin<vidType>(graph_file.c_str(), graph_nodes, graph_degree);
+        if (graph_nodes != num_nodes_ || static_cast<int>(graph_degree) != degree_) {
+            release_bin_buffer(graph_tmp, graph_degree);
+            throw std::runtime_error("Graph bin shape mismatch");
+        }
+        graph_edges_ = allocate_and_copy(graph_tmp, graph_nodes * graph_degree, graph_degree);
+        release_bin_buffer(graph_tmp, graph_degree);
+
+        size_t code_nodes = 0, code_width = 0;
+        uint64_t* codes_tmp = read_bin<uint64_t>(codes_file.c_str(), code_nodes, code_width);
+        if (code_nodes != num_nodes_ || code_width != codes_row_words_) {
+            release_bin_buffer(codes_tmp, code_width);
+            throw std::runtime_error("Packed-code bin shape mismatch");
+        }
+        codes_and_factors_ = allocate_and_copy(codes_tmp, code_nodes * code_width, code_width);
+        release_bin_buffer(codes_tmp, code_width);
+
+        size_t sign_rows = 0, sign_dim = 0;
+        float* signs_tmp = read_bin<float>(signs_file.c_str(), sign_rows, sign_dim);
+        if (!((sign_rows == 1 && sign_dim == padded_dim_) ||
+              (sign_rows == padded_dim_ && sign_dim == 1))) {
+            release_bin_buffer(signs_tmp, sign_dim);
+            throw std::runtime_error("Sign-table bin shape mismatch");
+        }
+        signs_ptr_ = allocate_and_copy(signs_tmp, padded_dim_, padded_dim_);
+        release_bin_buffer(signs_tmp, sign_dim);
+
+        entry_point_ = UINT32_MAX;
+
+        printf("Loaded bins-mode QG: %zu nodes, dim=%zu, degree=%d, padded_dim=%zu, codes_row_words=%zu u64\n",
+               num_nodes_, dim_, degree_, padded_dim_, codes_row_words_);
+    }
+
     ~QuantizationGraph() {
-        std::free(data_);
+        if (bins_mode_) {
+            std::free(codes_and_factors_);
+            std::free(graph_edges_);
+        } else {
+            std::free(data_);
+        }
         std::free(signs_ptr_);
     }
 
@@ -220,13 +263,12 @@ public:
         float* appro_dist,
         const QueryFactors& qf,
         uint16_t* result_raw,
-        float* result_float,
-        bool debug_print_
+        float* result_float
     ) const {
         size_t num_blocks   = static_cast<size_t>(degree_) / kBatchSize;
 
-        // locate codes and factors from the codebook row
-        const uint8_t* packed_code = reinterpret_cast<const uint8_t*>(get_row(node_idx) + code_offset_);
+        // Access packed codes through the mode-aware accessor so both layouts work.
+        const uint8_t* packed_code = reinterpret_cast<const uint8_t*>(get_binary_codes(node_idx));
         const float* factors  = get_factor(node_idx);
         const float* triple_x = factors;
         const float* fac_dq   = triple_x + degree_;
@@ -260,67 +302,171 @@ public:
         // Step 3: compute final approximate distances
         appro_dist_impl(degree_, exact_dist, qf.width, qf.low_val,
             result_float, triple_x, fac_dq, fac_vq, appro_dist);
+    }
 
-        // Debug: Print per-neighbor factors and estimated distances (matches 1-by-1 path)
-        if (debug_print_) {
-            for (int i = 0; i < degree_; ++i) {
-                std::cout << std::fixed << std::setprecision(6)
-                          << "  [fastscan] Neighbor rank: " << i
-                          << ", Estimated Distance: " << appro_dist[i]
-                          << ", Factors: [tx: " << triple_x[i]
-                          << ", dq: " << fac_dq[i]
-                          << ", vq: " << fac_vq[i]
-                          << ", result_float: " << result_float[i]
-                          << ", sum_q: " << qf.sum_q
-                          << ", width: " << qf.width
-                          << ", low_val: " << qf.low_val
-                          << "]\n";
+    void scan_all_neighbors_32(
+        uint32_t node_idx,
+        float exact_dist,
+        float* appro_dist,
+        const QueryFactors& qf,
+        uint32_t* result_raw,
+        float* result_float
+    ) const {
+        size_t num_blocks   = static_cast<size_t>(degree_) / kBatchSize;
+
+        // Access packed codes through the mode-aware accessor so both layouts work.
+        const uint8_t* packed_code = reinterpret_cast<const uint8_t*>(get_binary_codes(node_idx));
+        const float* factors  = get_factor(node_idx);
+        const float* triple_x = factors;
+        const float* fac_dq   = triple_x + degree_;
+        const float* fac_vq   = fac_dq   + degree_;
+
+        // Step 1: accumulate raw uint32 sums for each block of 32 neighbors
+        for (size_t b = 0; b < num_blocks; ++b) {
+            accumulate_impl_32(padded_dim_, packed_code + b * padded_dim_ * 4, qf.lut, &result_raw[b * kBatchSize]);
+        }
+
+        // Step 2: convert uint32 raw sums to float: result = (raw * 2) - sum_q
+    #if defined(__AVX512F__)
+        {
+            const __m512i qq = _mm512_set1_epi32(qf.sum_q);
+            for (size_t i = 0; i < degree_; i += 16) {
+                __m512i i32 = _mm512_loadu_si512(
+                    reinterpret_cast<const void*>(&result_raw[i]));
+                i32 = _mm512_sub_epi32(_mm512_slli_epi32(i32, 1), qq);
+                __m512 f32 = _mm512_cvtepi32_ps(i32);
+                _mm512_storeu_ps(&result_float[i], f32);
             }
         }
+    #else
+        for (size_t i = 0; i < degree_; ++i)
+            result_float[i] = static_cast<float>((static_cast<uint32_t>(result_raw[i]) << 1) - qf.sum_q);
+    #endif
+
+        // Step 3: compute final approximate distances
+        appro_dist_impl(degree_, exact_dist, qf.width, qf.low_val,
+            result_float, triple_x, fac_dq, fac_vq, appro_dist);
     }
 
     void prefetch_nbr(uint32_t node_idx) const {
-        // prefetch raw vector + codes + factors
-        const char* base = reinterpret_cast<const char*>(get_row(node_idx));
-        size_t bytes = neighbor_offset_ * sizeof(float);
-        mem_prefetch_l2(reinterpret_cast<const char*>(base), 10);
-        // for (size_t off = 0; off < bytes; off += 64)
-        //     __builtin_prefetch(base + off, 0, 0);
+        auto prefetch_span = [](const char* base, size_t bytes) {
+            constexpr size_t kCacheLineBytes = 64;
+            constexpr size_t kMaxPrefetchLines = 20;
+
+            size_t num_lines = (bytes + kCacheLineBytes - 1) / kCacheLineBytes;
+            while (num_lines > 0) {
+                size_t chunk_lines = std::min(num_lines, kMaxPrefetchLines);
+                mem_prefetch_l2(base, chunk_lines);
+                base += chunk_lines * kCacheLineBytes;
+                num_lines -= chunk_lines;
+            }
+        };
+
+        if (bins_mode_) {
+            const char* raw_base = reinterpret_cast<const char*>(get_row(node_idx));
+            const char* codes_base = reinterpret_cast<const char*>(get_binary_codes(node_idx));
+            const char* neighbors_base = reinterpret_cast<const char*>(get_neighbors(node_idx));
+
+            prefetch_span(raw_base, dim_ * sizeof(float));
+            prefetch_span(codes_base, codes_row_words_ * sizeof(uint64_t));
+            prefetch_span(neighbors_base, static_cast<size_t>(degree_) * sizeof(uint32_t));
+            return;
+        }
+
+        const char* row_base = reinterpret_cast<const char*>(get_row(node_idx));
+        prefetch_span(row_base, row_offset_ * sizeof(float));
     }
 
     inline const float* get_row(uint32_t node_idx) const {
-        return data_ + static_cast<size_t>(node_idx) * row_offset_;
+        return bins_mode_
+            ? base_vectors_ + static_cast<size_t>(node_idx) * dim_
+            : data_ + static_cast<size_t>(node_idx) * row_offset_;
     }
 
     inline const uint64_t* get_binary_codes(uint32_t node_idx) const {
-        return reinterpret_cast<const uint64_t*>(get_row(node_idx) + code_offset_);
+        return bins_mode_
+            ? codes_and_factors_ + static_cast<size_t>(node_idx) * codes_row_words_
+            : reinterpret_cast<const uint64_t*>(get_row(node_idx) + code_offset_);
     }
 
     inline const float* get_factor(uint32_t node_idx) const {
-        return get_row(node_idx) + factor_offset_;
+        return bins_mode_
+            ? reinterpret_cast<const float*>(codes_and_factors_ + static_cast<size_t>(node_idx) * codes_row_words_ + bitcode_words_ * degree_)
+            : get_row(node_idx) + factor_offset_;
     }
     
     inline const uint32_t* get_neighbors(uint32_t node_idx) const {
-        return reinterpret_cast<const uint32_t*>(get_row(node_idx) + neighbor_offset_);
+        return bins_mode_
+            ? graph_edges_ + static_cast<size_t>(node_idx) * degree_
+            : reinterpret_cast<const uint32_t*>(get_row(node_idx) + neighbor_offset_);
     }
 
     inline float* get_signs_ptr() const { return signs_ptr_; }
     inline int get_degree() const { return degree_; }
     inline vidType get_entry_point() const { return entry_point_; }
+    inline void set_entry_point(vidType entry_point) { entry_point_ = entry_point; }
 
 private:
+    void init_layout(bool bins_mode) {
+        padded_dim_ = 1ULL << static_cast<size_t>(std::ceil(std::log2(dim_)));
+        bitcode_words_ = padded_dim_ / 64;
+        code_offset_ = bins_mode ? 0 : dim_;
+        factor_offset_ = code_offset_ + bitcode_words_ * 2 * degree_;
+        neighbor_offset_ = factor_offset_ + 3 * degree_;
+        row_offset_ = neighbor_offset_ + degree_;
+        codes_row_offset_ = factor_offset_ + 3 * degree_;
+        codes_row_words_ = bitcode_words_ * degree_ + ((3 * degree_ * sizeof(float) + sizeof(uint64_t) - 1) / sizeof(uint64_t));
+    }
+
+    template <typename T>
+    static T* allocate_and_copy(const T* src, size_t count, size_t row_dim) {
+        size_t row_bytes = row_dim * sizeof(T);
+        T* dst = nullptr;
+        if (row_bytes % 64 == 0) {
+            dst = static_cast<T*>(std::aligned_alloc(64, sizeof(T) * count));
+        } else if (row_bytes % 32 == 0) {
+            dst = static_cast<T*>(std::aligned_alloc(32, sizeof(T) * count));
+        } else {
+            size_t bytes = sizeof(T) * count;
+            size_t alloc_bytes = (bytes + 63) & ~size_t(63);
+            dst = static_cast<T*>(std::aligned_alloc(64, alloc_bytes));
+        }
+        if (dst == nullptr) {
+            throw std::bad_alloc();
+        }
+        std::memcpy(dst, src, sizeof(T) * count);
+        return dst;
+    }
+
+    template <typename T>
+    static void release_bin_buffer(T* ptr, size_t row_dim) {
+        if (ptr == nullptr) return;
+        size_t row_bytes = row_dim * sizeof(T);
+        if (row_bytes % 64 == 0 || row_bytes % 32 == 0) {
+            std::free(ptr);
+        } else {
+            delete[] ptr;
+        }
+    }
+
     size_t num_nodes_;
     size_t dim_, padded_dim_;
     int degree_;
     size_t bitcode_words_;
     vidType entry_point_;
+    bool bins_mode_ = false;
 
     // QG-style offsets (in units of float)
     size_t code_offset_;
     size_t factor_offset_;
     size_t neighbor_offset_;
     size_t row_offset_;
+    size_t codes_row_offset_;
+    size_t codes_row_words_;
 
     float* data_ = nullptr;
+    const float* base_vectors_ = nullptr;
+    uint64_t* codes_and_factors_ = nullptr;
+    vidType* graph_edges_ = nullptr;
     float* signs_ptr_ = nullptr;
 };
