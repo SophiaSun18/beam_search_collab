@@ -47,10 +47,12 @@ SearchResult beam_cpu_rabitq(
 
     vector<float> appro_dist;
     vector<uint16_t> raw_buf;
+    vector<uint32_t> raw_buf_32;
     vector<float> result_f_buf;
     if constexpr (FASTSCAN_ENABLED) {
         appro_dist.resize(degree);
         raw_buf.resize(degree);
+        if constexpr (FASTSCAN_WIDE_ACCUM_ENABLED) raw_buf_32.resize(degree);
         result_f_buf.resize(degree);
     }
 
@@ -162,22 +164,93 @@ SearchResult beam_cpu_rabitq(
 
         // compute the estimated distance for each neighbor
         if constexpr (FASTSCAN_ENABLED) {
-            filter.scan_all_neighbors(cur_node, exact_dist, appro_dist.data(), qf, raw_buf.data(), result_f_buf.data(), DEBUG);
-            t_dist_est += lap();
-            for (size_t i = 0; i < g.degree; i++) {
-                float est = appro_dist[i];
-                dist_est++;
-                current_candidate.emplace_back(neighbors[i], est);
+            if constexpr (FASTSCAN_WIDE_ACCUM_ENABLED) {
+                TSTART(tc_dist_est);
+                qg.scan_all_neighbors_32(cur_node, exact_dist, appro_dist.data(), qf, raw_buf_32.data(), result_f_buf.data());
+                dist_est += degree;
+                TSTOP(tc_dist_est);
+            } else {
+                TSTART(tc_dist_est);
+                qg.scan_all_neighbors(cur_node, exact_dist, appro_dist.data(), qf, raw_buf.data(), result_f_buf.data());
+                dist_est += degree;
+                TSTOP(tc_dist_est);
             }
-            t_other += lap();
+
+            for (int i = 0; i < degree; i++) {
+                TSTART(tc_hash_filter);
+                if (is_visited.contains(neighbors[i])) {
+                    visited_pruned++;
+                    pruned++;
+                    TSTOP(tc_hash_filter);
+                    continue;
+                }
+                TSTOP(tc_hash_filter);
+                curr_candidate.push_back({neighbors[i], appro_dist[i]});
+            }
+
+            if (iter > BEAM_SIZE * APPROX_RATIO) {
+                // partial sort the neighbors by their distance to the query and prune by the ratio
+                size_t num_kept = degree * (1 - PRUNE_RATIO);
+                size_t iter_pruned = 0;
+                if (num_kept > 0 && curr_candidate.size() > num_kept) {
+                    iter_pruned = curr_candidate.size() - num_kept;
+                    pruned += iter_pruned;
+                    neighbor_pruned += iter_pruned;
+                    nth_element(curr_candidate.begin(), curr_candidate.begin() + num_kept, curr_candidate.end(),
+                        [](const Candidate& a, const Candidate& b) {
+                            return a.dist < b.dist;
+                        });
+                    curr_candidate.resize(num_kept);
+                }
+            }
+
+            for (size_t i = 0; i < curr_candidate.size(); i++) {
+                vidType n = curr_candidate[i].vid;
+                float dist = curr_candidate[i].dist;
+                TSTART(tc_queue_push);
+                if (frontier.size() < BEAM_SIZE || dist < frontier.get_tail_dist()) {
+                    if constexpr (DUP_HANDLING_ENABLED) {
+                        if (is_added.add(n)) {
+                            frontier.push(n, dist);
+                            pushes++;
+                        } else {
+                            pushes++;
+                            duplicate_pushes++;
+                            frontier.push_update(n, dist);
+                        }
+                    } else {
+                        frontier.push(n, dist);
+                        pushes++;
+                    }
+                }
+                TSTOP(tc_queue_push);
+            }
+
+            // prefetch next node
+            if (frontier.has_unexpanded()) {
+                int new_idx = frontier.get_next_index();
+                qg.prefetch_nbr(frontier[new_idx]);
+            }
         } else {
-            for (size_t i = 0; i < g.degree; i++) {
-                auto nf = filter.nbr_filter(cur_node, i);
+            for (size_t i = 0; i < degree; i++) {
+                TSTART(tc_hash_filter);
+                if (is_visited.contains(neighbors[i])) {
+                    visited_pruned++;
+                    pruned++;
+                    TSTOP(tc_hash_filter);
+                    continue;
+                }
+                TSTOP(tc_hash_filter);
+
+                TSTART(tc_nbr_filter);
+                auto nf = qg.nbr_filter(cur_node, i);
+                TSTOP(tc_nbr_filter);
                 dist_est++;
-                float est = filter.estimated_distance(qf, nf, exact_dist);
-                t_dist_est += lap();
-                current_candidate.emplace_back(neighbors[i], est);
-                t_other += lap();
+                TSTART(tc_dist_est);
+                float est = qg.estimated_distance(qf, nf, exact_dist);
+                TSTOP(tc_dist_est);
+
+                curr_candidate.push_back({neighbors[i], est});
 
                 if (DEBUG) {
                     // Debug: Print neighbor details
@@ -193,46 +266,50 @@ SearchResult beam_cpu_rabitq(
                             << "]\n";
                 }
             }
-        }
 
-        // size_t num_kept = g.degree * (1 - PRUNE_RATIO);
-        // if (num_kept > 0 && num_kept < current_candidate.size()) {
-        //     size_t iter_pruned = current_candidate.size() - num_kept;
-        //     pruned += iter_pruned;
-        //     neighbor_pruned += iter_pruned;
-        //     nth_element(current_candidate.begin(), current_candidate.begin() + num_kept, current_candidate.end(),
-        //         [](const pair<vidType,float>& a, const pair<vidType,float>& b) {
-        //             return a.second < b.second;
-        //         });
-        //     current_candidate.resize(num_kept);
-        // }
-        // t_other += lap();
-
-        // push unvisited neighbors to the frontier with estimated distance
-        for (auto node : current_candidate) {
-            if (is_visited.contains(node.first)) {
-                visited_pruned++;
-                pruned++;
-                t_hash_filter += lap();
-                continue;
-            }   // skip if already computed
-            t_hash_filter += lap();
-            if (frontier.size() < BEAM_SIZE || node.second < frontier.get_tail_dist()) {
-                if constexpr (DUP_HANDLING_ENABLED) {
-                    if (is_added.add(node.first)) {
-                        frontier.push(node.first, node.second);
-                        pushes++;
-                    } else {
-                        pushes++;
-                        duplicate_pushes++;
-                        frontier.push_update(node.first, node.second);
-                    }
-                } else {
-                    frontier.push(node.first, node.second);
-                    pushes++;
+            if (iter > BEAM_SIZE * APPROX_RATIO) {
+                // partial sort the neighbors by their distance to the query and prune by the ratio
+                size_t num_kept = degree * (1 - PRUNE_RATIO);
+                size_t iter_pruned = 0;
+                if (num_kept > 0 && curr_candidate.size() > num_kept) {
+                    iter_pruned = curr_candidate.size() - num_kept;
+                    pruned += iter_pruned;
+                    neighbor_pruned += iter_pruned;
+                    nth_element(curr_candidate.begin(), curr_candidate.begin() + num_kept, curr_candidate.end(),
+                        [](const Candidate& a, const Candidate& b) {
+                            return a.dist < b.dist;
+                        });
+                    curr_candidate.resize(num_kept);
                 }
             }
-            t_queue += lap();   // frontier push, either push or not
+
+            for (size_t i = 0; i < curr_candidate.size(); i++) {
+                vidType n = curr_candidate[i].vid;
+                float dist = curr_candidate[i].dist;
+                TSTART(tc_queue_push);
+                if (frontier.size() < BEAM_SIZE || dist < frontier.get_tail_dist()) {
+                    if constexpr (DUP_HANDLING_ENABLED) {
+                        if (is_added.add(n)) {
+                            frontier.push(n, dist);
+                            pushes++;
+                        } else {
+                            pushes++;
+                            duplicate_pushes++;
+                            frontier.push_update(n, dist);
+                        }
+                    } else {
+                        frontier.push(n, dist);
+                        pushes++;
+                    }
+                }
+                TSTOP(tc_queue_push);
+            }
+
+            // prefetch next node
+            if (frontier.has_unexpanded()) {
+                int new_idx = frontier.get_next_index();
+                qg.prefetch_nbr(frontier[new_idx]);
+            }
         }
 
         if (DEBUG) {
