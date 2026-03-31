@@ -5,7 +5,6 @@
 #include <cmath> 
 #include <cfloat>
 #include <cstring>
-#include <chrono>
 #include <omp.h>
 
 #include "../include/utils.h"
@@ -19,9 +18,20 @@ int K = 100;
 int BEAM_SIZE = 128;
 float PRUNE_RATIO = 0.0;
 float APPROX_RATIO = 0.0;
-bool DEBUG = false;
-constexpr bool TIMING_ENABLED = false;  // set to false to disable all timing overhead at compile time
-constexpr bool DUP_HANDLING_ENABLED = false;  // set to true to enable duplicate handling
+
+#define DEBUG 0
+
+#define TIMING_ENABLED 0
+
+#if TIMING_ENABLED
+#define TSTART(tc) ctimer_start(&(tc))
+#define TSTOP(tc)  do { ctimer_stop(&(tc)); ctimer_lap(&(tc)); } while(0)
+#else
+#define TSTART(tc) ((void)0)
+#define TSTOP(tc)  ((void)0)
+#endif
+
+#define DUP_HANDLING_ENABLED 0
 
 SearchResult beam_cpu_rabitq(
     QuantizationGraph& qg, int K, const float* d_query, size_t dim, vidType entry_point)
@@ -53,6 +63,16 @@ SearchResult beam_cpu_rabitq(
     size_t pushes = 0;
     size_t duplicate_pushes = 0;
 
+    // fine-grained timing accumulators (ctimer-based, zero overhead when macros disabled)
+    ctimer_t tc_dist_comp, tc_nbr_filter, tc_dist_est;
+    ctimer_t tc_queue_pop, tc_queue_push;
+    ctimer_t tc_hash_filter;
+    ctimer_t tc_query_prepare;
+    ctimer_reset(&tc_dist_comp); ctimer_reset(&tc_nbr_filter); ctimer_reset(&tc_dist_est);
+    ctimer_reset(&tc_queue_pop); ctimer_reset(&tc_queue_push);
+    ctimer_reset(&tc_hash_filter);
+    ctimer_reset(&tc_query_prepare);
+
     // pre-allocate buffers for query preparation
     size_t padded_dim = 1ULL << static_cast<size_t>(std::ceil(std::log2(dim)));
     QuantizationGraph::QueryBuffers query_buffers;
@@ -63,44 +83,53 @@ SearchResult beam_cpu_rabitq(
     }
 
     // push the starting point to the frontier with max distance
+    TSTART(tc_queue_push);
     frontier.push(entry_point, FLT_MAX);
     pushes++;
-    t_queue += lap();
+    TSTOP(tc_queue_push);
     if constexpr (DUP_HANDLING_ENABLED) {
+        TSTART(tc_hash_filter);
         is_added.add(entry_point);
-        t_hash_filter += lap();
+        TSTOP(tc_hash_filter);
     }
 
     // quantize the query once to avoid redundant computations
+    TSTART(tc_query_prepare);
     auto qf = qg.query_prepare(d_query, query_buffers);
+    TSTOP(tc_query_prepare);
 
     int iter = 0;
     while (frontier.has_unexpanded()) {
         iter++;
+        curr_candidate.clear();
+
+        TSTART(tc_queue_pop);
         int idx = frontier.get_next_index();
         vidType cur_node = frontier[idx];
         frontier.set_front_expanded();
-        t_queue += lap();
-        
-        g.prefetch_node(cur_node);
-        t_other += lap();
+        TSTOP(tc_queue_pop);
 
+        TSTART(tc_hash_filter);
         if (is_visited.contains(cur_node)) {
             visited_pruned++;
             pruned++;
-            t_hash_filter += lap();
+            TSTOP(tc_hash_filter);
             continue;
         }
-        t_hash_filter += lap();
+        TSTOP(tc_hash_filter);
 
+        TSTART(tc_dist_comp);
         float exact_dist = compute_distance(dim, d_query, qg.get_row(cur_node));
         dist_cmps++;
-        t_dist_comp += lap();
+        TSTOP(tc_dist_comp);
 
+        TSTART(tc_queue_push);
         result_pool.push(cur_node, exact_dist);
-        t_queue += lap();
+        TSTOP(tc_queue_push);
+        
+        TSTART(tc_hash_filter);
         is_visited.add(cur_node);
-        t_hash_filter += lap();
+        TSTOP(tc_hash_filter);
 
         if (DEBUG) {
             // Debug: Print current node being expanded
@@ -110,20 +139,20 @@ SearchResult beam_cpu_rabitq(
             // Debug: Print the current sign table
             std::cout << "Sign table: ";
             for (size_t d = 0; d < dim; d++) {
-                std::cout << filter.get_signs_ptr()[d] << " ";
+                std::cout << qg.get_signs_ptr()[d] << " ";
             }
             std::cout << "\n";
 
             // Debug: Print the rotated query and quantized query
             std::cout << "Rotated query: ";
             for (size_t d = 0; d < dim; d++) {
-                std::cout << qf.rotated_query[d] << " ";
+                std::cout << query_buffers.rotated_query[d] << " ";
             }
             std::cout << "\n";
 
             std::cout << "Quantized query: ";
             for (size_t d = 0; d < dim; d++) {
-                std::cout << static_cast<int>(qf.quantized_query[d]) << " ";
+                std::cout << query_buffers.quantized_query[d] << " ";
             }
             std::cout << "\n";
         }
@@ -220,7 +249,6 @@ SearchResult beam_cpu_rabitq(
             }
         }
     }
-    t_queue += lap();   // final frontier has unexpanded check
 
     // update results: expand result pool by visiting neighbors of current results
     int pool_size = result_pool.size();
@@ -230,31 +258,29 @@ SearchResult beam_cpu_rabitq(
             const vidType* neighbors = qg.get_neighbors(data_id);
             for (int j = 0; j < degree; j++) {
                 vidType cur_neighbor = neighbors[j];
-                t_other += lap();
+                TSTART(tc_hash_filter);
                 if (!is_visited.contains(cur_neighbor)) {
                     is_visited.add(cur_neighbor);
+                    TSTOP(tc_hash_filter);
+                    TSTART(tc_dist_comp);
                     float dist = compute_distance(dim, d_query, qg.get_row(cur_neighbor));
                     extra_dist_cmps++;
-                    t_dist_comp += lap();
+                    TSTOP(tc_dist_comp);
+                    TSTART(tc_queue_push);
                     result_pool.push(cur_neighbor, dist);
-                    t_queue += lap();
+                    TSTOP(tc_queue_push);
                 } else {
-                    t_hash_filter += lap();
+                    TSTOP(tc_hash_filter);
                 }
             }
-            if (result_pool.size() == K) {
-                t_queue += lap();
-                break;
-            }
+            if (result_pool.size() == K) break;
         }
     }
-    t_other += lap();
 
     // collect the top-K results from candidates and return with distance computation count
     vector<int> result;
     for (int i = 0; i < K; i++)
         result.push_back(result_pool[i]);
-    t_other += lap();
 
     if (DEBUG) {
         std::cout << "Final Results:\n";
@@ -272,17 +298,17 @@ SearchResult beam_cpu_rabitq(
     res.pruned = pruned;
     res.neighbor_pruned = neighbor_pruned;
     res.visited_pruned = visited_pruned;
-    res.time_dist_comp = t_dist_comp;
-    res.time_dist_est = t_dist_est;
-    res.time_queue = t_queue;
-    res.time_hash_filter = t_hash_filter;
-    res.time_other = t_other;
+    res.time_dist_comp = timespec_sec(tc_dist_comp.elapsed);
+    res.time_nbr_filter = timespec_sec(tc_nbr_filter.elapsed);
+    res.time_dist_est = timespec_sec(tc_dist_est.elapsed);
+    res.time_queue_pop = timespec_sec(tc_queue_pop.elapsed);
+    res.time_queue_push = timespec_sec(tc_queue_push.elapsed);
+    res.time_hash_filter = timespec_sec(tc_hash_filter.elapsed);
+    res.time_query_prepare = timespec_sec(tc_query_prepare.elapsed);
     res.hash_inserts = is_visited.get_total_inserts();
     res.hash_collisions = is_visited.get_total_collisions();
     res.pushes = pushes;
     res.duplicate_pushes = duplicate_pushes;
-    if constexpr (TIMING_ENABLED)
-        res.time_total = std::chrono::duration<double>(clock::now() - t_search_start).count();
     return res;
 }
 
@@ -306,7 +332,10 @@ RunStats run_ann_experiment_rabitq(
     int64_t total_pruned = 0;
     int64_t total_neighbor_pruned = 0;
     int64_t total_visited_pruned = 0;
-    double total_time_dist_comp = 0, total_time_dist_est = 0, total_time_queue = 0, total_time_hash_filter = 0, total_time_other = 0, total_time_total = 0;
+    double total_time_dist_comp = 0, total_time_nbr_filter = 0, total_time_dist_est = 0;
+    double total_time_queue_pop = 0, total_time_queue_push = 0;
+    double total_time_hash_filter = 0;
+    double total_time_query_prepare = 0;
     int64_t total_hash_inserts = 0, total_hash_collisions = 0;
     int64_t total_pushes = 0;
     int64_t total_duplicate_pushes = 0;
@@ -319,7 +348,15 @@ RunStats run_ann_experiment_rabitq(
     ctimer_t t;
     ctimer_start(&t);
 
-    #pragma omp parallel for schedule(dynamic, 1) reduction(+:total_count_dc) reduction(+:total_count_ds) reduction(+:total_extra_count_dc) reduction(+:total_hop) reduction(+:total_pruned) reduction(+:total_neighbor_pruned) reduction(+:total_visited_pruned) reduction(+:total_time_dist_comp) reduction(+:total_time_dist_est) reduction(+:total_time_queue) reduction(+:total_time_hash_filter) reduction(+:total_time_other) reduction(+:total_time_total) reduction(+:total_hash_inserts) reduction(+:total_hash_collisions) reduction(+:total_pushes) reduction(+:total_duplicate_pushes)
+    #pragma omp parallel for schedule(dynamic, 1) \
+        reduction(+:total_count_dc) reduction(+:total_count_ds) reduction(+:total_extra_count_dc) \
+        reduction(+:total_hop) reduction(+:total_pruned) reduction(+:total_neighbor_pruned) reduction(+:total_visited_pruned) \
+        reduction(+:total_time_dist_comp) reduction(+:total_time_nbr_filter) reduction(+:total_time_dist_est) \
+        reduction(+:total_time_queue_pop) reduction(+:total_time_queue_push) \
+        reduction(+:total_time_hash_filter) \
+        reduction(+:total_time_query_prepare) \
+        reduction(+:total_hash_inserts) reduction(+:total_hash_collisions) \
+        reduction(+:total_pushes) reduction(+:total_duplicate_pushes)
     for (int q = 0; q < actual_query; q++) {
         const float* query_ptr = query_vectors + q * dim;
 
@@ -334,11 +371,12 @@ RunStats run_ann_experiment_rabitq(
         total_neighbor_pruned += result.neighbor_pruned;
         total_visited_pruned += result.visited_pruned;
         total_time_dist_comp += result.time_dist_comp;
+        total_time_nbr_filter += result.time_nbr_filter;
         total_time_dist_est += result.time_dist_est;
-        total_time_queue += result.time_queue;
+        total_time_queue_pop += result.time_queue_pop;
+        total_time_queue_push += result.time_queue_push;
         total_time_hash_filter += result.time_hash_filter;
-        total_time_other += result.time_other;
-        total_time_total += result.time_total;
+        total_time_query_prepare += result.time_query_prepare;
         total_hash_inserts += result.hash_inserts;
         total_hash_collisions += result.hash_collisions;
         total_pushes += result.pushes;
@@ -362,11 +400,12 @@ RunStats run_ann_experiment_rabitq(
     stats.total_neighbor_pruned = total_neighbor_pruned;
     stats.total_visited_pruned = total_visited_pruned;
     stats.time_dist_comp = total_time_dist_comp;
+    stats.time_nbr_filter = total_time_nbr_filter;
     stats.time_dist_est = total_time_dist_est;
-    stats.time_queue = total_time_queue;
+    stats.time_queue_pop = total_time_queue_pop;
+    stats.time_queue_push = total_time_queue_push;
     stats.time_hash_filter = total_time_hash_filter;
-    stats.time_other = total_time_other;
-    stats.time_total = total_time_total;
+    stats.time_query_prepare = total_time_query_prepare;
     stats.total_hash_inserts = total_hash_inserts;
     stats.total_hash_collisions = total_hash_collisions;
     stats.total_pushes = total_pushes;
@@ -382,15 +421,20 @@ RunStats run_ann_experiment_rabitq(
     cout << "total # pruned neighbors: " << stats.total_pruned << "\n";
     cout << "average # pruned neighbors: " << stats.total_pruned / n_query << "\n";
 
-    double t_total = stats.time_dist_comp + stats.time_dist_est + stats.time_queue + stats.time_hash_filter + stats.time_other;
+    double t_sum = stats.time_dist_comp + stats.time_nbr_filter + stats.time_dist_est
+                 + stats.time_queue_pop + stats.time_queue_push
+                 + stats.time_hash_filter + stats.time_query_prepare;
     printf("--- Timing breakdown (total across queries) ---\n");
-    printf("  distance computation: %.6f sec (%.1f%%)\n", stats.time_dist_comp, stats.time_dist_comp / t_total * 100);
-    printf("  distance estimation:  %.6f sec (%.1f%%)\n", stats.time_dist_est, stats.time_dist_est / t_total * 100);
-    printf("  queue management:     %.6f sec (%.1f%%)\n", stats.time_queue, stats.time_queue / t_total * 100);
-    printf("  hash filter:          %.6f sec (%.1f%%)\n", stats.time_hash_filter, stats.time_hash_filter / t_total * 100);
-    printf("  other:                %.6f sec (%.1f%%)\n", stats.time_other, stats.time_other / t_total * 100);
-    printf("  sum:                  %.6f sec\n", t_total);
-    printf("  total (wall-clock):   %.6f sec\n", stats.time_total);
+    printf("  dist computation:  %.6f sec (%.1f%%)\n", stats.time_dist_comp, stats.time_dist_comp / t_sum * 100);
+    printf("  nbr filter:        %.6f sec (%.1f%%)\n", stats.time_nbr_filter, stats.time_nbr_filter / t_sum * 100);
+    printf("  dist estimation:   %.6f sec (%.1f%%)\n", stats.time_dist_est, stats.time_dist_est / t_sum * 100);
+    printf("  queue pop:         %.6f sec (%.1f%%)\n", stats.time_queue_pop, stats.time_queue_pop / t_sum * 100);
+    printf("  queue push:        %.6f sec (%.1f%%)\n", stats.time_queue_push, stats.time_queue_push / t_sum * 100);
+    printf("  hash filter:       %.6f sec (%.1f%%)\n", stats.time_hash_filter, stats.time_hash_filter / t_sum * 100);
+    printf("  query prepare:     %.6f sec (%.1f%%)\n", stats.time_query_prepare, stats.time_query_prepare / t_sum * 100);
+    printf("  sum:                  %.6f sec\n", t_sum);
+    printf("  wall-clock runtime:   %.6f sec\n", stats.runtime);
+    printf("  gap (unmeasured):     %.6f sec (%.1f%% of runtime)\n", stats.runtime - t_sum, (stats.runtime - t_sum) / stats.runtime * 100);
     printf("--- Hash collision stats ---\n");
     printf("  total inserts:    %ld\n", stats.total_hash_inserts);
     printf("  total collisions: %ld\n", stats.total_hash_collisions);
