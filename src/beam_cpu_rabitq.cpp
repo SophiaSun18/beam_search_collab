@@ -12,7 +12,7 @@
 #include "../include/ctimer.h"
 #include "../include/pqueue.hpp"
 #include "../include/hash_filter.hpp"
-#include "../include/rabitq_filter.hpp"
+#include "../include/qg.hpp"
 using namespace std;
 
 int K = 100;
@@ -24,14 +24,14 @@ constexpr bool TIMING_ENABLED = false;  // set to false to disable all timing ov
 constexpr bool DUP_HANDLING_ENABLED = false;  // set to true to enable duplicate handling
 
 SearchResult beam_cpu_rabitq(
-    Graph& g, int K, int npoints,
-    const float* d_data, const float* d_query, size_t dim,
-    vidType entry_point, RaBitQFilter& filter)
+    QuantizationGraph& qg, int K, const float* d_query, size_t dim, vidType entry_point)
 {
+    int degree = qg.get_degree();
+
     // initialize the search environment
     hash_filter<vidType> is_visited(BEAM_SIZE * BEAM_SIZE);
     hash_filter<vidType> is_added(DUP_HANDLING_ENABLED ? BEAM_SIZE * BEAM_SIZE : 1);
-    vector<pair<vidType, float>> current_candidate(g.degree);
+    vector<pair<vidType, float>> curr_candidate(degree);
     new_pqueue_t<vidType> frontier(BEAM_SIZE);
     new_pqueue_t<vidType> result_pool(K);
 
@@ -39,9 +39,9 @@ SearchResult beam_cpu_rabitq(
     vector<uint16_t> raw_buf;
     vector<float> result_f_buf;
     if constexpr (FASTSCAN_ENABLED) {
-        appro_dist.resize(g.degree);
-        raw_buf.resize(g.degree);
-        result_f_buf.resize(g.degree);
+        appro_dist.resize(degree);
+        raw_buf.resize(degree);
+        result_f_buf.resize(degree);
     }
 
     size_t dist_cmps = 0;
@@ -53,13 +53,14 @@ SearchResult beam_cpu_rabitq(
     size_t pushes = 0;
     size_t duplicate_pushes = 0;
 
-    // timing accumulators
-    using clock = std::chrono::high_resolution_clock;
-    double t_dist_comp = 0, t_dist_est = 0, t_queue = 0, t_hash_filter = 0, t_other = 0;
-    auto t_search_start = clock::now();
-    auto t_lap = t_search_start;
-
-    auto lap = [&]() -> double { if constexpr (!TIMING_ENABLED) return 0.0; auto now = clock::now(); auto d = std::chrono::duration<double>(now - t_lap).count(); t_lap = now; return d; };
+    // pre-allocate buffers for query preparation
+    size_t padded_dim = 1ULL << static_cast<size_t>(std::ceil(std::log2(dim)));
+    QuantizationGraph::QueryBuffers query_buffers;
+    query_buffers.rotated_query = static_cast<float*>(aligned_alloc(64, padded_dim * sizeof(float)));
+    query_buffers.quantized_query = static_cast<uint8_t*>(aligned_alloc(64, padded_dim * sizeof(uint8_t)));
+    if constexpr (FASTSCAN_ENABLED) {
+        query_buffers.lut = static_cast<uint8_t*>(aligned_alloc(64, padded_dim << 2));
+    }
 
     // push the starting point to the frontier with max distance
     frontier.push(entry_point, FLT_MAX);
@@ -71,11 +72,10 @@ SearchResult beam_cpu_rabitq(
     }
 
     // quantize the query once to avoid redundant computations
-    auto qf = filter.query_prepare(d_query);
-    t_dist_est += lap();
+    auto qf = qg.query_prepare(d_query, query_buffers);
 
     int iter = 0;
-    while (frontier.has_unexpanded()) {    
+    while (frontier.has_unexpanded()) {
         iter++;
         int idx = frontier.get_next_index();
         vidType cur_node = frontier[idx];
@@ -93,7 +93,7 @@ SearchResult beam_cpu_rabitq(
         }
         t_hash_filter += lap();
 
-        float exact_dist = compute_distance(dim, d_query, d_data + cur_node * dim);
+        float exact_dist = compute_distance(dim, d_query, qg.get_row(cur_node));
         dist_cmps++;
         t_dist_comp += lap();
 
@@ -129,15 +129,7 @@ SearchResult beam_cpu_rabitq(
         }
 
         // expand the current node
-        const vidType* neighbors = g.get_neighbors(cur_node);
-        filter.prefetch_nbr(cur_node);
-        current_candidate.clear();
-
-        if (frontier.has_unexpanded()) {
-            int idx2 = frontier.get_next_index();
-            g.prefetch_node(frontier[idx2]);
-        }
-        t_other += lap();
+        const vidType* neighbors = qg.get_neighbors(cur_node);
 
         // compute the estimated distance for each neighbor
         if constexpr (FASTSCAN_ENABLED) {
@@ -235,14 +227,13 @@ SearchResult beam_cpu_rabitq(
     if (pool_size != K) {
         for (int i = 0; i < pool_size; i++) {
             vidType data_id = result_pool[i];
-            const vidType* neighbors = g.get_neighbors(data_id);
-            for (size_t j = 0; j < g.degree; j++) {
+            const vidType* neighbors = qg.get_neighbors(data_id);
+            for (int j = 0; j < degree; j++) {
                 vidType cur_neighbor = neighbors[j];
                 t_other += lap();
                 if (!is_visited.contains(cur_neighbor)) {
                     is_visited.add(cur_neighbor);
-                    t_hash_filter += lap();
-                    float dist = compute_distance(dim, d_query, d_data + cur_neighbor * dim);
+                    float dist = compute_distance(dim, d_query, qg.get_row(cur_neighbor));
                     extra_dist_cmps++;
                     t_dist_comp += lap();
                     result_pool.push(cur_neighbor, dist);
@@ -261,7 +252,6 @@ SearchResult beam_cpu_rabitq(
 
     // collect the top-K results from candidates and return with distance computation count
     vector<int> result;
-    // int topK = min(K, (int)result_pool.size());
     for (int i = 0; i < K; i++)
         result.push_back(result_pool[i]);
     t_other += lap();
@@ -297,8 +287,8 @@ SearchResult beam_cpu_rabitq(
 }
 
 RunStats run_ann_experiment_rabitq(
-    Graph& g, int K, size_t n_base, size_t n_query, size_t dim,
-    const float* base_vectors, const float* query_vectors, const int* groundtruth, size_t dim_gt, RaBitQFilter& filter
+    QuantizationGraph& qg, int K, size_t n_base, size_t n_query, size_t dim,
+    const float* base_vectors, const float* query_vectors, const int* groundtruth, size_t dim_gt
 ) {
     int actual_threads = 0;
     #pragma omp parallel
@@ -306,6 +296,8 @@ RunStats run_ann_experiment_rabitq(
         actual_threads = omp_get_num_threads();
     }
     cout << "OpenMP ANN search (" << actual_threads << " threads)\n";
+
+    int actual_query = (DEBUG) ? 1 : n_query;   // if in debug mode, only run 1 query for easy debugging
 
     int64_t total_count_dc = 0;
     int64_t total_count_ds = 0;
@@ -320,10 +312,9 @@ RunStats run_ann_experiment_rabitq(
     int64_t total_duplicate_pushes = 0;
     vector<vector<int>> all_results(n_query, vector<int>(K));
 
-    vector<float> centroid = compute_centroid(base_vectors, n_base, dim, actual_threads);
-    vidType entry_point = exact_nn(base_vectors, centroid.data(), n_base, dim, actual_threads);
-
-    int actual_query = (DEBUG) ? 1 : n_query;   // if in debug mode, only run 1 query for easy debugging
+    // vector<float> centroid = compute_centroid(base_vectors, n_base, dim, actual_threads);
+    // vidType entry_point = exact_nn(base_vectors, centroid.data(), n_base, dim, actual_threads);
+    vidType entry_point = qg.get_entry_point();
 
     ctimer_t t;
     ctimer_start(&t);
@@ -332,7 +323,7 @@ RunStats run_ann_experiment_rabitq(
     for (int q = 0; q < actual_query; q++) {
         const float* query_ptr = query_vectors + q * dim;
 
-        SearchResult result = beam_cpu_rabitq(g, K, n_base, base_vectors, query_ptr, dim, entry_point, filter);
+        SearchResult result = beam_cpu_rabitq(qg, K, query_ptr, dim, entry_point);
 
         all_results[q] = result.neighbors;
         total_count_dc += result.dist_cmps;
@@ -413,14 +404,18 @@ int main(int argc, char** argv) {
     if (argc < 2) {
         cerr << "Usage:\n" << argv[0]
         << " -base <base.fvecs>" << " -query <query.fvecs>" << " -gt <groundtruth.ivecs>"
-        << " -graph <graph_index>\n" << " [-rabitq <rabitq_table>]" << "[-sign <sign_table>]"
+        << " -degree <int>" << " [-mode <codebook|bins>]"
+        << " [-qg <qg_codebook>]" << " [-graph <graph_index>]"
+        << " [-rabitq <rabitq_table>]" << " [-sign <sign_table>]"
         << " [-beam <int>]" << " [-p_ratio <float>]" << " [-a_ratio <float>]" << " [-csv <output.csv>]\n";
         return 1;
     }
 
     // required input files
-    string base_file, query_file, gt_file, graph_file, rabitq_table, signs_table;
+    string base_file, query_file, gt_file, graph_file, rabitq_table, signs_table, qg_codebook;
+    string mode = "codebook";
     string csv_file;
+    int degree = 32;
 
     for (int i = 1; i < argc; ++i) {
         string arg = argv[i];
@@ -434,14 +429,23 @@ int main(int argc, char** argv) {
         else if (arg == "-gt" && i + 1 < argc) {
             gt_file = argv[++i];
         }
+        else if (arg == "-mode" && i + 1 < argc) {
+            mode = argv[++i];
+        }
         else if (arg == "-graph" && i + 1 < argc) {
             graph_file = argv[++i];
+        }
+        else if (arg == "-degree" && i + 1 < argc) {
+            degree = atoi(argv[++i]);
         }
         else if (arg == "-rabitq" && i + 1 < argc) {
             rabitq_table = argv[++i];
         }
         else if (arg == "-sign" && i + 1 < argc) {
             signs_table = argv[++i];
+        }
+        else if (arg == "-qg" && i + 1 < argc) {
+            qg_codebook = argv[++i];
         }
         else if (arg == "-beam" && i + 1 < argc) {
             BEAM_SIZE = atoi(argv[++i]);
@@ -461,8 +465,23 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (base_file.empty() || query_file.empty() || gt_file.empty() || graph_file.empty() || rabitq_table.empty()) {
+    if (mode != "codebook" && mode != "bins") {
+        cerr << "Error: -mode must be either 'codebook' or 'bins'.\n";
+        return 1;
+    }
+
+    if (base_file.empty() || query_file.empty() || gt_file.empty()) {
         cerr << "Error: missing required input files.\n";
+        return 1;
+    }
+
+    if (mode == "codebook" && qg_codebook.empty()) {
+        cerr << "Error: codebook mode requires -qg <qg_codebook>.\n";
+        return 1;
+    }
+
+    if (mode == "bins" && (graph_file.empty() || rabitq_table.empty() || signs_table.empty())) {
+        cerr << "Error: bins mode requires -graph <graph_index> -rabitq <rabitq_table> -sign <sign_table>.\n";
         return 1;
     }
 
@@ -475,15 +494,24 @@ int main(int argc, char** argv) {
     const float* query_vectors = read_fvecs(query_file.c_str(), n_query, dim_query);
     const int* groundtruth = read_ivecs(gt_file.c_str(), n_gt, dim_gt);
 
-    Graph g;
-    g.load_graph_index(graph_file.c_str());
-    // g.load_qg_index(graph_file.c_str(), n_base, dim_base, 32);
+    QuantizationGraph qg = (mode == "codebook")
+        ? QuantizationGraph(n_base, dim_base, degree, qg_codebook)
+        : QuantizationGraph(n_base, dim_base, degree, graph_file, rabitq_table, signs_table, base_vectors);
 
-    // initialize the filter
-    RaBitQFilter filter(dim_base, g.degree, rabitq_table, signs_table);  // 6 bits for quantization as SymQG
+    if (mode == "bins") {
+        int actual_threads = 0;
+        #pragma omp parallel
+        {
+            actual_threads = omp_get_num_threads();
+        }
+        vector<float> centroid = compute_centroid(base_vectors, n_base, dim_base, actual_threads);
+        vidType entry_point = exact_nn(base_vectors, centroid.data(), n_base, dim_base, actual_threads);
+        qg.set_entry_point(entry_point);
+        cout << "Computed bins-mode entry point: " << entry_point << "\n";
+    }
 
     // Run experiment
-    RunStats stats = run_ann_experiment_rabitq(g, K, n_base, n_query, dim_base, base_vectors, query_vectors, groundtruth, dim_gt, filter);
+    RunStats stats = run_ann_experiment_rabitq(qg, K, n_base, n_query, dim_base, base_vectors, query_vectors, groundtruth, dim_gt);
 
     if (!csv_file.empty()) {
         append_stats_to_csv(csv_file, K, BEAM_SIZE, PRUNE_RATIO, APPROX_RATIO, stats);
