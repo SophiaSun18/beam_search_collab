@@ -181,8 +181,8 @@ struct RunStats {
     double time_dist_comp = 0;
     double time_nbr_filter = 0;       // fetching neighbor factors
     double time_dist_est = 0;         // actual distance estimation computation
-    double time_queue_pop = 0;        // frontier pop (get_next_index + set_front_expanded)
-    double time_queue_push = 0;       // frontier + result_pool push
+    double time_queue_mgmt = 0;       // frontier + result_pool queue operations
+    double time_pruning = 0;          // candidate buffer handling + pruning
     double time_hash_filter = 0;      // is_visited check + add
     double time_query_prepare = 0;    // query_prepare
     int64_t total_hash_inserts = 0;
@@ -204,8 +204,8 @@ struct SearchResult {
     double time_dist_comp = 0;        // exact distance computations
     double time_nbr_filter = 0;       // fetching neighbor factors
     double time_dist_est = 0;         // actual distance estimation computation
-    double time_queue_pop = 0;        // frontier pop
-    double time_queue_push = 0;       // frontier + result_pool push
+    double time_queue_mgmt = 0;       // frontier + result_pool queue operations
+    double time_pruning = 0;          // candidate buffer handling + pruning
     double time_hash_filter = 0;      // is_visited check + add
     double time_query_prepare = 0;    // query_prepare
     size_t hash_inserts = 0;
@@ -466,8 +466,8 @@ inline void append_stats_to_csv(const std::string& filename,
             << "Time_dist_comp,"
             << "Time_nbr_filter,"
             << "Time_dist_est,"
-            << "Time_queue_pop,"
-            << "Time_queue_push,"
+            << "Time_queue_management,"
+            << "Time_pruning,"
             << "Time_hash_filter,"
             << "Time_query_prepare,"
             << "Hash_inserts,"
@@ -496,8 +496,8 @@ inline void append_stats_to_csv(const std::string& filename,
         << stats.time_dist_comp << ","
         << stats.time_nbr_filter << ","
         << stats.time_dist_est << ","
-        << stats.time_queue_pop << ","
-        << stats.time_queue_push << ","
+        << stats.time_queue_mgmt << ","
+        << stats.time_pruning << ","
         << stats.time_hash_filter << ","
         << stats.time_query_prepare << ","
         << stats.total_hash_inserts << ","

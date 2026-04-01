@@ -148,8 +148,8 @@ SearchResult beam_cpu_base(
     res.neighbor_pruned = neighbor_pruned;
     res.visited_pruned = visited_pruned;
     res.time_dist_comp = timespec_sec(tc_dist_comp.elapsed);
-    res.time_queue_pop = timespec_sec(tc_queue_pop.elapsed);
-    res.time_queue_push = timespec_sec(tc_queue_push.elapsed);
+    res.time_queue_mgmt = timespec_sec(tc_queue_pop.elapsed) + timespec_sec(tc_queue_push.elapsed);
+    res.time_pruning = 0;
     res.time_hash_filter = timespec_sec(tc_hash_filter.elapsed);
     res.hash_inserts = is_visited.get_total_inserts();
     res.hash_collisions = is_visited.get_total_collisions();
@@ -176,8 +176,8 @@ RunStats run_ann_experiment_base(
     int64_t total_pruned = 0;
     int64_t total_neighbor_pruned = 0;
     int64_t total_visited_pruned = 0;
-    double total_time_dist_comp = 0, total_time_queue_pop = 0;
-    double total_time_queue_push = 0, total_time_hash_filter = 0;
+    double total_time_dist_comp = 0, total_time_queue_mgmt = 0;
+    double total_time_pruning = 0, total_time_hash_filter = 0;
     int64_t total_hash_inserts = 0, total_hash_collisions = 0;
     int64_t total_pushes = 0;
     int64_t total_duplicate_pushes = 0;
@@ -194,8 +194,8 @@ RunStats run_ann_experiment_base(
     #pragma omp parallel for schedule(dynamic, 1) \
         reduction(+:total_count_dc) reduction(+:total_count_ds) reduction(+:total_extra_count_dc) \
         reduction(+:total_hop) reduction(+:total_pruned) reduction(+:total_neighbor_pruned) reduction(+:total_visited_pruned) \
-        reduction(+:total_time_dist_comp) reduction(+:total_time_queue_pop) \
-        reduction(+:total_time_queue_push) reduction(+:total_time_hash_filter) \
+        reduction(+:total_time_dist_comp) reduction(+:total_time_queue_mgmt) \
+        reduction(+:total_time_pruning) reduction(+:total_time_hash_filter) \
         reduction(+:total_hash_inserts) reduction(+:total_hash_collisions) \
         reduction(+:total_pushes) reduction(+:total_duplicate_pushes)
     for (int q = 0; q < n_query; q++) {
@@ -212,8 +212,8 @@ RunStats run_ann_experiment_base(
         total_neighbor_pruned += result.neighbor_pruned;
         total_visited_pruned += result.visited_pruned;
         total_time_dist_comp += result.time_dist_comp;
-        total_time_queue_pop += result.time_queue_pop;
-        total_time_queue_push += result.time_queue_push;
+        total_time_queue_mgmt += result.time_queue_mgmt;
+        total_time_pruning += result.time_pruning;
         total_time_hash_filter += result.time_hash_filter;
         total_hash_inserts += result.hash_inserts;
         total_hash_collisions += result.hash_collisions;
@@ -238,8 +238,8 @@ RunStats run_ann_experiment_base(
     stats.total_neighbor_pruned = total_neighbor_pruned;
     stats.total_visited_pruned = total_visited_pruned;
     stats.time_dist_comp = total_time_dist_comp;
-    stats.time_queue_pop = total_time_queue_pop;
-    stats.time_queue_push = total_time_queue_push;
+    stats.time_queue_mgmt = total_time_queue_mgmt;
+    stats.time_pruning = total_time_pruning;
     stats.time_hash_filter = total_time_hash_filter;
     stats.total_hash_inserts = total_hash_inserts;
     stats.total_hash_collisions = total_hash_collisions;
@@ -256,14 +256,14 @@ RunStats run_ann_experiment_base(
     cout << "total # pruned neighbors: " << stats.total_pruned << "\n";
     cout << "average # pruned neighbors: " << stats.total_pruned / n_query << "\n";
     double t_sum = stats.time_dist_comp + stats.time_nbr_filter + stats.time_dist_est
-                 + stats.time_queue_pop + stats.time_queue_push
+                 + stats.time_queue_mgmt + stats.time_pruning
                  + stats.time_hash_filter + stats.time_query_prepare;
     printf("--- Timing breakdown (total across queries) ---\n");
     printf("  dist computation:  %.6f sec (%.1f%%)\n", stats.time_dist_comp, t_sum > 0 ? stats.time_dist_comp / t_sum * 100 : 0.0);
     printf("  nbr filter:        %.6f sec (%.1f%%)\n", stats.time_nbr_filter, t_sum > 0 ? stats.time_nbr_filter / t_sum * 100 : 0.0);
     printf("  est dist:          %.6f sec (%.1f%%)\n", stats.time_dist_est, t_sum > 0 ? stats.time_dist_est / t_sum * 100 : 0.0);
-    printf("  queue pop:         %.6f sec (%.1f%%)\n", stats.time_queue_pop, t_sum > 0 ? stats.time_queue_pop / t_sum * 100 : 0.0);
-    printf("  queue push:        %.6f sec (%.1f%%)\n", stats.time_queue_push, t_sum > 0 ? stats.time_queue_push / t_sum * 100 : 0.0);
+    printf("  queue management:  %.6f sec (%.1f%%)\n", stats.time_queue_mgmt, t_sum > 0 ? stats.time_queue_mgmt / t_sum * 100 : 0.0);
+    printf("  pruning:           %.6f sec (%.1f%%)\n", stats.time_pruning, t_sum > 0 ? stats.time_pruning / t_sum * 100 : 0.0);
     printf("  hash filter:       %.6f sec (%.1f%%)\n", stats.time_hash_filter, t_sum > 0 ? stats.time_hash_filter / t_sum * 100 : 0.0);
     printf("  query prepare:     %.6f sec (%.1f%%)\n", stats.time_query_prepare, t_sum > 0 ? stats.time_query_prepare / t_sum * 100 : 0.0);
     printf("  sum:                  %.6f sec\n", t_sum);

@@ -12,7 +12,7 @@
 #include "../include/fastscan_impl.hpp"
 
 static constexpr bool FASTSCAN_ENABLED = true;  // set to true to use fastscan batch estimation
-static constexpr bool FASTSCAN_WIDE_ACCUM_ENABLED = true;   // set to true to ensure high dimension overflow can be handled
+static constexpr bool HUGE_PAGE_ENABLED = false;
 
 class QuantizationGraph {
 public:
@@ -58,12 +58,17 @@ public:
         size_t total_floats = num_nodes_ * row_offset_;
         size_t total_bytes = total_floats * sizeof(float);
 
-        constexpr size_t kHugePageAlign = 1 << 22;  // 4 MB
-        size_t alloc_bytes = (total_bytes + kHugePageAlign - 1) & ~(kHugePageAlign - 1);
+        if (HUGE_PAGE_ENABLED) {
+            constexpr size_t kHugePageAlign = 1 << 22;  // 4 MB
+            size_t alloc_bytes = (total_bytes + kHugePageAlign - 1) & ~(kHugePageAlign - 1);
 
-        data_ = static_cast<float*>(std::aligned_alloc(kHugePageAlign, alloc_bytes));
-        madvise(data_, alloc_bytes, MADV_HUGEPAGE);
-
+            data_ = static_cast<float*>(std::aligned_alloc(kHugePageAlign, alloc_bytes));
+            madvise(data_, alloc_bytes, MADV_HUGEPAGE);
+        } else {
+            size_t alloc_bytes = (total_bytes + 64 - 1) & ~(64 - 1);
+            data_ = static_cast<float*>(std::aligned_alloc(64, alloc_bytes));
+        }
+        
         fin.read(reinterpret_cast<char*>(data_), total_floats * sizeof(float));
 
         // load the sign table
