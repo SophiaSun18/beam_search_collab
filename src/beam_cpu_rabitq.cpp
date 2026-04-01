@@ -19,8 +19,6 @@ int BEAM_SIZE = 128;
 float PRUNE_RATIO = 0.0;
 float APPROX_RATIO = 0.0;
 
-#define DEBUG 0
-
 #define TIMING_ENABLED 0
 
 #if TIMING_ENABLED
@@ -36,23 +34,27 @@ float APPROX_RATIO = 0.0;
 SearchResult beam_cpu_rabitq(
     QuantizationGraph& qg, int K, const float* d_query, size_t dim, vidType entry_point)
 {
+    struct Candidate {
+        vidType vid;
+        float dist;
+    };
+
     int degree = qg.get_degree();
 
     // initialize the search environment
     hash_filter<vidType> is_visited(BEAM_SIZE * BEAM_SIZE);
     hash_filter<vidType> is_added(DUP_HANDLING_ENABLED ? BEAM_SIZE * BEAM_SIZE : 1);
-    vector<pair<vidType, float>> curr_candidate(degree);
+    vector<Candidate> curr_candidate;
+    curr_candidate.reserve(degree);
     new_pqueue_t<vidType> frontier(BEAM_SIZE);
     new_pqueue_t<vidType> result_pool(K);
 
     vector<float> appro_dist;
-    vector<uint16_t> raw_buf;
     vector<uint32_t> raw_buf_32;
     vector<float> result_f_buf;
     if constexpr (FASTSCAN_ENABLED) {
         appro_dist.resize(degree);
-        raw_buf.resize(degree);
-        if constexpr (FASTSCAN_WIDE_ACCUM_ENABLED) raw_buf_32.resize(degree);
+        raw_buf_32.resize(degree);
         result_f_buf.resize(degree);
     }
 
@@ -66,14 +68,14 @@ SearchResult beam_cpu_rabitq(
     size_t duplicate_pushes = 0;
 
     // fine-grained timing accumulators (ctimer-based, zero overhead when macros disabled)
-    ctimer_t tc_dist_comp, tc_nbr_filter, tc_dist_est;
-    ctimer_t tc_queue_pop, tc_queue_push;
+    ctimer_t tc_dist_comp, tc_dist_est;
+    ctimer_t tc_nbr_filter, tc_query_prepare;
+    ctimer_t tc_queue_mgmt, tc_pruning;
     ctimer_t tc_hash_filter;
-    ctimer_t tc_query_prepare;
-    ctimer_reset(&tc_dist_comp); ctimer_reset(&tc_nbr_filter); ctimer_reset(&tc_dist_est);
-    ctimer_reset(&tc_queue_pop); ctimer_reset(&tc_queue_push);
+    ctimer_reset(&tc_dist_comp); ctimer_reset(&tc_dist_est);
+    ctimer_reset(&tc_nbr_filter); ctimer_reset(&tc_query_prepare);
+    ctimer_reset(&tc_queue_mgmt); ctimer_reset(&tc_pruning);
     ctimer_reset(&tc_hash_filter);
-    ctimer_reset(&tc_query_prepare);
 
     // pre-allocate buffers for query preparation
     size_t padded_dim = 1ULL << static_cast<size_t>(std::ceil(std::log2(dim)));
@@ -85,10 +87,10 @@ SearchResult beam_cpu_rabitq(
     }
 
     // push the starting point to the frontier with max distance
-    TSTART(tc_queue_push);
+    TSTART(tc_queue_mgmt);
     frontier.push(entry_point, FLT_MAX);
     pushes++;
-    TSTOP(tc_queue_push);
+    TSTOP(tc_queue_mgmt);
     if constexpr (DUP_HANDLING_ENABLED) {
         TSTART(tc_hash_filter);
         is_added.add(entry_point);
@@ -103,13 +105,15 @@ SearchResult beam_cpu_rabitq(
     int iter = 0;
     while (frontier.has_unexpanded()) {
         iter++;
+        TSTART(tc_pruning);
         curr_candidate.clear();
+        TSTOP(tc_pruning);
 
-        TSTART(tc_queue_pop);
+        TSTART(tc_queue_mgmt);
         int idx = frontier.get_next_index();
         vidType cur_node = frontier[idx];
         frontier.set_front_expanded();
-        TSTOP(tc_queue_pop);
+        TSTOP(tc_queue_mgmt);
 
         TSTART(tc_hash_filter);
         if (is_visited.contains(cur_node)) {
@@ -125,56 +129,23 @@ SearchResult beam_cpu_rabitq(
         dist_cmps++;
         TSTOP(tc_dist_comp);
 
-        TSTART(tc_queue_push);
+        TSTART(tc_queue_mgmt);
         result_pool.push(cur_node, exact_dist);
-        TSTOP(tc_queue_push);
+        TSTOP(tc_queue_mgmt);
         
         TSTART(tc_hash_filter);
         is_visited.add(cur_node);
         TSTOP(tc_hash_filter);
-
-        if (DEBUG) {
-            // Debug: Print current node being expanded
-            std::cout << "\n=== Iteration " << iter << " ===\n";
-            std::cout << "Expanding node: " << cur_node << " with exact distance: " << exact_dist << "\n";
-
-            // Debug: Print the current sign table
-            std::cout << "Sign table: ";
-            for (size_t d = 0; d < dim; d++) {
-                std::cout << qg.get_signs_ptr()[d] << " ";
-            }
-            std::cout << "\n";
-
-            // Debug: Print the rotated query and quantized query
-            std::cout << "Rotated query: ";
-            for (size_t d = 0; d < dim; d++) {
-                std::cout << query_buffers.rotated_query[d] << " ";
-            }
-            std::cout << "\n";
-
-            std::cout << "Quantized query: ";
-            for (size_t d = 0; d < dim; d++) {
-                std::cout << query_buffers.quantized_query[d] << " ";
-            }
-            std::cout << "\n";
-        }
 
         // expand the current node
         const vidType* neighbors = qg.get_neighbors(cur_node);
 
         // compute the estimated distance for each neighbor
         if constexpr (FASTSCAN_ENABLED) {
-            if constexpr (FASTSCAN_WIDE_ACCUM_ENABLED) {
-                TSTART(tc_dist_est);
-                qg.scan_all_neighbors_32(cur_node, exact_dist, appro_dist.data(), qf, raw_buf_32.data(), result_f_buf.data());
-                dist_est += degree;
-                TSTOP(tc_dist_est);
-            } else {
-                TSTART(tc_dist_est);
-                qg.scan_all_neighbors(cur_node, exact_dist, appro_dist.data(), qf, raw_buf.data(), result_f_buf.data());
-                dist_est += degree;
-                TSTOP(tc_dist_est);
-            }
+            TSTART(tc_dist_est);
+            qg.scan_all_neighbors_32(cur_node, exact_dist, appro_dist.data(), qf, raw_buf_32.data(), result_f_buf.data());
+            dist_est += degree;
+            TSTOP(tc_dist_est);
 
             for (int i = 0; i < degree; i++) {
                 TSTART(tc_hash_filter);
@@ -185,11 +156,14 @@ SearchResult beam_cpu_rabitq(
                     continue;
                 }
                 TSTOP(tc_hash_filter);
+                TSTART(tc_pruning);
                 curr_candidate.push_back({neighbors[i], appro_dist[i]});
+                TSTOP(tc_pruning);
             }
 
             if (iter > BEAM_SIZE * APPROX_RATIO) {
                 // partial sort the neighbors by their distance to the query and prune by the ratio
+                TSTART(tc_pruning);
                 size_t num_kept = degree * (1 - PRUNE_RATIO);
                 size_t iter_pruned = 0;
                 if (num_kept > 0 && curr_candidate.size() > num_kept) {
@@ -202,12 +176,13 @@ SearchResult beam_cpu_rabitq(
                         });
                     curr_candidate.resize(num_kept);
                 }
+                TSTOP(tc_pruning);
             }
 
             for (size_t i = 0; i < curr_candidate.size(); i++) {
                 vidType n = curr_candidate[i].vid;
                 float dist = curr_candidate[i].dist;
-                TSTART(tc_queue_push);
+                TSTART(tc_queue_mgmt);
                 if (frontier.size() < BEAM_SIZE || dist < frontier.get_tail_dist()) {
                     if constexpr (DUP_HANDLING_ENABLED) {
                         if (is_added.add(n)) {
@@ -223,14 +198,14 @@ SearchResult beam_cpu_rabitq(
                         pushes++;
                     }
                 }
-                TSTOP(tc_queue_push);
+                TSTOP(tc_queue_mgmt);
             }
 
             // prefetch next node
-            if (frontier.has_unexpanded()) {
-                int new_idx = frontier.get_next_index();
-                qg.prefetch_nbr(frontier[new_idx]);
-            }
+            // if (frontier.has_unexpanded()) {
+            //     int new_idx = frontier.get_next_index();
+            //     qg.prefetch_nbr(frontier[new_idx]);
+            // }
         } else {
             for (size_t i = 0; i < degree; i++) {
                 TSTART(tc_hash_filter);
@@ -250,25 +225,14 @@ SearchResult beam_cpu_rabitq(
                 float est = qg.estimated_distance(qf, nf, exact_dist);
                 TSTOP(tc_dist_est);
 
+                TSTART(tc_pruning);
                 curr_candidate.push_back({neighbors[i], est});
-
-                if (DEBUG) {
-                    // Debug: Print neighbor details
-                    std::cout << std::fixed << std::setprecision(6)
-                            << "  Neighbor ID: " << neighbors[i]
-                            << ", Estimated Distance: " << est
-                            << ", Factors: [tx: " << nf.triple_x
-                            << ", dq: " << nf.factor_dq
-                            << ", vq: " << nf.factor_vq
-                            << ", sum q: " << qf.sum_q
-                            << ", width: " << qf.width
-                            << ", low_val: " << qf.low_val
-                            << "]\n";
-                }
+                TSTOP(tc_pruning);
             }
 
             if (iter > BEAM_SIZE * APPROX_RATIO) {
                 // partial sort the neighbors by their distance to the query and prune by the ratio
+                TSTART(tc_pruning);
                 size_t num_kept = degree * (1 - PRUNE_RATIO);
                 size_t iter_pruned = 0;
                 if (num_kept > 0 && curr_candidate.size() > num_kept) {
@@ -281,12 +245,13 @@ SearchResult beam_cpu_rabitq(
                         });
                     curr_candidate.resize(num_kept);
                 }
+                TSTOP(tc_pruning);
             }
 
             for (size_t i = 0; i < curr_candidate.size(); i++) {
                 vidType n = curr_candidate[i].vid;
                 float dist = curr_candidate[i].dist;
-                TSTART(tc_queue_push);
+                TSTART(tc_queue_mgmt);
                 if (frontier.size() < BEAM_SIZE || dist < frontier.get_tail_dist()) {
                     if constexpr (DUP_HANDLING_ENABLED) {
                         if (is_added.add(n)) {
@@ -302,28 +267,14 @@ SearchResult beam_cpu_rabitq(
                         pushes++;
                     }
                 }
-                TSTOP(tc_queue_push);
+                TSTOP(tc_queue_mgmt);
             }
 
             // prefetch next node
-            if (frontier.has_unexpanded()) {
-                int new_idx = frontier.get_next_index();
-                qg.prefetch_nbr(frontier[new_idx]);
-            }
-        }
-
-        if (DEBUG) {
-            // Debug: Print current state of the frontier
-            std::cout << "Frontier state (size = " << frontier.size() << "):\n";
-            for (int i = 0; i < frontier.size(); i++) {
-                std::cout << "  Node: " << frontier[i] << " Dist: " << frontier.get_dist(i) << " Visited: " << (is_visited.contains(frontier[i]) ? "Yes" : "No") << "\n";
-            }
-
-            // Debug: Print current state of the result pool
-            std::cout << "Result pool state (size = " << result_pool.size() << "):\n";
-            for (int i = 0; i < result_pool.size(); i++) {
-                std::cout << "  Node: " << result_pool[i] << " Dist: " << result_pool.get_dist(i) << "\n";
-            }
+            // if (frontier.has_unexpanded()) {
+            //     int new_idx = frontier.get_next_index();
+            //     qg.prefetch_nbr(frontier[new_idx]);
+            // }
         }
     }
 
@@ -343,9 +294,9 @@ SearchResult beam_cpu_rabitq(
                     float dist = compute_distance(dim, d_query, qg.get_row(cur_neighbor));
                     extra_dist_cmps++;
                     TSTOP(tc_dist_comp);
-                    TSTART(tc_queue_push);
+                    TSTART(tc_queue_mgmt);
                     result_pool.push(cur_neighbor, dist);
-                    TSTOP(tc_queue_push);
+                    TSTOP(tc_queue_mgmt);
                 } else {
                     TSTOP(tc_hash_filter);
                 }
@@ -359,13 +310,6 @@ SearchResult beam_cpu_rabitq(
     for (int i = 0; i < K; i++)
         result.push_back(result_pool[i]);
 
-    if (DEBUG) {
-        std::cout << "Final Results:\n";
-        for (int i = 0; i < K; i++) {
-            std::cout << "  Neighbor ID: " << result[i] << "\n";
-        }
-    }
-
     SearchResult res;
     res.neighbors = move(result);
     res.dist_cmps = dist_cmps;
@@ -378,8 +322,8 @@ SearchResult beam_cpu_rabitq(
     res.time_dist_comp = timespec_sec(tc_dist_comp.elapsed);
     res.time_nbr_filter = timespec_sec(tc_nbr_filter.elapsed);
     res.time_dist_est = timespec_sec(tc_dist_est.elapsed);
-    res.time_queue_pop = timespec_sec(tc_queue_pop.elapsed);
-    res.time_queue_push = timespec_sec(tc_queue_push.elapsed);
+    res.time_queue_mgmt = timespec_sec(tc_queue_mgmt.elapsed);
+    res.time_pruning = timespec_sec(tc_pruning.elapsed);
     res.time_hash_filter = timespec_sec(tc_hash_filter.elapsed);
     res.time_query_prepare = timespec_sec(tc_query_prepare.elapsed);
     res.hash_inserts = is_visited.get_total_inserts();
@@ -400,8 +344,6 @@ RunStats run_ann_experiment_rabitq(
     }
     cout << "OpenMP ANN search (" << actual_threads << " threads)\n";
 
-    int actual_query = (DEBUG) ? 1 : n_query;   // if in debug mode, only run 1 query for easy debugging
-
     int64_t total_count_dc = 0;
     int64_t total_count_ds = 0;
     int64_t total_extra_count_dc = 0;
@@ -410,7 +352,7 @@ RunStats run_ann_experiment_rabitq(
     int64_t total_neighbor_pruned = 0;
     int64_t total_visited_pruned = 0;
     double total_time_dist_comp = 0, total_time_nbr_filter = 0, total_time_dist_est = 0;
-    double total_time_queue_pop = 0, total_time_queue_push = 0;
+    double total_time_queue_mgmt = 0, total_time_pruning = 0;
     double total_time_hash_filter = 0;
     double total_time_query_prepare = 0;
     int64_t total_hash_inserts = 0, total_hash_collisions = 0;
@@ -418,8 +360,6 @@ RunStats run_ann_experiment_rabitq(
     int64_t total_duplicate_pushes = 0;
     vector<vector<int>> all_results(n_query, vector<int>(K));
 
-    // vector<float> centroid = compute_centroid(base_vectors, n_base, dim, actual_threads);
-    // vidType entry_point = exact_nn(base_vectors, centroid.data(), n_base, dim, actual_threads);
     vidType entry_point = qg.get_entry_point();
 
     ctimer_t t;
@@ -429,12 +369,12 @@ RunStats run_ann_experiment_rabitq(
         reduction(+:total_count_dc) reduction(+:total_count_ds) reduction(+:total_extra_count_dc) \
         reduction(+:total_hop) reduction(+:total_pruned) reduction(+:total_neighbor_pruned) reduction(+:total_visited_pruned) \
         reduction(+:total_time_dist_comp) reduction(+:total_time_nbr_filter) reduction(+:total_time_dist_est) \
-        reduction(+:total_time_queue_pop) reduction(+:total_time_queue_push) \
+        reduction(+:total_time_queue_mgmt) reduction(+:total_time_pruning) \
         reduction(+:total_time_hash_filter) \
         reduction(+:total_time_query_prepare) \
         reduction(+:total_hash_inserts) reduction(+:total_hash_collisions) \
         reduction(+:total_pushes) reduction(+:total_duplicate_pushes)
-    for (int q = 0; q < actual_query; q++) {
+    for (int q = 0; q < n_query; q++) {
         const float* query_ptr = query_vectors + q * dim;
 
         SearchResult result = beam_cpu_rabitq(qg, K, query_ptr, dim, entry_point);
@@ -450,8 +390,8 @@ RunStats run_ann_experiment_rabitq(
         total_time_dist_comp += result.time_dist_comp;
         total_time_nbr_filter += result.time_nbr_filter;
         total_time_dist_est += result.time_dist_est;
-        total_time_queue_pop += result.time_queue_pop;
-        total_time_queue_push += result.time_queue_push;
+        total_time_queue_mgmt += result.time_queue_mgmt;
+        total_time_pruning += result.time_pruning;
         total_time_hash_filter += result.time_hash_filter;
         total_time_query_prepare += result.time_query_prepare;
         total_hash_inserts += result.hash_inserts;
@@ -479,8 +419,8 @@ RunStats run_ann_experiment_rabitq(
     stats.time_dist_comp = total_time_dist_comp;
     stats.time_nbr_filter = total_time_nbr_filter;
     stats.time_dist_est = total_time_dist_est;
-    stats.time_queue_pop = total_time_queue_pop;
-    stats.time_queue_push = total_time_queue_push;
+    stats.time_queue_mgmt = total_time_queue_mgmt;
+    stats.time_pruning = total_time_pruning;
     stats.time_hash_filter = total_time_hash_filter;
     stats.time_query_prepare = total_time_query_prepare;
     stats.total_hash_inserts = total_hash_inserts;
@@ -499,14 +439,14 @@ RunStats run_ann_experiment_rabitq(
     cout << "average # pruned neighbors: " << stats.total_pruned / n_query << "\n";
 
     double t_sum = stats.time_dist_comp + stats.time_nbr_filter + stats.time_dist_est
-                 + stats.time_queue_pop + stats.time_queue_push
+                 + stats.time_queue_mgmt + stats.time_pruning
                  + stats.time_hash_filter + stats.time_query_prepare;
     printf("--- Timing breakdown (total across queries) ---\n");
     printf("  dist computation:  %.6f sec (%.1f%%)\n", stats.time_dist_comp, stats.time_dist_comp / t_sum * 100);
     printf("  nbr filter:        %.6f sec (%.1f%%)\n", stats.time_nbr_filter, stats.time_nbr_filter / t_sum * 100);
     printf("  dist estimation:   %.6f sec (%.1f%%)\n", stats.time_dist_est, stats.time_dist_est / t_sum * 100);
-    printf("  queue pop:         %.6f sec (%.1f%%)\n", stats.time_queue_pop, stats.time_queue_pop / t_sum * 100);
-    printf("  queue push:        %.6f sec (%.1f%%)\n", stats.time_queue_push, stats.time_queue_push / t_sum * 100);
+    printf("  queue management:  %.6f sec (%.1f%%)\n", stats.time_queue_mgmt, stats.time_queue_mgmt / t_sum * 100);
+    printf("  pruning:           %.6f sec (%.1f%%)\n", stats.time_pruning, stats.time_pruning / t_sum * 100);
     printf("  hash filter:       %.6f sec (%.1f%%)\n", stats.time_hash_filter, stats.time_hash_filter / t_sum * 100);
     printf("  query prepare:     %.6f sec (%.1f%%)\n", stats.time_query_prepare, stats.time_query_prepare / t_sum * 100);
     printf("  sum:                  %.6f sec\n", t_sum);
