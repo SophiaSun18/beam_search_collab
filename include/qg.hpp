@@ -249,7 +249,7 @@ public:
         raw_sum = static_cast<int32_t>(_mm_extract_epi64(sum128, 0) + _mm_extract_epi64(sum128, 1));
 
     #else
-        for (size_t d = 0; d < dim_; ++d) {
+        for (size_t d = 0; d < padded_dim_; ++d) {
             if ((bits[d / 64] >> (d % 64)) & 1ULL)
                 raw_sum += static_cast<int32_t>(q[d]);
         }
