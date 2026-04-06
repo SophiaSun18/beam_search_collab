@@ -11,3 +11,5 @@ scripts/
 *.out
 *.csv
 *.txt
+
+*benchmark*

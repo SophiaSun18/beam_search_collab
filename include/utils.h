@@ -13,7 +13,8 @@
 #include <cfloat>
 #include <filesystem>
 #include <iomanip>
-#if defined(__AVX512F__) || defined(__AVX2__) || defined(__SSE2__)
+#include <omp.h>
+#if !defined(__CUDACC__) && (defined(__AVX512F__) || defined(__AVX2__) || defined(__SSE2__))
 #include <immintrin.h>
 #endif
 
@@ -21,6 +22,54 @@ using namespace std;
 typedef uint32_t vidType;
 
 #define QG_BQUERY 6
+
+inline int* read_ivecs(const char* filename, size_t& n_out, size_t& d_out) {
+    std::ifstream input(filename, std::ios::binary);
+    if (!input) throw std::runtime_error("Cannot open ivecs file");
+
+    int d;
+    input.read((char*)&d, sizeof(int));
+    input.seekg(0, std::ios::end);
+    size_t file_size = input.tellg();
+    input.seekg(0, std::ios::beg);
+    size_t num = file_size / ((d + 1) * sizeof(int));
+    int* data = new int[num * d];
+
+    for (size_t i = 0; i < num; ++i) {
+        int dim;
+        input.read((char*)&dim, sizeof(int));
+        assert(dim == d);
+        input.read((char*)(data + i * d), sizeof(int) * d);
+    }
+
+    d_out = d;
+    n_out = num;
+    return data;
+}
+
+inline float* read_fvecs(const char* filename, size_t& n_out, size_t& d_out) {
+    std::ifstream input(filename, std::ios::binary);
+    if (!input) throw std::runtime_error("Cannot open fvecs file");
+
+    int d;
+    input.read((char*)&d, sizeof(int));
+    input.seekg(0, std::ios::end);
+    size_t file_size = input.tellg();
+    input.seekg(0, std::ios::beg);
+    size_t num = file_size / (d * sizeof(float) + sizeof(int));
+    float* data = new float[num * d];
+
+    for (size_t i = 0; i < num; ++i) {
+        int dim;
+        input.read((char*)&dim, sizeof(int));
+        assert(dim == d);
+        input.read((char*)(data + i * d), sizeof(float) * d);
+    }
+
+    d_out = d;
+    n_out = num;
+    return data;
+}
 
 template <typename T = float>
 T* read_bin(const char* filename, size_t& n_out, size_t& d_out) {
@@ -51,12 +100,15 @@ T* read_bin(const char* filename, size_t& n_out, size_t& d_out) {
 }
 
 template <typename T>
-void PREFETCH_VECTOR(int dim, T *vec) {
-  char* a = (char*)vec;
-  int l = dim * sizeof(T) / 64;
-  for (int j = 0; j < l; j++) {
-    __builtin_prefetch(a + 64 * j);
-  }
+void write_bin(const char* filename, const T* data, size_t n, size_t d) {
+    std::ofstream output(filename, std::ios::binary);
+    if (!output) throw std::runtime_error("Cannot open output bin file");
+    int32_t nn = static_cast<int32_t>(n);
+    int32_t dd = static_cast<int32_t>(d);
+    output.write(reinterpret_cast<const char*>(&nn), sizeof(int32_t));
+    output.write(reinterpret_cast<const char*>(&dd), sizeof(int32_t));
+    output.write(reinterpret_cast<const char*>(data), sizeof(T) * n * d);
+    if (!output) throw std::runtime_error("Error writing bin data");
 }
 
 struct Graph {
@@ -178,13 +230,27 @@ struct RunStats {
     int64_t total_neighbor_pruned;
     int64_t total_visited_pruned;
     // fine-grained timers
+    double time_search_total = 0;     // total time spent inside search function
     double time_dist_comp = 0;
     double time_nbr_filter = 0;       // fetching neighbor factors
     double time_dist_est = 0;         // actual distance estimation computation
     double time_queue_mgmt = 0;       // frontier + result_pool queue operations
     double time_pruning = 0;          // candidate buffer handling + pruning
+    double time_candidate_buffer_mgmt = 0; // curr_candidate clear/push/resize overhead
+    double time_nth_element = 0;      // std::nth_element call overhead
     double time_hash_filter = 0;      // is_visited check + add
     double time_query_prepare = 0;    // query_prepare
+    int64_t total_timer_calls = 0;
+    int64_t timer_calls_search_total = 0;
+    int64_t timer_calls_dist_comp = 0;
+    int64_t timer_calls_nbr_filter = 0;
+    int64_t timer_calls_dist_est = 0;
+    int64_t timer_calls_queue_mgmt = 0;
+    int64_t timer_calls_pruning = 0;
+    int64_t timer_calls_candidate_buffer_mgmt = 0;
+    int64_t timer_calls_nth_element = 0;
+    int64_t timer_calls_hash_filter = 0;
+    int64_t timer_calls_query_prepare = 0;
     int64_t total_hash_inserts = 0;
     int64_t total_hash_collisions = 0;
     int64_t total_pushes = 0;
@@ -201,108 +267,32 @@ struct SearchResult {
     size_t neighbor_pruned;
     size_t visited_pruned;
     // fine-grained timers (seconds)
+    double time_search_total = 0;     // total time spent inside search function
     double time_dist_comp = 0;        // exact distance computations
     double time_nbr_filter = 0;       // fetching neighbor factors
     double time_dist_est = 0;         // actual distance estimation computation
     double time_queue_mgmt = 0;       // frontier + result_pool queue operations
     double time_pruning = 0;          // candidate buffer handling + pruning
+    double time_candidate_buffer_mgmt = 0; // curr_candidate clear/push/resize overhead
+    double time_nth_element = 0;      // std::nth_element call overhead
     double time_hash_filter = 0;      // is_visited check + add
     double time_query_prepare = 0;    // query_prepare
+    size_t timer_calls = 0;
+    size_t timer_calls_search_total = 0;
+    size_t timer_calls_dist_comp = 0;
+    size_t timer_calls_nbr_filter = 0;
+    size_t timer_calls_dist_est = 0;
+    size_t timer_calls_queue_mgmt = 0;
+    size_t timer_calls_pruning = 0;
+    size_t timer_calls_candidate_buffer_mgmt = 0;
+    size_t timer_calls_nth_element = 0;
+    size_t timer_calls_hash_filter = 0;
+    size_t timer_calls_query_prepare = 0;
     size_t hash_inserts = 0;
     size_t hash_collisions = 0;
     size_t pushes = 0;
     size_t duplicate_pushes = 0;
 };
-
-inline int* read_ivecs(const char* filename, size_t& n_out, size_t& d_out) {
-    std::ifstream input(filename, std::ios::binary);
-    if (!input) throw std::runtime_error("Cannot open ivecs file");
-
-    int d;
-    input.read((char*)&d, sizeof(int));
-    input.seekg(0, std::ios::end);
-    size_t file_size = input.tellg();
-    input.seekg(0, std::ios::beg);
-    size_t num = file_size / ((d + 1) * sizeof(int));
-    int* data = new int[num * d];
-
-    for (size_t i = 0; i < num; ++i) {
-        int dim;
-        input.read((char*)&dim, sizeof(int));
-        assert(dim == d);
-        input.read((char*)(data + i * d), sizeof(int) * d);
-    }
-
-    d_out = d;
-    n_out = num;
-    return data;
-}
-
-inline float* read_fvecs(const char* filename, size_t& n_out, size_t& d_out) {
-    std::ifstream input(filename, std::ios::binary);
-    if (!input) throw std::runtime_error("Cannot open fvecs file");
-
-    int d;
-    input.read((char*)&d, sizeof(int));
-    input.seekg(0, std::ios::end);
-    size_t file_size = input.tellg();
-    input.seekg(0, std::ios::beg);
-    size_t num = file_size / (d * sizeof(float) + sizeof(int));
-    float* data = new float[num * d];
-
-    for (size_t i = 0; i < num; ++i) {
-        int dim;
-        input.read((char*)&dim, sizeof(int));
-        assert(dim == d);
-        input.read((char*)(data + i * d), sizeof(float) * d);
-    }
-
-    d_out = d;
-    n_out = num;
-    return data;
-}
-
-inline int* read_ibin(const char* filename, size_t& n_out, size_t& d_out, size_t start_idx = 0, size_t chunk_size = 0) {
-    std::ifstream input(filename, std::ios::binary);
-    if (!input) throw std::runtime_error("Cannot open ibin file");
-
-    int32_t n = 0, d = 0;
-    input.read(reinterpret_cast<char*>(&n), sizeof(int32_t));
-    input.read(reinterpret_cast<char*>(&d), sizeof(int32_t));
-
-    if (start_idx >= size_t(n)) throw std::runtime_error("start_idx out of bounds");
-
-    size_t read_n = (chunk_size == 0 || start_idx + chunk_size > size_t(n)) ?
-                    size_t(n) - start_idx : chunk_size;
-
-    int* data = new int[read_n * d];
-
-    input.seekg(sizeof(int32_t) * d * start_idx, std::ios::cur);
-    input.read(reinterpret_cast<char*>(data), sizeof(int32_t) * read_n * d);
-
-    if (!input) throw std::runtime_error("Error reading ibin vector data");
-
-    n_out = read_n;
-    d_out = d;
-    return data;
-}
-
-inline void write_ibin(const char* filename, const int* data, size_t n, size_t d) {
-    std::ofstream output(filename, std::ios::binary);
-    if (!output) {
-        throw std::runtime_error("Cannot open output ibin file");
-    }
-
-    int32_t nn = static_cast<int32_t>(n);
-    int32_t dd = static_cast<int32_t>(d);
-    output.write(reinterpret_cast<const char*>(&nn), sizeof(int32_t));
-    output.write(reinterpret_cast<const char*>(&dd), sizeof(int32_t));
-    output.write(reinterpret_cast<const char*>(data), sizeof(int32_t) * n * d);
-
-    if (!output) {
-        throw std::runtime_error("Error writing to ibin file");
-    }
-}
 
 // ─── Scalar fallback distance ───────────────────────────────────────
 inline float compute_distance_scalar(int dim, const float* __restrict__ a, const float* __restrict__ b) {
@@ -399,18 +389,6 @@ inline int get_matching_bits(const uint32_t* a, const uint32_t* b, size_t words)
     return dist;
 }
 
-template <typename T>
-void write_bin(const char* filename, const T* data, size_t n, size_t d) {
-    std::ofstream output(filename, std::ios::binary);
-    if (!output) throw std::runtime_error("Cannot open output bin file");
-    int32_t nn = static_cast<int32_t>(n);
-    int32_t dd = static_cast<int32_t>(d);
-    output.write(reinterpret_cast<const char*>(&nn), sizeof(int32_t));
-    output.write(reinterpret_cast<const char*>(&dd), sizeof(int32_t));
-    output.write(reinterpret_cast<const char*>(data), sizeof(T) * n * d);
-    if (!output) throw std::runtime_error("Error writing bin data");
-}
-
 // compute recall@K for a single query
 inline float recall_at_k(const vector<int>& ann_result, const int* gt_ptr, int K, int gt_k) {
     unordered_set<int> ann_set(ann_result.begin(), ann_result.begin() + K);
@@ -433,80 +411,23 @@ inline float compute_avg_recall(const vector<std::vector<int>>& all_results,
     return total_recall / n_query * 100.0f;
 }
 
-inline void append_stats_to_csv(const std::string& filename,
-    int k, int beam, float prune_ratio, float approx_ratio,
-    const RunStats& stats)
-{
-    bool file_exists = std::filesystem::exists(filename);
-
-    std::ofstream out(filename, std::ios::app);
-    if (!out.is_open()) {
-        std::cerr << "Error: cannot open CSV file " << filename << "\n";
-        return;
+template <typename T>
+float compute_recall(const T* predicted, const int* groundtruth,
+                     size_t nq, int topk, int gt_k) {
+    size_t correct = 0;
+    for (size_t i = 0; i < nq; ++i) {
+        for (int j = 0; j < topk; ++j) {
+            int pred = int(predicted[i * topk + j]);
+            for (int k = 0; k < gt_k; ++k) {
+                int gt = groundtruth[i * gt_k + k];
+                if (pred == gt) {
+                    ++correct;
+                    break;
+                }
+            }
+        }
     }
-
-    // Write header only if file does not exist
-    if (!file_exists) {
-        out << "TopK,"
-            << "Beam_size,"
-            << "Prune_ratio,"
-            << "Approx_ratio,"
-            << "Runtime,"
-            << "Latency,"
-            << "Throughput,"
-            << "Recall,"
-            << "Total_dist_comp,"
-            << "Total_dist_est,"
-            << "Total_extra_dist_comp,"
-            << "Total_full_dist_comp,"
-            << "Total_iter,"
-            << "Total_pruned,"
-            << "Total_neighbor_pruned,"
-            << "Total_visited_pruned,"
-            << "Time_dist_comp,"
-            << "Time_nbr_filter,"
-            << "Time_dist_est,"
-            << "Time_queue_management,"
-            << "Time_pruning,"
-            << "Time_hash_filter,"
-            << "Time_query_prepare,"
-            << "Hash_inserts,"
-            << "Hash_collisions,"
-            << "Hash_collision_ratio,"
-            << "Pushes,"
-            << "Duplicate_pushes\n";
-    }
-
-    out << k << ","
-        << beam << ","
-        << prune_ratio << ","
-        << approx_ratio << ","
-        << stats.runtime << ","
-        << stats.latency << ","
-        << stats.throughput << ","
-        << stats.recall << ","
-        << stats.total_dc << ","
-        << stats.total_ds << ","
-        << stats.total_extra_dc << ","
-        << stats.total_full_dc << ","
-        << stats.total_iter << ","
-        << stats.total_pruned << ","
-        << stats.total_neighbor_pruned << ","
-        << stats.total_visited_pruned << ","
-        << stats.time_dist_comp << ","
-        << stats.time_nbr_filter << ","
-        << stats.time_dist_est << ","
-        << stats.time_queue_mgmt << ","
-        << stats.time_pruning << ","
-        << stats.time_hash_filter << ","
-        << stats.time_query_prepare << ","
-        << stats.total_hash_inserts << ","
-        << stats.total_hash_collisions << ","
-        << (stats.total_hash_inserts > 0 ? (double)stats.total_hash_collisions / stats.total_hash_inserts : 0.0) << ","
-        << stats.total_pushes << ","
-        << stats.total_duplicate_pushes << "\n";
-
-    out.close();
+    return float(correct) / (nq * topk);
 }
 
 // Fast Walsh-Hadamard Transform (in-place, power-of-2 B, B >= 8)
@@ -717,50 +638,108 @@ inline vidType exact_nn(const float* data, const float* query, size_t num_points
     return nearest_neighbor;
 }
 
-template <typename T>
-void dump_bin_to_txt(const std::string& bin_file, const std::string& txt_file) {
-    // Open the binary file for reading
-    std::ifstream input(bin_file, std::ios::binary);
-    if (!input) {
-        throw std::runtime_error("Cannot open binary file: " + bin_file);
+inline void append_stats_to_csv(const std::string& filename,
+    int k, int beam, float prune_ratio, float approx_ratio,
+    const RunStats& stats)
+{
+    bool file_exists = std::filesystem::exists(filename);
+
+    std::ofstream out(filename, std::ios::app);
+    if (!out.is_open()) {
+        std::cerr << "Error: cannot open CSV file " << filename << "\n";
+        return;
     }
 
-    // Read the dimensions from the binary file
-    int32_t n, d;
-    input.read(reinterpret_cast<char*>(&n), sizeof(int32_t));
-    input.read(reinterpret_cast<char*>(&d), sizeof(int32_t));
-
-    if (n <= 0 || d <= 0) {
-        throw std::runtime_error("Invalid dimensions in binary file");
+    // Write header only if file does not exist
+    if (!file_exists) {
+        out << "TopK,"
+            << "Beam_size,"
+            << "Prune_ratio,"
+            << "Approx_ratio,"
+            << "Runtime,"
+            << "Latency,"
+            << "Throughput,"
+            << "Recall,"
+            << "Total_dist_comp,"
+            << "Total_dist_est,"
+            << "Total_extra_dist_comp,"
+            << "Total_full_dist_comp,"
+            << "Total_iter,"
+            << "Total_pruned,"
+            << "Total_neighbor_pruned,"
+            << "Total_visited_pruned,"
+            << "Time_search_total,"
+            << "Time_dist_comp,"
+            << "Time_nbr_filter,"
+            << "Time_dist_est,"
+            << "Time_queue_management,"
+            << "Time_pruning,"
+            << "Time_candidate_buffer_management,"
+            << "Time_nth_element,"
+            << "Time_hash_filter,"
+            << "Time_query_prepare,"
+            << "Timer_calls,"
+            << "Timer_calls_search_total,"
+            << "Timer_calls_dist_comp,"
+            << "Timer_calls_nbr_filter,"
+            << "Timer_calls_dist_est,"
+            << "Timer_calls_queue_management,"
+            << "Timer_calls_pruning,"
+            << "Timer_calls_candidate_buffer_management,"
+            << "Timer_calls_nth_element,"
+            << "Timer_calls_hash_filter,"
+            << "Timer_calls_query_prepare,"
+            << "Hash_inserts,"
+            << "Hash_collisions,"
+            << "Hash_collision_ratio,"
+            << "Pushes,"
+            << "Duplicate_pushes\n";
     }
 
-    // Read the data
-    std::vector<T> data(n * d);
-    input.read(reinterpret_cast<char*>(data.data()), sizeof(T) * n * d);
-    if (!input) {
-        throw std::runtime_error("Error reading binary data");
-    }
-    input.close();
+    out << k << ","
+        << beam << ","
+        << prune_ratio << ","
+        << approx_ratio << ","
+        << stats.runtime << ","
+        << stats.latency << ","
+        << stats.throughput << ","
+        << stats.recall << ","
+        << stats.total_dc << ","
+        << stats.total_ds << ","
+        << stats.total_extra_dc << ","
+        << stats.total_full_dc << ","
+        << stats.total_iter << ","
+        << stats.total_pruned << ","
+        << stats.total_neighbor_pruned << ","
+        << stats.total_visited_pruned << ","
+        << stats.time_search_total << ","
+        << stats.time_dist_comp << ","
+        << stats.time_nbr_filter << ","
+        << stats.time_dist_est << ","
+        << stats.time_queue_mgmt << ","
+        << stats.time_pruning << ","
+        << stats.time_candidate_buffer_mgmt << ","
+        << stats.time_nth_element << ","
+        << stats.time_hash_filter << ","
+        << stats.time_query_prepare << ","
+        << stats.total_timer_calls << ","
+        << stats.timer_calls_search_total << ","
+        << stats.timer_calls_dist_comp << ","
+        << stats.timer_calls_nbr_filter << ","
+        << stats.timer_calls_dist_est << ","
+        << stats.timer_calls_queue_mgmt << ","
+        << stats.timer_calls_pruning << ","
+        << stats.timer_calls_candidate_buffer_mgmt << ","
+        << stats.timer_calls_nth_element << ","
+        << stats.timer_calls_hash_filter << ","
+        << stats.timer_calls_query_prepare << ","
+        << stats.total_hash_inserts << ","
+        << stats.total_hash_collisions << ","
+        << (stats.total_hash_inserts > 0 ? (double)stats.total_hash_collisions / stats.total_hash_inserts : 0.0) << ","
+        << stats.total_pushes << ","
+        << stats.total_duplicate_pushes << "\n";
 
-    // Open the text file for writing
-    std::ofstream output(txt_file);
-    if (!output) {
-        throw std::runtime_error("Cannot open text file: " + txt_file);
-    }
-
-    // Write the data to the text file
-    for (int i = 0; i < n; ++i) {
-        for (int j = 0; j < d; ++j) {
-            output << data[i * d + j];
-            if (j < d - 1) {
-                output << " ";
-            }
-        }
-        output << "\n";
-    }
-    output.close();
-
-    std::cout << "Dumped binary file " << bin_file << " to text file " << txt_file << "\n";
+    out.close();
 }
 
 // Dump a rabitq table (.bin) with per-neighbor breakdown:
@@ -832,7 +811,7 @@ inline void dump_rabitq_table(const std::string& bin_file, const std::string& tx
 }
 
 static inline void prefetch_l2(const void* addr) {
-#if defined(__SSE2__)
+#if !defined(__CUDACC__) && defined(__SSE2__)
     _mm_prefetch((const char*)addr, _MM_HINT_T1);
 #else
     __builtin_prefetch(addr, 0, 2);
