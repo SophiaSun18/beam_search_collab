@@ -5,77 +5,109 @@
 #include <chrono>
 
 #include "include/index.hpp"
-#include "include/utils.hpp"
+#include "include/qg.hpp"
+#include "include/utils.h"
 #include "include/search_bitonic.cuh"
 using namespace std;
 
 int main(int argc, char** argv) {
-    if (argc < 5) {
+    if (argc < 6) {
         cerr << "Usage: " << argv[0] 
-             << " <data.fvecs> <query.fvecs> <gt.ivecs> <graph_prefix> [K=100] [beam_size=128]\n";
+             << " <mode:gpu_base|gpu_rabitq> <data.fvecs> <query.fvecs> <gt.ivecs> <graph_or_codebook>"
+             << " [K=100] [beam_size=128] [degree=32]\n";
         return 1;
     }
-    
-    const char* data_file = argv[1];
-    const char* query_file = argv[2];
-    const char* gt_file = argv[3];
-    const char* graph_prefix = argv[4];
-    int K = (argc >= 6) ? atoi(argv[5]) : 100;
-    int beam_size = (argc >= 7) ? atoi(argv[6]) : 128;
+
+    string mode = argv[1];
+    const char* data_file = argv[2];
+    const char* query_file = argv[3];
+    const char* gt_file = argv[4];
     
     cout << "========================================\n";
     cout << "GPU Beam Search Loading from: \n";
     cout << "========================================\n";
+    cout << "Mode: " << mode << "\n";
     cout << "Data file: " << data_file << "\n";
     cout << "Query file: " << query_file << "\n";
     cout << "Ground truth: " << gt_file << "\n";
-    cout << "Graph prefix: " << graph_prefix << "\n";
-    cout << "========================================\n\n";
     
     // Initialize the random seed
     srand(42);
     
-    // Load the index
-    IndexGraph<float> index;
-    // index.load_graph(graph_prefix);
-    index.load_graph_index(graph_prefix);
-    index.load_data(data_file);
-    
-    // Load the queries
-    size_t nq;
-    int query_dim;
-    vector<float> queries = IndexGraph<float>::load_queries(query_file, nq, query_dim);
-    
-    // Limit the number of queries 
-    if (nq > 10000) {
-        cout << "Limiting queries to 10000\n";
-        nq = 10000;
+    vector<vid_t> results;
+    vector<float> distances;
+    vector<float> queries;
+    vector<int> groundtruth;
+    size_t nq = 0;
+    int gt_k = 0;
+    double elapsed = 0.0;
+    int K = 100;
+    int beam_size = 128;
+
+    if (mode == "gpu_base") {
+        if (argc < 6) {
+            cerr << "gpu_base requires: <mode> <data> <query> <gt> <graph_index> [K] [beam_size]\n";
+            return 1;
+        }
+        const char* graph_prefix = argv[5];
+        K = (argc >= 7) ? atoi(argv[6]) : 100;
+        beam_size = (argc >= 8) ? atoi(argv[7]) : 128;
+        cout << "Graph prefix: " << graph_prefix << "\n";
+        cout << "========================================\n\n";
+
+        IndexGraph<float> index;
+        index.load_graph_index(graph_prefix);
+        index.load_data(data_file);
+
+        int query_dim = 0;
+        queries = IndexGraph<float>::load_queries(query_file, nq, query_dim);
+        if (nq > 10000) {
+            cout << "Limiting queries to 10000\n";
+            nq = 10000;
+        }
+
+        size_t gt_nq = 0;
+        groundtruth = IndexGraph<float>::load_groundtruth(gt_file, gt_nq, gt_k);
+        results.resize(nq * K);
+        distances.resize(nq * K);
+        
+        index.search(static_cast<int>(nq), queries.data(), K, distances.data(), results.data(), beam_size, elapsed);
+    } else if (mode == "gpu_rabitq") {
+        if (argc < 7) {
+            cerr << "gpu_rabitq requires: <mode> <data> <query> <gt> <qg_codebook> [K] [beam_size] [degree]\n";
+            return 1;
+        }
+        const char* qg_codebook = argv[5];
+        K = (argc >= 7) ? atoi(argv[6]) : 100;
+        beam_size = (argc >= 8) ? atoi(argv[7]) : 128;
+        int degree = (argc >= 9) ? atoi(argv[8]) : 32;
+        cout << "QG codebook: " << qg_codebook << "\n";
+        cout << "========================================\n\n";
+
+        IndexGraph<float> index;
+        index.load_data(data_file);
+
+        int query_dim = 0;
+        queries = IndexGraph<float>::load_queries(query_file, nq, query_dim);
+        if (nq > 10000) {
+            cout << "Limiting queries to 10000\n";
+            nq = 10000;
+        }
+
+        size_t gt_nq = 0;
+        groundtruth = IndexGraph<float>::load_groundtruth(gt_file, gt_nq, gt_k);
+        results.resize(nq * K);
+        distances.resize(nq * K);
+
+        QuantizationGraph qg(index.ntotal, index.d, degree, qg_codebook);
+        qg.gpu_search(static_cast<int>(nq), queries.data(), K, distances.data(), results.data(), beam_size, elapsed);
+    } else {
+        cerr << "Unknown mode: " << mode << "\n";
+        return 1;
     }
-    
-    // Load the ground truth
-    size_t gt_nq;
-    int gt_k;
-    vector<int> groundtruth = IndexGraph<float>::load_groundtruth(gt_file, gt_nq, gt_k);
-    
-    // Allocate the result array
-    vector<vid_t> results(nq * K);
-    vector<float> distances(nq * K);
-    
-    // // Execute the search
-    // cout << "\nStarting GPU beam search...\n";
-    // auto start = chrono::high_resolution_clock::now();
-    
-    double elapsed;
-    index.search(nq, queries.data(), K, distances.data(), results.data(), beam_size, elapsed);
-    
-    // auto end = chrono::high_resolution_clock::now();
-    // double elapsed = chrono::duration<double>(end - start).count();
-    
-    // Compute the performance metrics
+
     double qps = nq / elapsed;
     double latency_ms = elapsed / nq * 1000;
-    
-    // Compute the Recall
     float recall = compute_recall(results.data(), groundtruth.data(), nq, K, gt_k);
     
     // Output the results

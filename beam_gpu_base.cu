@@ -10,18 +10,13 @@
 
 #include <chrono>
 
-#define BEAM_SIZE       128
-#define NUM_START BEAM_SIZE // number of starting nodes
-
 template <typename T>
 void IndexGraph<T>::search(int nq, const T* queries, int K, T *result_vec, vid_t *result_idx, int beam_sz, double& elapsed) {
-  // bool use_ip = (this->metric == METRIC_IP);
   auto dim = this->d;
   auto npoints = this->ntotal;
   auto max_degree = this->maxDeg;
-  // assert(beam_sz <= BEAM_SIZE); // todo: set BEAM_SIZE as user specified
-  BEAM_SIZE = beam_sz;
-  printf("Beam search on GPU: K=%d, nq=%d, dim=%d, npoints=%ld, beam_size=%d\n", K, nq, dim, npoints, BEAM_SIZE);
+  auto beam_size = beam_sz;
+  printf("Beam search on GPU: K=%d, nq=%d, dim=%d, npoints=%ld, beam_size=%d\n", K, nq, dim, npoints, beam_size);
 
   size_t num_threads = BLOCK_SIZE;
   size_t num_blocks = nq;
@@ -64,16 +59,16 @@ void IndexGraph<T>::search(int nq, const T* queries, int K, T *result_vec, vid_t
 
   GraphGPU<vid_t> gg(npoints, max_degree, this->edges.data()); // GPU graph 
 
-  vid_t *starting_points = new vid_t[NUM_START];
+  vid_t *starting_points = new vid_t[beam_size];
   vid_t *d_starting_points;
-  for (int i = 0; i < NUM_START; i++) starting_points[i] = rand() % npoints;
+  for (int i = 0; i < beam_size; i++) starting_points[i] = rand() % npoints;
   // printf("random nodes generated: ");
-  // for (size_t i = 0; i < NUM_START; i++) {
+  // for (size_t i = 0; i < beam_size; i++) {
   //   printf("%d, ", starting_points[i]);
   // }
   // printf("\n");
-  CUDA_SAFE_CALL(cudaMalloc((void **)&d_starting_points, NUM_START * sizeof(vid_t)));
-  CUDA_SAFE_CALL(cudaMemcpy(d_starting_points, starting_points, NUM_START * sizeof(vid_t), cudaMemcpyHostToDevice));
+  CUDA_SAFE_CALL(cudaMalloc((void **)&d_starting_points, beam_size * sizeof(vid_t)));
+  CUDA_SAFE_CALL(cudaMemcpy(d_starting_points, starting_points, beam_size * sizeof(vid_t), cudaMemcpyHostToDevice));
 
 #ifdef USE_RADIX
   //vid_t *d_filters = nullptr;

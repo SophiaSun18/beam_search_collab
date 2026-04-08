@@ -5,7 +5,7 @@
 #include <cassert>
 #include <cstdint>
 #include <string>
-#include "utils.hpp"
+#include "utils.h"
 
 typedef uint32_t vid_t;
 

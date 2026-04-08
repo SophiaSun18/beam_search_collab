@@ -20,6 +20,18 @@
 #define SHFL_XOR(val, mask) __shfl_xor_sync(FULL_MASK, val, mask)
 
 typedef unsigned long long gpu_long_t; // for counters
+typedef uint32_t vidType;
+using vid_t = vidType;
+
+struct QueryFactors {
+  float* rotated_query = nullptr;
+  uint8_t* quantized_query = nullptr;
+  uint8_t* lut = nullptr;
+  float low_val = 0.0f;
+  float high_val = 0.0f;
+  float width = 0.0f;
+  int32_t sum_q = 0;
+};
 
 #define CUDA_RT_CALL(call)                                                                  \
     {                                                                                       \
@@ -53,20 +65,19 @@ typedef unsigned long long gpu_long_t; // for counters
 
 template <typename T>
 class GraphGPU {
-typedef uint32_t vid_t;
 protected:
-  vid_t nv;           // number of vertices
-  vid_t maxDeg;       // maximun degree
-  vid_t *d_edges;
+  vidType nv;           // number of vertices
+  vidType maxDeg;       // maximun degree
+  vidType *d_edges;
 public:
-  GraphGPU(int n, int d, vid_t *h_edges) : nv(n), maxDeg(d) {
-    CUDA_SAFE_CALL(cudaMalloc((void **)&d_edges, n * d * sizeof(vid_t)));
-    CUDA_SAFE_CALL(cudaMemcpy(d_edges, h_edges, n * d * sizeof(vid_t), cudaMemcpyHostToDevice));
+  GraphGPU(int n, int d, vidType *h_edges) : nv(n), maxDeg(d) {
+    CUDA_SAFE_CALL(cudaMalloc((void **)&d_edges, n * d * sizeof(vidType)));
+    CUDA_SAFE_CALL(cudaMemcpy(d_edges, h_edges, n * d * sizeof(vidType), cudaMemcpyHostToDevice));
     CUDA_SAFE_CALL(cudaDeviceSynchronize());
   }
-  inline __device__ __host__ vid_t V() { return nv; }
-  inline __device__ __host__ vid_t get_max_degree() { return maxDeg; }
-  inline __device__ __host__ vid_t* N(vid_t vid) { return d_edges + vid * maxDeg; }
+  inline __device__ __host__ vidType V() { return nv; }
+  inline __device__ __host__ vidType get_max_degree() { return maxDeg; }
+  inline __device__ __host__ vidType* N(vidType vid) { return d_edges + vid * maxDeg; }
 };
 
 template <typename T = float>
@@ -458,4 +469,157 @@ static __device__ uint32_t pick_expanders(int N, INDEX_T* output_list, int M, IN
     if (num_exp >= N) { break; }
   }
   return num_exp;
+}
+
+/*-------------------------------------------- rabitq --------------------------------------------*/
+static __device__ inline void rotate_vector_gpu(const float* src, float* dst,
+   const float* signs, int dim, int padded_dim) {
+
+  int tid = threadIdx.x;
+  
+  for (size_t i = tid; i < dim; i += blockDim.x) {
+    dst[i] = src[i] * signs[i];
+  }
+  for (int i = dim + tid; i < padded_dim; i += blockDim.x) {
+    dst[i] = 0.0f;
+  }
+  __syncthreads();
+
+  // Fast Walsh-Hadamard Transform (in-place, power-of-2 B, B >= 8)
+  for (size_t len = 1; len < padded_dim; len <<= 1) {
+    int pairs = padded_dim >> 1;
+    for (int pair_idx = tid; pair_idx < pairs; pair_idx += blockDim.x) {
+      int block = pair_idx / len;
+      int j = pair_idx % len;
+      int base = block * (len << 1);
+
+      int idx1 = base + j;
+      int idx2 = idx1 + len;
+
+      float u = dst[idx1];
+      float v = dst[idx2];
+      dst[idx1] = u + v;
+      dst[idx2] = u - v;
+    }
+    __syncthreads();
+  }
+}
+
+static __device__ void query_prepare_gpu(const float* query_raw, QueryFactors& scratch,
+    const float* signs_ptr, int dim, int padded_dim) {
+
+  int tid = threadIdx.x;
+  int lane_id = tid % WARP_SIZE;
+  int warp_id = tid / WARP_SIZE;
+
+  // rotate the query
+  rotate_vector_gpu(query_raw, scratch.rotated_query, signs_ptr, dim, padded_dim);
+  __syncthreads();
+
+  __shared__ float warp_min[WARPS_PER_BLOCK];
+  __shared__ float warp_max[WARPS_PER_BLOCK];
+  float local_min = FLT_MAX;
+  float local_max = -FLT_MAX;
+
+  // data range: find the lowest and highest dimension in the rotated query
+  for (size_t i = tid; i < padded_dim; i += blockDim.x) {
+      float tmp = scratch.rotated_query[i];
+      local_min = fminf(local_min, tmp);
+      local_max = fmaxf(local_max, tmp);
+  }
+
+  for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+    local_min = fminf(local_min, __shfl_down_sync(FULL_MASK, local_min, offset));
+    local_max = fmaxf(local_max, __shfl_down_sync(FULL_MASK, local_max, offset));
+  }
+
+  if (lane_id == 0) {
+    warp_min[warp_id] = local_min;
+    warp_max[warp_id] = local_max;
+  }
+  __syncthreads();
+
+  if (warp_id == 0) {
+    local_min = (lane_id < WARPS_PER_BLOCK) ? warp_min[lane_id] : FLT_MAX;
+    local_max = (lane_id < WARPS_PER_BLOCK) ? warp_max[lane_id] : -FLT_MAX;
+
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+      local_min = fminf(local_min, __shfl_down_sync(FULL_MASK, local_min, offset));
+      local_max = fmaxf(local_max, __shfl_down_sync(FULL_MASK, local_max, offset));
+    }
+
+    if (lane_id == 0) {
+      scratch.low_val = local_min;
+      scratch.high_val = local_max;
+      scratch.width = (scratch.high_val - scratch.low_val) / ((1 << QG_BQUERY) - 1);
+    }
+  }
+  __syncthreads();
+
+  // quantize the query 
+  float inv_width = 1.0F / scratch.width;
+
+  __shared__ int32_t warp_sum[WARPS_PER_BLOCK];
+  int32_t local_sum = 0;
+  for (size_t i = tid; i < padded_dim; i += blockDim.x) {
+      uint8_t cur = static_cast<uint8_t>(lroundf(((scratch.rotated_query[i] - scratch.low_val) * inv_width) + 0.5));
+      scratch.quantized_query[i] = cur;
+      local_sum += cur;
+  }
+
+  for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+    local_sum += __shfl_down_sync(FULL_MASK, local_sum, offset);
+  }
+
+  if (lane_id == 0) {
+    warp_sum[warp_id] = local_sum;
+  }
+  __syncthreads();
+
+  if (warp_id == 0) {
+    local_sum = (lane_id < WARPS_PER_BLOCK) ? warp_sum[lane_id] : 0;
+
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+      local_sum += __shfl_down_sync(FULL_MASK, local_sum, offset);
+    }
+
+    if (lane_id == 0) {
+      scratch.sum_q = local_sum;
+    }
+  }
+  __syncthreads();
+}
+
+static __device__ inline DISTANCE_T estimated_distance_gpu(const QueryFactors& qf, 
+  uint32_t node_idx, int neighbor_rank, float exact_dist, int degree_, int padded_dim_,
+  const float* data_ptr, size_t row_offset, size_t code_offset, size_t factor_offset) {
+
+  const int tid = threadIdx.x;
+  const int lane_id = tid % WARP_SIZE;
+
+  const float* base = data_ptr + static_cast<size_t>(node_idx) * row_offset;
+  const uint64_t* packed_code = reinterpret_cast<const uint64_t*>(base + code_offset) + neighbor_rank * (padded_dim_ / 64);
+  const float* factors = base + factor_offset;
+  float triple_x = factors[neighbor_rank];
+  float factor_dq = factors[degree_ + neighbor_rank];
+  float factor_vq = factors[2 * degree_ + neighbor_rank];
+
+  if (triple_x == FLT_MAX) return 0.0f;
+
+  int32_t local_sum = 0;
+  for (size_t d = lane_id; d < padded_dim_; d += WARP_SIZE) {
+      if ((packed_code[d / 64] >> (d % 64)) & 1ULL)
+          local_sum += static_cast<int32_t>(qf.quantized_query[d]);
+  }
+
+  // reduce the sum
+  for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+      local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
+  }
+
+  float result_float = static_cast<float>((local_sum << 1) - qf.sum_q);
+  DISTANCE_T est_dist = triple_x + exact_dist;
+  est_dist += factor_dq * qf.width * result_float;
+  est_dist += factor_vq * qf.low_val;
+  return est_dist;
 }

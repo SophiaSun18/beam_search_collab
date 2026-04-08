@@ -1,3 +1,4 @@
+#pragma once
 #include <iostream>
 #include <iomanip>
 #include <vector>
@@ -6,12 +7,23 @@
 #include <fstream>
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
+#include <cstring>
+#include <cfloat>
+#include <string>
+#include <stdexcept>
 #include <sys/mman.h>
 
 #include "../include/utils.h"
+#ifndef __CUDACC__
 #include "../include/fastscan_impl.hpp"
+#endif
 
+#ifdef __CUDACC__
+static constexpr bool FASTSCAN_ENABLED = false;
+#else
 static constexpr bool FASTSCAN_ENABLED = true;  // set to true to use fastscan batch estimation
+#endif
 static constexpr bool HUGE_PAGE_ENABLED = false;
 
 class QuantizationGraph {
@@ -136,6 +148,7 @@ public:
         std::free(signs_ptr_);
     }
 
+    #ifndef __CUDACC__
     QueryFactors query_prepare(const float* query_raw, const QueryBuffers& scratch) const {
         QueryFactors qf;
         qf.rotated_query = scratch.rotated_query;
@@ -381,6 +394,7 @@ public:
         const char* row_base = reinterpret_cast<const char*>(get_row(node_idx));
         prefetch_span(row_base, row_offset_ * sizeof(float));
     }
+    #endif
 
     inline const float* get_row(uint32_t node_idx) const {
         return bins_mode_
@@ -406,10 +420,34 @@ public:
             : reinterpret_cast<const uint32_t*>(get_row(node_idx) + neighbor_offset_);
     }
 
-    inline float* get_signs_ptr() const { return signs_ptr_; }
+    inline const float* get_data_ptr() const {
+        return bins_mode_ ? base_vectors_ : data_;
+    }
+    inline const float* get_signs_ptr() const { return signs_ptr_; }
+    inline size_t get_data_bytes() const {
+        return bins_mode_
+            ? num_nodes_ * dim_ * sizeof(float)
+            : num_nodes_ * row_offset_ * sizeof(float);
+    }
+    inline size_t get_signs_bytes() const { return padded_dim_ * sizeof(float); }
+    inline bool is_bins_mode() const { return bins_mode_; }
+
+    inline size_t get_num_nodes() const { return num_nodes_; }
+    inline size_t get_dim() const { return dim_; }
+    inline int get_padded_dim() const { return padded_dim_; }
     inline int get_degree() const { return degree_; }
+
+    inline size_t get_code_offset() const { return code_offset_; }
+    inline size_t get_factor_offset() const { return factor_offset_; }
+    inline size_t get_neighbor_offset() const { return neighbor_offset_; }
+    inline size_t get_row_offset() const { return row_offset_; }
+    inline size_t get_codes_row_words() const { return codes_row_words_; }
+
     inline vidType get_entry_point() const { return entry_point_; }
     inline void set_entry_point(vidType entry_point) { entry_point_ = entry_point; }
+
+    void gpu_search(int nq, const float* queries, int K, float* result_vec,
+                    vidType* result_idx, int beam_sz, double& elapsed);
 
 private:
     void init_layout(bool bins_mode) {

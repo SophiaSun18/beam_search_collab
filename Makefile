@@ -25,9 +25,9 @@ SRC_PREPROCESS_RABITQ = $(SRC_DIR)/preprocess_rabitq.cpp
 CPU_TARGETS = cpu_base cpu_pathw cpu_rabitq preprocess_rabitq
 
 # GPU source files
-GPU_SOURCES = main.cu beam_gpu_base.cu
-GPU_HEADERS = $(HEADERS_DIR)index.hpp $(HEADERS_DIR)utils.h $(HEADERS_DIR)search_bitonic.cuh
-GPU_TARGET = gpu_base
+GPU_SOURCES = main.cu beam_gpu_base.cu beam_gpu_rabitq.cu
+GPU_HEADERS = $(HEADERS_DIR)index.hpp $(HEADERS_DIR)qg.hpp $(HEADERS_DIR)utils.h $(HEADERS_DIR)search_bitonic.cuh $(HEADERS_DIR)search_rabitq.cuh
+GPU_TARGET = gpu_search
 
 .PHONY: all cpu gpu clean
 
