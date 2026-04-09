@@ -613,19 +613,12 @@ static __device__ void query_prepare_gpu(const float* query_raw, QueryFactors& s
   __syncthreads();
 }
 
-static __device__ inline DISTANCE_T estimated_distance_gpu(const QueryFactors& qf, 
-  uint32_t node_idx, int neighbor_rank, float exact_dist, int degree_, int padded_dim_,
-  const float* data_ptr, size_t row_offset, size_t code_offset, size_t factor_offset) {
+static __device__ inline DISTANCE_T estimated_distance_gpu(const QueryFactors& qf,
+  const uint64_t* packed_code, float triple_x, float factor_dq, float factor_vq,
+  float exact_dist, int padded_dim_) {
 
   const int tid = threadIdx.x;
   const int lane_id = tid % WARP_SIZE;
-
-  const float* base = data_ptr + static_cast<size_t>(node_idx) * row_offset;
-  const uint64_t* packed_code = reinterpret_cast<const uint64_t*>(base + code_offset) + neighbor_rank * (padded_dim_ / 64);
-  const float* factors = base + factor_offset;
-  float triple_x = factors[neighbor_rank];
-  float factor_dq = factors[degree_ + neighbor_rank];
-  float factor_vq = factors[2 * degree_ + neighbor_rank];
 
   if (triple_x == FLT_MAX) return 0.0f;
 

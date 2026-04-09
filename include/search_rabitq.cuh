@@ -17,6 +17,7 @@ static __host__ inline uint32_t calculate_shared_mem_size(int dim, int topk, int
         return (value + alignment - 1) & ~(alignment - 1);
     };
     size_t padded_dim = 1ULL << static_cast<size_t>(ceilf(log2f(dim)));
+    size_t code_words = padded_dim / 64;
     size_t size = 0;    
     size += hashtable_getsize(BITLEN) * sizeof(INDEX_T);    // hash table
     size += RESULT_BUFFER_SIZE * sizeof(INDEX_T);           // top k and candidate index
@@ -28,6 +29,9 @@ static __host__ inline uint32_t calculate_shared_mem_size(int dim, int topk, int
     size += (padded_dim << 2) * sizeof(uint8_t);            // LUT buffer
     size += 3 * sizeof(float);                              // low/high/width
     size += sizeof(int32_t);                                // sum_q
+    size = align_up(size, alignof(uint64_t));               // align staged candidate codes
+    size += max_deg * code_words * sizeof(uint64_t);        // staged candidate codes
+    size += 3 * max_deg * sizeof(float);                    // staged candidate factors
     size += 2 * sizeof(uint32_t);                           // counter and hops
     if (GPU_SEARCH_STATS) {
         size += GPU_SEARCH_STAT_COUNT * sizeof(uint32_t);   // search stats
@@ -62,6 +66,7 @@ static __global__ void QuantizedBeamSearch(
     const int lane_id = tid % WARP_SIZE;
     
     size_t padded_dim = 1ULL << static_cast<size_t>(ceilf(log2f(dim)));
+    size_t code_words = padded_dim / 64;
 
     // initialize the shared memory
     extern __shared__ char shared_memory[];
@@ -84,9 +89,14 @@ static __global__ void QuantizedBeamSearch(
     float* high_val = low_val + 1;
     float* width = high_val + 1;
     int32_t* sum_q = reinterpret_cast<int32_t*>(width + 1);
-
-    uint32_t* counter = reinterpret_cast<uint32_t*>(sum_q + 1);
-    uint32_t* hops = (uint32_t*)(counter + 1);
+    char* staged_base = reinterpret_cast<char*>(sum_q + 1);
+    staged_base = reinterpret_cast<char*>((reinterpret_cast<uintptr_t>(staged_base) + alignof(uint64_t) - 1) &
+                                          ~(static_cast<uintptr_t>(alignof(uint64_t)) - 1));
+    uint64_t* STAGED_CODE_BUFFER = reinterpret_cast<uint64_t*>(staged_base);
+    float* STAGED_FACTOR_BUFFER = reinterpret_cast<float*>(STAGED_CODE_BUFFER + max_degree * code_words);
+    
+    uint32_t* counter = reinterpret_cast<uint32_t*>(STAGED_FACTOR_BUFFER + 3 * max_degree);
+    uint32_t* hops = counter + 1;
     uint32_t* stats = hops + 1;
     char* timing_base = reinterpret_cast<char*>(stats + (GPU_SEARCH_STATS ? GPU_SEARCH_STAT_COUNT : 0));
     timing_base = reinterpret_cast<char*>((reinterpret_cast<uintptr_t>(timing_base) + alignof(gpu_long_t) - 1) &
@@ -186,6 +196,10 @@ static __global__ void QuantizedBeamSearch(
         // make sure to mark the invalid neighbor using dummy large values
         INDEX_T current_node = TOP_K_INDEX[PARENT_LIST[0]] & 0x7fffffff;
         const float* current_row = d_qg_data + static_cast<size_t>(current_node) * row_offset;
+        const vidType* current_neighbors = reinterpret_cast<const vidType*>(current_row + neighbor_offset);
+        const uint64_t* current_codes = reinterpret_cast<const uint64_t*>(current_row + code_offset);
+        const float* current_factors = current_row + factor_offset;
+
         gpu_long_t l2_start = 0;
         if (GPU_DISTANCE_TIMING && lane_id == 0) l2_start = gpu_globaltimer();
         DISTANCE_T exact_dist = warp_l2_distance(dim, query, current_row);
@@ -200,7 +214,7 @@ static __global__ void QuantizedBeamSearch(
         __syncthreads();
 
         for (int i = tid; i < CANDIDATE_BUFFER_SIZE; i += blockDim.x) {
-            INDEX_T child_id = (i < max_degree) ? neighbors[i] : MAX_INDEX;      // only in-bound threads take from the neighbor list
+            INDEX_T child_id = (i < max_degree) ? current_neighbors[i] : MAX_INDEX;      // only in-bound threads take from the neighbor list
 
             if (child_id != MAX_INDEX) {    // check if visited already
                 if (hashtable_insert(HASH_TABLE, BITLEN, child_id) == 0) {
@@ -214,14 +228,40 @@ static __global__ void QuantizedBeamSearch(
         }
         __syncthreads();
 
+        // load the packed code and factors for the current row once so the candidate loop can
+        // read it from shared memory instead of issuing many global loads
+        for (int j = tid; j < max_degree * code_words; j += blockDim.x) {
+            STAGED_CODE_BUFFER[j] = current_codes[j];
+        }
+        for (int j = tid; j < 3 * max_degree; j += blockDim.x) {
+            STAGED_FACTOR_BUFFER[j] = current_factors[j];
+        }
+        __syncthreads();
+
         // all warps work together to compute candidate distance
         for (int i = warp_id; i < CANDIDATE_BUFFER_SIZE; i += WARPS_PER_BLOCK) {
             // visited candidates are marked as invalid
             if (CANDIDATE_INDEX[i] == MAX_INDEX) continue;
 
             // if current node is new in hash table, compute and store its distance
+            const uint64_t* packed_code = STAGED_CODE_BUFFER + i * code_words;
+            const float* factors = STAGED_FACTOR_BUFFER;
+            float triple_x = 0.0f;
+            float factor_dq = 0.0f;
+            float factor_vq = 0.0f;
+            if (lane_id == 0) {
+                triple_x = factors[i];
+                factor_dq = factors[max_degree + i];
+                factor_vq = factors[2 * max_degree + i];
+            }
+            triple_x = __shfl_sync(FULL_MASK, triple_x, 0);
+            factor_dq = __shfl_sync(FULL_MASK, factor_dq, 0);
+            factor_vq = __shfl_sync(FULL_MASK, factor_vq, 0);
+            
             gpu_long_t est_start = 0;
             if (GPU_DISTANCE_TIMING && lane_id == 0) est_start = gpu_globaltimer();
+            DISTANCE_T est_dist = estimated_distance_gpu(
+                qf, packed_code, triple_x, factor_dq, factor_vq, exact_dist, padded_dim);
             if (lane_id == 0) {
                 atomicAdd(&counter[0], 1);
                 if (GPU_SEARCH_STATS) {
