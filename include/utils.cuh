@@ -623,9 +623,17 @@ static __device__ inline DISTANCE_T estimated_distance_gpu(const QueryFactors& q
   if (triple_x == FLT_MAX) return 0.0f;
 
   int32_t local_sum = 0;
-  for (size_t d = lane_id; d < padded_dim_; d += WARP_SIZE) {
-      if ((packed_code[d / 64] >> (d % 64)) & 1ULL)
-          local_sum += static_cast<int32_t>(qf.quantized_query[d]);
+  for (int word = 0; word < padded_dim_ / 64; ++word) {
+      uint64_t bits = packed_code[word];
+      int base = word * 64;
+
+      int d0 = base + lane_id;
+      if ((bits >> lane_id) & 1ULL)
+          local_sum += static_cast<int32_t>(qf.quantized_query[d0]);
+
+      int d1 = d0 + 32;
+      if (d1 < padded_dim_ && ((bits >> (lane_id + 32)) & 1ULL))
+          local_sum += static_cast<int32_t>(qf.quantized_query[d1]);
   }
 
   // reduce the sum
