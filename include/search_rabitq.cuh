@@ -42,7 +42,8 @@ static __host__ inline uint32_t calculate_shared_mem_size(int dim, int topk, int
     return size;
 }
 
-static __global__ void QuantizedBeamSearch(
+static __global__ GPU_LAUNCH_BOUNDS(BLOCK_SIZE)
+void QuantizedBeamSearch(
     int K, int nq, int dim, int max_degree, size_t npoints,
     const float* __restrict__ d_queries,
     const float* __restrict__ d_qg_data,

@@ -2,19 +2,15 @@
 #include "utils.cuh"
 #include "distance.cuh"
 #include <cuda_runtime.h>
-// #define BEAM_SIZE       128
 #define INTERNAL_TOPK   128
 #define SEARCH_WIDTH    1     // MAX: 2 nodes * 32 degree = 64 neighbors = CANDIDATE_BUFFER_SIZE
 #define BITLEN          10
 #define MAX_ITERATIONS  1024
-// #define MAX_DEGREE      64
 #define TEAM_SIZE       8
-// #define HASH_SIZE       MAX_ITERATIONS * SEARCH_WIDTH * MAX_DEGREE * 2
 #define USE_SEED        0
 #define PRUNE_CONFIG    0
 #define THRESHOLD_CONFIG    0
 #define HASH_TABLE_CONFIG   1
-// #define CANDIDATE_BUFFER_SIZE SEARCH_WIDTH * MAX_DEGREE
 #define CANDIDATE_BUFFER_SIZE 64
 #define RESULT_BUFFER_SIZE INTERNAL_TOPK + CANDIDATE_BUFFER_SIZE
 
@@ -45,7 +41,8 @@ static inline std::vector<uint32_t> load_sign_bit(const char* filename) {
 }
 
 template <typename T>
-static __global__ void BeamSearch(
+static __global__ GPU_LAUNCH_BOUNDS(BLOCK_SIZE)
+void BeamSearch(
     int K, int nq, int dim, size_t npoints,
     const T* __restrict__ d_queries,
     const T* __restrict__ d_data,

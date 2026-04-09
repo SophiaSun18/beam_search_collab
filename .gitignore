@@ -13,3 +13,4 @@ scripts/
 *.txt
 
 *benchmark*
+*ncu*

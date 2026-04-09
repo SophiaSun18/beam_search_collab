@@ -21,6 +21,15 @@
 #define SHFL(val, lane) __shfl_sync(FULL_MASK, val, lane)
 #define SHFL_XOR(val, mask) __shfl_xor_sync(FULL_MASK, val, mask)
 
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890) && (__CUDA_ARCH__ < 900)
+#define GPU_MAX_WARPS_PER_SM 48
+#else
+#define GPU_MAX_WARPS_PER_SM 64
+#endif
+
+#define GPU_MIN_BLOCKS_PER_SM_FOR(block_size) (GPU_MAX_WARPS_PER_SM / WARPS_PER_BLOCK)
+#define GPU_LAUNCH_BOUNDS(block_size) __launch_bounds__((block_size), GPU_MIN_BLOCKS_PER_SM_FOR(block_size))
+
 typedef unsigned long long gpu_long_t; // for counters
 typedef uint32_t vidType;
 using vid_t = vidType;
