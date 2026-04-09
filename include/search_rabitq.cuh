@@ -11,19 +11,11 @@
 #define CANDIDATE_BUFFER_SIZE 64
 #define RESULT_BUFFER_SIZE INTERNAL_TOPK + CANDIDATE_BUFFER_SIZE
 
-enum GpuRabitqStatIndex : int {
-    GPU_RABITQ_STAT_EXPANDED = 0,
-    GPU_RABITQ_STAT_NEIGHBORS_SCANNED = 1,
-    GPU_RABITQ_STAT_CANDIDATES_INSERTED = 2,
-    GPU_RABITQ_STAT_DUPLICATE_VISITED_PRUNES = 3,
-    GPU_RABITQ_STAT_DIST_CMPS = 4,
-    GPU_RABITQ_STAT_DIST_EST = 5,
-    GPU_RABITQ_STAT_ITERATIONS = 6,
-    GPU_RABITQ_STAT_COUNT = 7
-};
-
 static __host__ inline uint32_t calculate_shared_mem_size(int dim, int topk, int max_deg, 
                                                            int search_width, int bitlen) {
+    auto align_up = [](size_t value, size_t alignment) {
+        return (value + alignment - 1) & ~(alignment - 1);
+    };
     size_t padded_dim = 1ULL << static_cast<size_t>(ceilf(log2f(dim)));
     size_t size = 0;    
     size += hashtable_getsize(BITLEN) * sizeof(INDEX_T);    // hash table
@@ -37,7 +29,11 @@ static __host__ inline uint32_t calculate_shared_mem_size(int dim, int topk, int
     size += 3 * sizeof(float);                              // low/high/width
     size += sizeof(int32_t);                                // sum_q
     size += 2 * sizeof(uint32_t);                           // counter and hops
-    size += GPU_RABITQ_STAT_COUNT * sizeof(uint32_t);       // search stats
+    if (GPU_SEARCH_STATS) {
+        size += GPU_SEARCH_STAT_COUNT * sizeof(uint32_t);   // search stats
+    }
+    size = align_up(size, alignof(gpu_long_t));             // align timing stats
+    size += GPU_TIMING_COUNT * sizeof(gpu_long_t);          // timing stats
     printf("shared memory size: %ld\n", size);
     return size;
 }
@@ -49,6 +45,7 @@ static __global__ void QuantizedBeamSearch(
     const float* __restrict__ d_qg_signs,
     vidType* __restrict__ d_results,
     gpu_long_t* d_total_stats,
+    gpu_long_t* d_total_timing,
     vidType entry_point,
     size_t row_offset,
     size_t neighbor_offset,
@@ -91,6 +88,10 @@ static __global__ void QuantizedBeamSearch(
     uint32_t* counter = reinterpret_cast<uint32_t*>(sum_q + 1);
     uint32_t* hops = (uint32_t*)(counter + 1);
     uint32_t* stats = hops + 1;
+    char* timing_base = reinterpret_cast<char*>(stats + (GPU_SEARCH_STATS ? GPU_SEARCH_STAT_COUNT : 0));
+    timing_base = reinterpret_cast<char*>((reinterpret_cast<uintptr_t>(timing_base) + alignof(gpu_long_t) - 1) &
+                                          ~(static_cast<uintptr_t>(alignof(gpu_long_t)) - 1));
+    gpu_long_t* timing = reinterpret_cast<gpu_long_t*>(timing_base);
 
     __shared__ QueryFactors qf;
 
@@ -106,8 +107,15 @@ static __global__ void QuantizedBeamSearch(
         qf.sum_q = 0;
         counter[0] = 0;
         hops[0] = 0;
-        for (int i = 0; i < GPU_RABITQ_STAT_COUNT; i++) {
-            stats[i] = 0;
+        if (GPU_SEARCH_STATS) {
+            for (int i = 0; i < GPU_SEARCH_STAT_COUNT; i++) {
+                stats[i] = 0;
+            }
+        }
+        if (GPU_DISTANCE_TIMING) {
+            for (int i = 0; i < GPU_TIMING_COUNT; i++) {
+                timing[i] = 0;
+            }
         }
     }
 
@@ -127,8 +135,14 @@ static __global__ void QuantizedBeamSearch(
 
     // only the first slot in candidate list is actually initialized with valid entry point
     if (warp_id == 0) {
+        gpu_long_t l2_start = 0;
+        if (GPU_DISTANCE_TIMING && lane_id == 0) l2_start = gpu_globaltimer();
         CANDIDATE_INDEX[0] = entry_point;
         CANDIDATE_DISTANCE[0] = warp_l2_distance(dim, query, d_qg_data + static_cast<size_t>(entry_point) * row_offset);
+        if (GPU_DISTANCE_TIMING && lane_id == 0) {
+            atomicAdd(&timing[GPU_TIMING_L2_CALLS], gpu_long_t(1));
+            atomicAdd(&timing[GPU_TIMING_L2_CYCLES], gpu_globaltimer() - l2_start);
+        }
         hashtable_insert(HASH_TABLE, BITLEN, entry_point);
     }
     __syncthreads();
@@ -149,7 +163,7 @@ static __global__ void QuantizedBeamSearch(
             }
             __syncthreads();
         }
-      
+
         // use warp level sort to find the actual closest top K elements and update the topK list
         topk_by_bitonic_sort<2, INTERNAL_TOPK / WARP_SIZE>(ALL_INDEX, ALL_DISTANCE, RESULT_BUFFER_SIZE,
             CANDIDATE_BUFFER_SIZE, INTERNAL_TOPK, (iter == 0));
@@ -167,21 +181,23 @@ static __global__ void QuantizedBeamSearch(
             }
             break;
         }
-        if (tid == 0) {
-            stats[GPU_RABITQ_STAT_ITERATIONS]++;
-        }
 
         // collect the neighbors of the expanding node and add into candidate list if not visited before
         // make sure to mark the invalid neighbor using dummy large values
         INDEX_T current_node = TOP_K_INDEX[PARENT_LIST[0]] & 0x7fffffff;
         const float* current_row = d_qg_data + static_cast<size_t>(current_node) * row_offset;
-        const vidType* neighbors = reinterpret_cast<const vidType*>(current_row + neighbor_offset);
+        gpu_long_t l2_start = 0;
+        if (GPU_DISTANCE_TIMING && lane_id == 0) l2_start = gpu_globaltimer();
         DISTANCE_T exact_dist = warp_l2_distance(dim, query, current_row);
-        if (tid == 0) {
-            stats[GPU_RABITQ_STAT_EXPANDED]++;
-            stats[GPU_RABITQ_STAT_DIST_CMPS]++;
-            stats[GPU_RABITQ_STAT_NEIGHBORS_SCANNED] += static_cast<uint32_t>(max_degree);
+        if (GPU_DISTANCE_TIMING && lane_id == 0) {
+            atomicAdd(&timing[GPU_TIMING_L2_CALLS], gpu_long_t(1));
+            atomicAdd(&timing[GPU_TIMING_L2_CYCLES], gpu_globaltimer() - l2_start);
         }
+        if (GPU_SEARCH_STATS && tid == 0) {
+            stats[GPU_SEARCH_STAT_ITERATIONS]++;
+            stats[GPU_SEARCH_STAT_DIST_CMPS]++;
+        }
+        __syncthreads();
 
         for (int i = tid; i < CANDIDATE_BUFFER_SIZE; i += blockDim.x) {
             INDEX_T child_id = (i < max_degree) ? neighbors[i] : MAX_INDEX;      // only in-bound threads take from the neighbor list
@@ -190,10 +206,8 @@ static __global__ void QuantizedBeamSearch(
                 if (hashtable_insert(HASH_TABLE, BITLEN, child_id) == 0) {
                     child_id = MAX_INDEX;
                     CANDIDATE_DISTANCE[i] = FLT_MAX;
-                    atomicAdd(&stats[GPU_RABITQ_STAT_DUPLICATE_VISITED_PRUNES], 1u);
                 } else {
                     CANDIDATE_DISTANCE[i] = 0;
-                    atomicAdd(&stats[GPU_RABITQ_STAT_CANDIDATES_INSERTED], 1u);
                 }
             }
             CANDIDATE_INDEX[i] = child_id;
@@ -206,11 +220,17 @@ static __global__ void QuantizedBeamSearch(
             if (CANDIDATE_INDEX[i] == MAX_INDEX) continue;
 
             // if current node is new in hash table, compute and store its distance
-            DISTANCE_T est_dist = estimated_distance_gpu(qf, current_node, i, exact_dist, max_degree, padded_dim,
-                d_qg_data, row_offset, code_offset, factor_offset);
+            gpu_long_t est_start = 0;
+            if (GPU_DISTANCE_TIMING && lane_id == 0) est_start = gpu_globaltimer();
             if (lane_id == 0) {
                 atomicAdd(&counter[0], 1);
-                atomicAdd(&stats[GPU_RABITQ_STAT_DIST_EST], 1u);
+                if (GPU_SEARCH_STATS) {
+                    atomicAdd(&stats[GPU_SEARCH_STAT_DIST_EST], 1u);
+                }
+                if (GPU_DISTANCE_TIMING) {
+                    atomicAdd(&timing[GPU_TIMING_EST_CALLS], gpu_long_t(1));
+                    atomicAdd(&timing[GPU_TIMING_EST_CYCLES], gpu_globaltimer() - est_start);
+                }
                 CANDIDATE_DISTANCE[i] = est_dist;
             }
         }
@@ -227,10 +247,16 @@ static __global__ void QuantizedBeamSearch(
         d_results[query_id * K + i] = TOP_K_INDEX[i] & ~0x80000000;
     }
     if (tid == 0) {
-        stats[GPU_RABITQ_STAT_DIST_EST] = counter[0];
-        stats[GPU_RABITQ_STAT_ITERATIONS] = hops[0];
-        for (int i = 0; i < GPU_RABITQ_STAT_COUNT; i++) {
-            atomicAdd(&d_total_stats[i], gpu_long_t(stats[i]));
+        if (GPU_SEARCH_STATS) {
+            stats[GPU_SEARCH_STAT_DIST_EST] = counter[0];
+            for (int i = 0; i < GPU_SEARCH_STAT_COUNT; i++) {
+                atomicAdd(&d_total_stats[i], gpu_long_t(stats[i]));
+            }
+        }
+        if (GPU_DISTANCE_TIMING) {
+            for (int i = 0; i < GPU_TIMING_COUNT; i++) {
+                atomicAdd(&d_total_timing[i], timing[i]);
+            }
         }
     }
 

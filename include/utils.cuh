@@ -12,6 +12,8 @@
 #define LOG_WARP_SIZE 5
 #define WARPS_PER_BLOCK (BLOCK_SIZE / WARP_SIZE)
 //#define FLT_MAX 3.40282347e+38
+#define GPU_SEARCH_STATS 1
+#define GPU_DISTANCE_TIMING 0
 
 #define MAX_INDEX UINT_MAX
 
@@ -22,6 +24,27 @@
 typedef unsigned long long gpu_long_t; // for counters
 typedef uint32_t vidType;
 using vid_t = vidType;
+
+__device__ __forceinline__ gpu_long_t gpu_globaltimer() {
+  gpu_long_t ticks;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(ticks));
+  return ticks;
+}
+
+enum GpuDistanceTimingIndex : int {
+  GPU_TIMING_L2_CALLS = 0,
+  GPU_TIMING_L2_CYCLES = 1,
+  GPU_TIMING_EST_CALLS = 2,
+  GPU_TIMING_EST_CYCLES = 3,
+  GPU_TIMING_COUNT = 4
+};
+
+enum GpuSearchStatIndex : int {
+  GPU_SEARCH_STAT_DIST_CMPS = 0,
+  GPU_SEARCH_STAT_DIST_EST = 1,
+  GPU_SEARCH_STAT_ITERATIONS = 2,
+  GPU_SEARCH_STAT_COUNT = 3
+};
 
 struct QueryFactors {
   float* rotated_query = nullptr;

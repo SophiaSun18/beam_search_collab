@@ -27,6 +27,10 @@ static __host__ inline uint32_t calculate_shared_mem_size(int dim, int topk, int
     size += SEARCH_WIDTH * sizeof(INDEX_T);                 // next expanders / parent buffer
     size += dim * 4;                                        // query buffer size
     size += 2 * 4;                                          // terminate flag and counter
+    if (GPU_SEARCH_STATS) {
+        size += GPU_SEARCH_STAT_COUNT * sizeof(uint32_t);   // search stats
+    }
+    size += GPU_TIMING_COUNT * sizeof(gpu_long_t);          // timing stats
     printf("shared memory size: %ld\n", size);
     return size;
 }
@@ -46,8 +50,8 @@ static __global__ void BeamSearch(
     const T* __restrict__ d_queries,
     const T* __restrict__ d_data,
     vid_t* __restrict__ d_results,
-    gpu_long_t* d_total_count_dc,
-    gpu_long_t* d_total_hops,
+    gpu_long_t* d_total_stats,
+    gpu_long_t* d_total_timing,
     vid_t* d_starting_points,
     vid_t* d_seed_map,
     uint32_t* d_sign_bit,
@@ -79,12 +83,22 @@ static __global__ void BeamSearch(
     DATA_T* QUERY_BUFFER = (DATA_T*)(PARENT_LIST + SEARCH_WIDTH);
     uint32_t* counter = (uint32_t*)(QUERY_BUFFER + dim);
     uint32_t* hops = (uint32_t*)(counter + 1);
+    uint32_t* stats = hops + 1;
+    gpu_long_t* timing = reinterpret_cast<gpu_long_t*>(stats + (GPU_SEARCH_STATS ? GPU_SEARCH_STAT_COUNT : 0));
 
     // initialize the block-wise total distance computation count
     __shared__ uint32_t keep_expanding;
     if (tid == 0) {
         counter[0] = 0;
         hops[0] = 0;
+        if (GPU_SEARCH_STATS) {
+            for (int i = 0; i < GPU_SEARCH_STAT_COUNT; i++) {
+                stats[i] = 0;
+            }
+        }
+        for (int i = 0; i < GPU_TIMING_COUNT; i++) {
+            timing[i] = 0;
+        }
     }
 
     // initialize the hash table to record visited (computed) nodes
@@ -104,10 +118,21 @@ static __global__ void BeamSearch(
     // load the candidate buffer with starting points
     for (int i = warp_id; i < CANDIDATE_BUFFER_SIZE; i += WARPS_PER_BLOCK) {
         CANDIDATE_INDEX[i] = d_starting_points[i];
-        DISTANCE_T dist = warp_l2_distance(dim, query, d_data + CANDIDATE_INDEX[i] * dim);
+        DISTANCE_T dist = FLT_MAX;
+        gpu_long_t l2_start = 0;
+        if (GPU_DISTANCE_TIMING && lane_id == 0 && CANDIDATE_INDEX[i] != MAX_INDEX) l2_start = gpu_globaltimer();
+        if (CANDIDATE_INDEX[i] != MAX_INDEX) {
+            dist = warp_l2_distance(dim, query, d_data + CANDIDATE_INDEX[i] * dim);
+        }
         if (lane_id == 0) {     // warp computes, only lane 0 writes
-            atomicAdd(&counter[0], 1);
-            hashtable_insert(HASH_TABLE, BITLEN, CANDIDATE_INDEX[i]);
+            if (CANDIDATE_INDEX[i] != MAX_INDEX) {
+                atomicAdd(&counter[0], 1);
+                hashtable_insert(HASH_TABLE, BITLEN, CANDIDATE_INDEX[i]);
+                if (GPU_DISTANCE_TIMING) {
+                    atomicAdd(&timing[GPU_TIMING_L2_CALLS], gpu_long_t(1));
+                    atomicAdd(&timing[GPU_TIMING_L2_CYCLES], gpu_globaltimer() - l2_start);
+                }
+            }
             CANDIDATE_DISTANCE[i] = dist;
         }
     }
@@ -143,11 +168,22 @@ static __global__ void BeamSearch(
             }
             break;
         }
+        if (GPU_SEARCH_STATS && tid == 0) {
+            stats[GPU_SEARCH_STAT_ITERATIONS]++;
+        }
 
         // collect the neighbors of the expanding node and add into candidate list if not visited before
         // make sure to mark the invalid neighbor using dummy large values
         INDEX_T current_node = TOP_K_INDEX[PARENT_LIST[0]] & 0x7fffffff;
         vid_t* neighbors = gg.N(current_node);
+        gpu_long_t l2_start = 0;
+        if (GPU_DISTANCE_TIMING && lane_id == 0) l2_start = gpu_globaltimer();
+        DISTANCE_T exact_dist = warp_l2_distance(dim, query, d_data + current_node * dim);
+        if (GPU_DISTANCE_TIMING && lane_id == 0) {
+            atomicAdd(&timing[GPU_TIMING_L2_CALLS], gpu_long_t(1));
+            atomicAdd(&timing[GPU_TIMING_L2_CYCLES], gpu_globaltimer() - l2_start);
+        }
+        __syncthreads();
 
         for (int i = tid; i < CANDIDATE_BUFFER_SIZE; i += blockDim.x) {
             INDEX_T child_id = (i < maxDegree) ? neighbors[i] : MAX_INDEX;      // only in-bound threads take from the neighbor list
@@ -170,9 +206,15 @@ static __global__ void BeamSearch(
             if (CANDIDATE_INDEX[i] == MAX_INDEX) continue;
 
             // if current node is new in hash table, compute and store its distance
+            gpu_long_t cand_l2_start = 0;
+            if (GPU_DISTANCE_TIMING && lane_id == 0) cand_l2_start = gpu_globaltimer();
             DISTANCE_T dist = warp_l2_distance(dim, query, d_data + CANDIDATE_INDEX[i] * dim);
             if (lane_id == 0) {
                 atomicAdd(&counter[0], 1);
+                if (GPU_DISTANCE_TIMING) {
+                    atomicAdd(&timing[GPU_TIMING_L2_CALLS], gpu_long_t(1));
+                    atomicAdd(&timing[GPU_TIMING_L2_CYCLES], gpu_globaltimer() - cand_l2_start);
+                }
                 CANDIDATE_DISTANCE[i] = dist;
             }
         }
@@ -189,7 +231,15 @@ static __global__ void BeamSearch(
         d_results[query_id * K + i] = TOP_K_INDEX[i] & ~0x80000000;
     }
     if (tid == 0) {
-        atomicAdd(d_total_count_dc, gpu_long_t(counter[0]));
-        atomicAdd(d_total_hops, gpu_long_t(hops[0]));
+        if (GPU_SEARCH_STATS) {
+            stats[GPU_SEARCH_STAT_DIST_CMPS] = counter[0];
+            stats[GPU_SEARCH_STAT_DIST_EST] = 0;
+            for (int i = 0; i < GPU_SEARCH_STAT_COUNT; i++) {
+                atomicAdd(&d_total_stats[i], gpu_long_t(stats[i]));
+            }
+        }
+        for (int i = 0; i < GPU_TIMING_COUNT; i++) {
+            atomicAdd(&d_total_timing[i], timing[i]);
+        }
     }
 }
