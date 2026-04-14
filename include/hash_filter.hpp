@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <cfloat>
+#include <limits>
 
 template <typename T>
 class hash_filter {
@@ -25,6 +26,7 @@ inline uint64_t hash64_2(uint64_t x) {
 */
   size_t total_inserts = 0;
   size_t total_collisions = 0;
+  static constexpr T kEmptyValue = std::numeric_limits<T>::max();
 
 public:
   hash_filter(int L) {
@@ -34,7 +36,7 @@ public:
     bits = (bit_size + 4) / 2 + 3;
     capacity = 1 << bits;
     seen.resize(capacity);
-    fill(seen.begin(), seen.end(), -1);
+    fill(seen.begin(), seen.end(), kEmptyValue);
   }
   int get_hash(T thing) {
     //return hasher(thing) & ((1 << bits)-1);
@@ -44,14 +46,14 @@ public:
   bool contains(T thing) {
     T val = seen[get_hash(thing)];
     if (val == thing) return true;
-    if (val == -1) return false;
+    if (val == kEmptyValue) return false;
     return stl_hash_.find(thing) != stl_hash_.end();
   }
   bool add(T thing) {
     T& val = seen[get_hash(thing)];
     if (val == thing) return false;
     total_inserts++;
-    if (val != -1) total_collisions++;  // slot occupied by different ID, spill to overflow
+    if (val != kEmptyValue) total_collisions++;  // slot occupied by different ID, spill to overflow
     else { val = thing; return true; }
     stl_hash_.insert(thing);
     return true;

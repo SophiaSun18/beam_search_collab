@@ -163,9 +163,6 @@ int main(int argc, char** argv) {
     std::cout << "Wrote rabitQ table to " << out_file << "\n";
     std::cout << "Wrote signs to " << signs_file << "\n";
 
-    dump_rabitq_table(out_file, "table.txt", dim, g.degree, 20);
-    dump_bin_to_txt<float>(signs_file.c_str(), "signs.txt");
-
     delete[] base_vectors;
     return 0;
 }

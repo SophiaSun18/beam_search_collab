@@ -134,7 +134,7 @@ inline void accumulate_impl(
     __m512i accu2 = _mm512_setzero_si512();
     __m512i accu3 = _mm512_setzero_si512();
 
-    auto dump_checkpoint = [&](const char* tag, size_t processed_dim) {
+    [[maybe_unused]] auto dump_checkpoint = [&](const char* tag, size_t processed_dim) {
         alignas(64) uint16_t tmp[32];
 
         __m512i a0 = accu0;

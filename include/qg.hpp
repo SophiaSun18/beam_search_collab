@@ -348,7 +348,7 @@ public:
     #if defined(__AVX512F__)
         {
             const __m512i qq = _mm512_set1_epi32(qf.sum_q);
-            for (size_t i = 0; i < degree_; i += 16) {
+            for (size_t i = 0; i < static_cast<size_t>(degree_); i += 16) {
                 __m512i i32 = _mm512_loadu_si512(
                     reinterpret_cast<const void*>(&result_raw[i]));
                 i32 = _mm512_sub_epi32(_mm512_slli_epi32(i32, 1), qq);

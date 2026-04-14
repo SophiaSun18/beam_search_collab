@@ -5,7 +5,31 @@ set -e
 # Parse which binary to run
 # --------------------------------------------
 RUN_TARGET=${1:-all}   # default to "all" if not specified
+TIMER_MODE=${2:-off}
+DEBUG_MODE=${3:-off}
 echo "Selected target: $RUN_TARGET"
+echo "Timer mode: $TIMER_MODE"
+echo "Debug mode: $DEBUG_MODE"
+
+case "$TIMER_MODE" in
+    on|off|1|0|true|false)
+        ;;
+    *)
+        echo "Unknown timer mode: $TIMER_MODE"
+        echo "Usage: $0 [cpu_base|cpu_pathw|cpu_rabitq|preprocess_rabitq|gpu_base|gpu_rabitq|all] [timer on|off] [debug on|off]"
+        exit 1
+        ;;
+esac
+
+case "$DEBUG_MODE" in
+    on|off|1|0|true|false)
+        ;;
+    *)
+        echo "Unknown debug mode: $DEBUG_MODE"
+        echo "Usage: $0 [cpu_base|cpu_pathw|cpu_rabitq|preprocess_rabitq|gpu_base|gpu_rabitq|all] [timer on|off] [debug on|off]"
+        exit 1
+        ;;
+esac
 
 # --------------------------------------------
 # Map run target to make target
@@ -26,12 +50,15 @@ case "$RUN_TARGET" in
     gpu_base)
         MAKE_TARGET="gpu"
         ;;
+    gpu_rabitq)
+        MAKE_TARGET="gpu"
+        ;;
     all)
         MAKE_TARGET="all"
         ;;
     *)
         echo "Unknown target: $RUN_TARGET"
-        echo "Usage: $0 [cpu_base|cpu_pathw|gpu_base|all]"
+        echo "Usage: $0 [cpu_base|cpu_pathw|cpu_rabitq|preprocess_rabitq|gpu_base|gpu_rabitq|all] [timer on|off] [debug on|off]"
         exit 1
         ;;
 esac
@@ -42,6 +69,7 @@ esac
 echo "Cleaning and building $MAKE_TARGET ..."
 make clean
 make "$MAKE_TARGET"
+# make preprocess_rabitq
 echo "Build done."
 
 # --------------------------------------------
@@ -49,22 +77,33 @@ echo "Build done."
 # --------------------------------------------
 THREADS=(16)
 TOPK=100
-BEAM_SIZES=(100 150 200 250 300 400 500 600 700 800 1000)
+DEGREE=32
+# BEAM_SIZES=(100 150 200 250 300 400 500 600 700 800 1000)
+BEAM_SIZES=(100 200 300 400 500 600)
 # PRUNE_RATIOS=(0 0.125 0.25 0.375 0.5 0.625 0.75 0.875)
 PRUNE_RATIOS=(0)
-# APPROX_RATIOS=(0 0.1 0.2 0.3 0.4 0.5)
+# APPROX_RATIOS=(0.1 0.2 0.3 0.4 0.5)
 APPROX_RATIOS=(0)
+# L2_START_ITERS=(0 10 20 30 40 50 60 70 80 90 100)
+L2_START_ITERS=10
+L2_END_ITER=50
+L2_PERIOD=0
 TRIALS=1
+MODE="fastscan"               # "fastscan" = enabled, "sequential" = fastscan disabled
+RABITQ_LOAD_MODE="codebook"  # "bins" = -graph + -rabitq + -sign, "codebook" = -qg
+ESTIMATE_STATS="off"          # "on" = write estimate reuse stats, "off" = disable
+STEP_EFFICIENCY="off"         # "on" = write per-step exact-distance reduction stats
+ACC32=""
 
 BIN_DIR="bin"
-RESULT_ROOT="result/3.11"
+RESULT_ROOT="result/4.13CheckL2Start=10End=50DEBUG"
 
 # --------------------------------------------
 # List of dataset prefixes and K values
 # --------------------------------------------
-# DATASETS=("gist" 32 "gist" 64 "sift" 32 "sift" 64 "sift10m" 32 "deep10m" 32 "deep10m" 64)
-# DATASETS=("sift" 32 "sift" 64 "gist" 32 "deep1M" 32 "deep10m" 64 "sift10m" 32)
-DATASETS=("sift" 32)
+# DATASETS=("sift" 32)
+DATASETS=("sift" 32 "gist" 32 "deep10m" 32 "fanns" 32)
+# DATASETS=("sift10m" 32 "gist" 32 "deep10m" 32 "deep1M" 32)
 
 # ============================================================
 # Function: Preprocess RaBitQ
@@ -81,6 +120,7 @@ preprocess_rabitq() {
     fi
 
     echo "Preprocessing RaBitQ table..."
+    echo "Running: $BIN_DIR/preprocess_rabitq -base $BASE_FILE -graph $GRAPH_FILE -out $RABITQ_TABLE -sign $RABITQ_SIGN"
     "$BIN_DIR/preprocess_rabitq" \
         -base "$BASE_FILE" \
         -graph "$GRAPH_FILE" \
@@ -119,6 +159,8 @@ run_cpu_base() {
                             -beam $beam \
                             -p_ratio $pr \
                             -a_ratio $ar \
+                            -timer "$TIMER_MODE" \
+                            -debug "$DEBUG_MODE" \
                             -csv "$CSV_FILE" >> "$LOG_FILE" 2>&1
 
                         "$BINARY" \
@@ -129,6 +171,8 @@ run_cpu_base() {
                             -beam $beam \
                             -p_ratio $pr \
                             -a_ratio $ar \
+                            -timer "$TIMER_MODE" \
+                            -debug "$DEBUG_MODE" \
                             -csv "$CSV_FILE" >> "$LOG_FILE" 2>&1
 
                         echo >> "$LOG_FILE"
@@ -197,12 +241,43 @@ run_cpu_pathw() {
 run_cpu_rabitq() {
     BINARY="$BIN_DIR/cpu_rabitq"
     BIN_NAME="cpu_rabitq"
+    LOAD_MODE_SUFFIX="$RABITQ_LOAD_MODE"
 
-    CSV_FILE="${LOG_ROOT}/${PREFIX}_deg${K}_top${TOPK}_rabitq.csv"
-    if [ -f "$CSV_FILE" ]; then
-        echo "Existing CSV file found. Removing..."
-        rm -f "$CSV_FILE"
-    fi
+    case "$RABITQ_LOAD_MODE" in
+        codebook)
+            if [ -z "$QG_CODEBOOK" ]; then
+                echo "Error: RABITQ_LOAD_MODE=codebook requires QG_CODEBOOK"
+                exit 1
+            fi
+            MODE_ARGS=(
+                -mode codebook
+                -qg "$QG_CODEBOOK"
+            )
+            ;;
+        bins)
+            if [ -z "$GRAPH_FILE" ] || [ -z "$RABITQ_TABLE" ] || [ -z "$RABITQ_SIGN" ]; then
+                echo "Error: RABITQ_LOAD_MODE=bins requires GRAPH_FILE, RABITQ_TABLE, and RABITQ_SIGN"
+                exit 1
+            fi
+            MODE_ARGS=(
+                -mode bins
+                -graph "$GRAPH_FILE"
+                -rabitq "$RABITQ_TABLE"
+                -sign "$RABITQ_SIGN"
+            )
+            ;;
+        *)
+            echo "Error: unsupported RABITQ_LOAD_MODE=$RABITQ_LOAD_MODE"
+            echo "Expected one of: codebook, bins"
+            exit 1
+            ;;
+    esac
+
+    # CSV_FILE="${LOG_ROOT}/${PREFIX}_deg${K}_top${TOPK}_rabitq.csv"
+    # if [ -f "$CSV_FILE" ]; then
+    #     echo "Existing CSV file found. Removing..."
+    #     rm -f "$CSV_FILE"
+    # fi
 
     for t in "${THREADS[@]}"; do
         export OMP_NUM_THREADS=$t
@@ -210,38 +285,70 @@ run_cpu_rabitq() {
         for beam in "${BEAM_SIZES[@]}"; do
             for pr in "${PRUNE_RATIOS[@]}"; do
                 for ar in "${APPROX_RATIOS[@]}"; do
+                    for l2_iter in "${L2_START_ITERS[@]}"; do
+                        CSV_FILE="${LOG_ROOT}/${PREFIX}_deg${K}_top${TOPK}_threads${t}_rabitq_${LOAD_MODE_SUFFIX}.csv"
+                        LOG_FILE="${LOG_ROOT_2}/${BIN_NAME}_${LOAD_MODE_SUFFIX}_beam${beam}_threads${t}_pr${pr}_a${ar}_l2i${l2_iter}_l2e${L2_END_ITER}_l2p${L2_PERIOD}.log"
+                        ESTIMATE_STATS_FILE="${LOG_ROOT_2}/${BIN_NAME}_${LOAD_MODE_SUFFIX}_beam${beam}_threads${t}_pr${pr}_a${ar}_l2i${l2_iter}_l2e${L2_END_ITER}_l2p${L2_PERIOD}.estimate_stats.txt"
+                        STEP_EFFICIENCY_FILE="${LOG_ROOT_2}/${BIN_NAME}_${LOAD_MODE_SUFFIX}_beam${beam}_threads${t}_pr${pr}_a${ar}_l2i${l2_iter}_l2e${L2_END_ITER}_l2p${L2_PERIOD}.step_efficiency.txt"
+                        ESTIMATE_STATS_ARGS=(
+                            -estimate_stats "$ESTIMATE_STATS"
+                        )
+                        if [[ "$ESTIMATE_STATS" == "on" || "$ESTIMATE_STATS" == "1" || "$ESTIMATE_STATS" == "true" ]]; then
+                            ESTIMATE_STATS_ARGS+=(
+                                -estimate_stats_file "$ESTIMATE_STATS_FILE"
+                            )
+                        fi
+                        STEP_EFFICIENCY_ARGS=(
+                            -step_efficiency "$STEP_EFFICIENCY"
+                        )
+                        if [[ "$STEP_EFFICIENCY" == "on" || "$STEP_EFFICIENCY" == "1" || "$STEP_EFFICIENCY" == "true" ]]; then
+                            STEP_EFFICIENCY_ARGS+=(
+                                -step_efficiency_file "$STEP_EFFICIENCY_FILE"
+                            )
+                        fi
+                        > "$LOG_FILE"
 
-                    LOG_FILE="${LOG_ROOT_2}/${BIN_NAME}_beam${beam}_threads${t}_pr${pr}_a${ar}_rabitq.log"
-                    > "$LOG_FILE"
+                        for ((trial=1; trial<=TRIALS; trial++)); do
+                            echo "=== Trial $trial/$TRIALS ===" >> "$LOG_FILE"
 
-                    for ((trial=1; trial<=TRIALS; trial++)); do
-                        echo "=== Trial $trial/$TRIALS ===" >> "$LOG_FILE"
+                            echo "$BINARY" \
+                                -base "$BASE_FILE" \
+                                -query "$QUERY_FILE" \
+                                -gt "$GT_FILE" \
+                                -degree "$DEGREE" \
+                                "${MODE_ARGS[@]}" \
+                                -beam $beam \
+                                -p_ratio $pr \
+                                -a_ratio $ar \
+                                -l2_iter $l2_iter \
+                                -l2_end_iter $L2_END_ITER \
+                                -l2_period $L2_PERIOD \
+                                -timer "$TIMER_MODE" \
+                                -debug "$DEBUG_MODE" \
+                                "${ESTIMATE_STATS_ARGS[@]}" \
+                                "${STEP_EFFICIENCY_ARGS[@]}" \
+                                -csv "$CSV_FILE" >> "$LOG_FILE" 2>&1
 
-                        echo "$BINARY" \
-                            -base "$BASE_FILE" \
-                            -query "$QUERY_FILE" \
-                            -gt "$GT_FILE" \
-                            -graph "$GRAPH_FILE" \
-                            -rabitq "$RABITQ_TABLE" \
-                            -sign "$RABITQ_SIGN" \
-                            -beam $beam \
-                            -p_ratio $pr \
-                            -a_ratio $ar \
-                            -csv "$CSV_FILE" >> "$LOG_FILE" 2>&1
+                            "$BINARY" \
+                                -base "$BASE_FILE" \
+                                -query "$QUERY_FILE" \
+                                -gt "$GT_FILE" \
+                                -degree "$DEGREE" \
+                                "${MODE_ARGS[@]}" \
+                                -beam $beam \
+                                -p_ratio $pr \
+                                -a_ratio $ar \
+                                -l2_iter $l2_iter \
+                                -l2_end_iter $L2_END_ITER \
+                                -l2_period $L2_PERIOD \
+                                -timer "$TIMER_MODE" \
+                                -debug "$DEBUG_MODE" \
+                                "${ESTIMATE_STATS_ARGS[@]}" \
+                                "${STEP_EFFICIENCY_ARGS[@]}" \
+                                -csv "$CSV_FILE" >> "$LOG_FILE" 2>&1
 
-                        "$BINARY" \
-                            -base "$BASE_FILE" \
-                            -query "$QUERY_FILE" \
-                            -gt "$GT_FILE" \
-                            -graph "$GRAPH_FILE" \
-                            -rabitq "$RABITQ_TABLE" \
-                            -sign "$RABITQ_SIGN" \
-                            -beam $beam \
-                            -p_ratio $pr \
-                            -a_ratio $ar \
-                            -csv "$CSV_FILE" >> "$LOG_FILE" 2>&1
-
-                        echo >> "$LOG_FILE"
+                            echo >> "$LOG_FILE"
+                        done
                     done
                 done
             done
@@ -253,30 +360,77 @@ run_cpu_rabitq() {
 # Function to run GPU base
 # --------------------------------------------
 run_gpu_base() {
-    BINARY="$BIN_DIR/gpu_base"
-    BIN_NAME=$(basename "$BINARY")
-    BEAM=128
+    BINARY="$BIN_DIR/gpu_search"
+    BIN_NAME="gpu_base"
 
-    for topk in "${TOPK[@]}"; do
-
-        LOG_FILE="${LOG_DIR}/${BIN_NAME}_beam${BEAM}_topk${topk}.log"
+    for beam in "${BEAM_SIZES[@]}"; do
+        LOG_FILE="${LOG_ROOT_2}/${BIN_NAME}_beam${beam}_topk${TOPK}.log"
         > "$LOG_FILE"
 
         for ((trial=1; trial<=TRIALS; trial++)); do
             echo "=== Trial $trial/$TRIALS ===" >> "$LOG_FILE"
-            echo "Running $BIN_NAME, dataset=$PREFIX, topK=$topk, beam=$BEAM, trial=$trial" >> "$LOG_FILE"
+            echo "Running $BIN_NAME, dataset=$PREFIX, topK=$TOPK, beam=$beam, trial=$trial" >> "$LOG_FILE"
 
-            "$BINARY" \
+            echo "$BINARY" \
+                gpu_base \
                 "$BASE_FILE" \
                 "$QUERY_FILE" \
                 "$GT_FILE" \
                 "$GRAPH_FILE" \
-                $topk \
-                $BEAM >> "$LOG_FILE" 2>&1
+                "$TOPK" \
+                "$beam" >> "$LOG_FILE" 2>&1
+
+            "$BINARY" \
+                gpu_base \
+                "$BASE_FILE" \
+                "$QUERY_FILE" \
+                "$GT_FILE" \
+                "$GRAPH_FILE" \
+                "$TOPK" \
+                "$beam" >> "$LOG_FILE" 2>&1
 
             echo >> "$LOG_FILE"
         done
+    done
+}
 
+# --------------------------------------------
+# Function to run GPU RabitQ
+# --------------------------------------------
+run_gpu_rabitq() {
+    BINARY="$BIN_DIR/gpu_search"
+    BIN_NAME="gpu_rabitq"
+
+    for beam in "${BEAM_SIZES[@]}"; do
+        LOG_FILE="${LOG_ROOT_2}/${BIN_NAME}_beam${beam}_topk${TOPK}_degree${DEGREE}.log"
+        > "$LOG_FILE"
+
+        for ((trial=1; trial<=TRIALS; trial++)); do
+            echo "=== Trial $trial/$TRIALS ===" >> "$LOG_FILE"
+            echo "Running $BIN_NAME, dataset=$PREFIX, topK=$TOPK, beam=$beam, degree=$DEGREE, trial=$trial" >> "$LOG_FILE"
+
+            echo "$BINARY" \
+                gpu_rabitq \
+                "$BASE_FILE" \
+                "$QUERY_FILE" \
+                "$GT_FILE" \
+                "$QG_CODEBOOK" \
+                "$TOPK" \
+                "$beam" \
+                "$DEGREE" >> "$LOG_FILE" 2>&1
+
+            "$BINARY" \
+                gpu_rabitq \
+                "$BASE_FILE" \
+                "$QUERY_FILE" \
+                "$GT_FILE" \
+                "$QG_CODEBOOK" \
+                "$TOPK" \
+                "$beam" \
+                "$DEGREE" >> "$LOG_FILE" 2>&1
+
+            echo >> "$LOG_FILE"
+        done
     done
 }
 
@@ -294,11 +448,17 @@ while [ $i -lt ${#DATASETS[@]} ]; do
     BASE_FILE="$DATA_PATH/${PREFIX}_base.fvecs"
     QUERY_FILE="$DATA_PATH/${PREFIX}_query.fvecs"
     GT_FILE="$DATA_PATH/${PREFIX}_groundtruth.ivecs"
-    GRAPH_FILE="$DATA_PATH/graph-d${K}"
+    # GRAPH_FILE="$DATA_PATH/graph-d${K}"
+    # GRAPH_FILE="$DATA_PATH/symphonyqg_32.index"
     SIGNBIT_FILE="$DATA_PATH/graph-d${K}.ref.signbit.bin"
 
-    RABITQ_TABLE="${GRAPH_FILE}.Sophia.rabitq.bin"
-    RABITQ_SIGN="${GRAPH_FILE}.Sophia.rabitq.sign.bin"
+    # RABITQ_TABLE="${GRAPH_FILE}.Sophia.rabitq.bin"
+    # RABITQ_SIGN="${GRAPH_FILE}.Sophia.rabitq.sign.bin"
+
+    GRAPH_FILE="$DATA_PATH/SymQG.${PREFIX}.graph.noNan.${MODE}.bin"
+    RABITQ_TABLE="$DATA_PATH/SymQG.${PREFIX}.rabitq.noNan.${MODE}.bin"
+    RABITQ_SIGN="$DATA_PATH/SymQG.${PREFIX}.signs.noNan.${MODE}.bin"
+    QG_CODEBOOK="$DATA_PATH/symphonyqg${K}.noNan.${MODE}.${ACC32}index"
 
     # create a separate log folder for this dataset/K
     LOG_ROOT="${RESULT_ROOT}/${PREFIX}_K${K}"
@@ -310,15 +470,16 @@ while [ $i -lt ${#DATASETS[@]} ]; do
     case "$RUN_TARGET" in
         cpu_base) run_cpu_base ;;
         cpu_pathw) run_cpu_pathw ;;
-        cpu_rabitq) 
-            preprocess_rabitq
-            run_cpu_rabitq ;;
+        preprocess_rabitq) preprocess_rabitq ;;
+        cpu_rabitq) run_cpu_rabitq ;;
         gpu_base) run_gpu_base ;;
+        gpu_rabitq) run_gpu_rabitq ;;
         all)
             run_cpu_base
             run_cpu_pathw
             run_cpu_rabitq
             run_gpu_base
+            run_gpu_rabitq
             ;;
     esac
 

@@ -35,9 +35,7 @@ SearchResult beam_cpu_pathw(
 
     size_t dist_cmps = 0;                                       // number of distance computations
     size_t dist_est = 0;
-    size_t pruned = 0;                                          // number of pruned neighbor candidates
     size_t neighbor_pruned = 0;
-    size_t visited_pruned = 0;
 
     // initialize the current frontier with randomly picked starting points and compute their distances
     int start_node = -1;
@@ -82,8 +80,6 @@ SearchResult beam_cpu_pathw(
             for (size_t i = 0; i < g.degree; i++) {
                 vidType n = neighbors[i];
                 if (is_visited.contains(n)) {
-                    visited_pruned++;
-                    pruned++;
                     continue;
                 }   // skip if already computed
                 const uint32_t* neighbor_dir = cur_node_table + i * packed_dim;
@@ -97,7 +93,6 @@ SearchResult beam_cpu_pathw(
             size_t num_kept = g.degree * (1 - PRUNE_RATIO);
             if (num_kept > 0 && num_kept < matching_score.size()) {
                 iter_pruned = matching_score.size() - num_kept;
-                pruned += iter_pruned;
                 neighbor_pruned += iter_pruned;
                 nth_element(matching_score.begin(), matching_score.begin() + num_kept, matching_score.end(),
                     [](const pair<vidType,int>& a, const pair<vidType,int>& b) {
@@ -121,8 +116,6 @@ SearchResult beam_cpu_pathw(
             for (size_t i = 0; i < g.degree; i++) {
                 vidType n = neighbors[i];
                 if (is_visited.contains(n)) {
-                    visited_pruned++;
-                    pruned++;
                     continue;
                 }   // skip if already computed
                 float dist = compute_distance(dim, d_query, d_data + n * dim);
@@ -146,9 +139,7 @@ SearchResult beam_cpu_pathw(
     res.dist_cmps = dist_cmps;
     res.dist_est = dist_est;
     res.iters = iter;
-    res.pruned = pruned;
     res.neighbor_pruned = neighbor_pruned;
-    res.visited_pruned = visited_pruned;
     return res;
 }
 
@@ -167,8 +158,6 @@ RunStats run_ann_experiment_pathw(
     int64_t total_count_ds = 0;
     int64_t total_hop = 0;
     int64_t total_pruned = 0;
-    int64_t total_neighbor_pruned = 0;
-    int64_t total_visited_pruned = 0;
     vector<vector<int>> all_results(n_query, vector<int>(K));
 
     size_t packed_dim = (dim + 31) / 32;
@@ -177,7 +166,7 @@ RunStats run_ann_experiment_pathw(
     ctimer_t t;
     ctimer_start(&t);
 
-    #pragma omp parallel for schedule(dynamic, 1) reduction(+:total_count_dc) reduction(+:total_count_ds) reduction(+:total_hop) reduction(+:total_pruned) reduction(+:total_neighbor_pruned) reduction(+:total_visited_pruned)
+    #pragma omp parallel for schedule(dynamic, 1) reduction(+:total_count_dc) reduction(+:total_count_ds) reduction(+:total_hop) reduction(+:total_pruned)
     for (int q = 0; q < n_query; q++) {
         vector<vidType> starting_points(K);
         for (int i = 0; i < K; i++)
@@ -191,9 +180,7 @@ RunStats run_ann_experiment_pathw(
         total_count_dc += result.dist_cmps;
         total_count_ds += result.dist_est;
         total_hop += result.iters;
-        total_pruned += result.pruned;
-        total_neighbor_pruned += result.neighbor_pruned;
-        total_visited_pruned += result.visited_pruned;
+        total_pruned += result.neighbor_pruned;
     }
 
     ctimer_stop(&t);
@@ -208,8 +195,6 @@ RunStats run_ann_experiment_pathw(
     stats.total_ds = total_count_ds;
     stats.total_iter = total_hop;
     stats.total_pruned = total_pruned;
-    stats.total_neighbor_pruned = total_neighbor_pruned;
-    stats.total_visited_pruned = total_visited_pruned;
 
     printf("runtime: %.6f sec, recall@%d: %.6f\n", stats.runtime, K, stats.recall);
     printf("avg latency: %.6f ms/query, throughput: %.6f queries/sec\n",

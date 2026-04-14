@@ -4,6 +4,7 @@
 #include <fstream>
 #include <vector>
 #include <queue>
+#include <unordered_map>
 #include <unordered_set>
 #include <algorithm>
 #include <cmath> 
@@ -227,8 +228,6 @@ struct RunStats {
     int64_t total_full_dc;
     int64_t total_iter;
     int64_t total_pruned;
-    int64_t total_neighbor_pruned;
-    int64_t total_visited_pruned;
     // fine-grained timers
     double time_search_total = 0;     // total time spent inside search function
     double time_dist_comp = 0;
@@ -239,22 +238,15 @@ struct RunStats {
     double time_candidate_buffer_mgmt = 0; // curr_candidate clear/push/resize overhead
     double time_nth_element = 0;      // std::nth_element call overhead
     double time_hash_filter = 0;      // is_visited check + add
-    double time_query_prepare = 0;    // query_prepare
-    int64_t total_timer_calls = 0;
-    int64_t timer_calls_search_total = 0;
-    int64_t timer_calls_dist_comp = 0;
-    int64_t timer_calls_nbr_filter = 0;
-    int64_t timer_calls_dist_est = 0;
-    int64_t timer_calls_queue_mgmt = 0;
-    int64_t timer_calls_pruning = 0;
-    int64_t timer_calls_candidate_buffer_mgmt = 0;
-    int64_t timer_calls_nth_element = 0;
-    int64_t timer_calls_hash_filter = 0;
-    int64_t timer_calls_query_prepare = 0;
-    int64_t total_hash_inserts = 0;
-    int64_t total_hash_collisions = 0;
-    int64_t total_pushes = 0;
-    int64_t total_duplicate_pushes = 0;
+    int64_t total_estimate_events = 0;
+    int64_t total_unique_estimated_nodes = 0;
+    int64_t total_duplicate_estimates = 0;
+    int64_t total_step_efficiency_events = 0;
+    double total_step_efficiency = 0;
+    unordered_map<vidType, size_t> estimated_count_by_node;
+    unordered_map<size_t, size_t> estimate_count_histogram;
+    vector<double> step_efficiency_sums_by_step;
+    vector<size_t> step_efficiency_counts_by_step;
 };
 
 struct SearchResult {
@@ -263,9 +255,7 @@ struct SearchResult {
     size_t dist_est;
     size_t extra_dist_cmps;
     size_t iters;
-    size_t pruned;
     size_t neighbor_pruned;
-    size_t visited_pruned;
     // fine-grained timers (seconds)
     double time_search_total = 0;     // total time spent inside search function
     double time_dist_comp = 0;        // exact distance computations
@@ -276,22 +266,14 @@ struct SearchResult {
     double time_candidate_buffer_mgmt = 0; // curr_candidate clear/push/resize overhead
     double time_nth_element = 0;      // std::nth_element call overhead
     double time_hash_filter = 0;      // is_visited check + add
-    double time_query_prepare = 0;    // query_prepare
-    size_t timer_calls = 0;
-    size_t timer_calls_search_total = 0;
-    size_t timer_calls_dist_comp = 0;
-    size_t timer_calls_nbr_filter = 0;
-    size_t timer_calls_dist_est = 0;
-    size_t timer_calls_queue_mgmt = 0;
-    size_t timer_calls_pruning = 0;
-    size_t timer_calls_candidate_buffer_mgmt = 0;
-    size_t timer_calls_nth_element = 0;
-    size_t timer_calls_hash_filter = 0;
-    size_t timer_calls_query_prepare = 0;
-    size_t hash_inserts = 0;
-    size_t hash_collisions = 0;
-    size_t pushes = 0;
-    size_t duplicate_pushes = 0;
+    size_t total_estimate_events = 0;
+    size_t total_unique_estimated_nodes = 0;
+    size_t total_duplicate_estimates = 0;
+    unordered_map<vidType, size_t> estimated_count_by_node;
+    unordered_map<size_t, size_t> estimate_count_histogram;
+    size_t total_step_efficiency_events = 0;
+    double total_step_efficiency = 0;
+    vector<double> step_efficiency_by_step;
 };
 
 // ─── Scalar fallback distance ───────────────────────────────────────
@@ -640,7 +622,7 @@ inline vidType exact_nn(const float* data, const float* query, size_t num_points
 
 inline void append_stats_to_csv(const std::string& filename,
     int k, int beam, float prune_ratio, float approx_ratio,
-    const RunStats& stats)
+    const RunStats& stats, int l2_iter_threshold = 0, int l2_end_iter_threshold = 0, int l2_period = 0)
 {
     bool file_exists = std::filesystem::exists(filename);
 
@@ -656,6 +638,9 @@ inline void append_stats_to_csv(const std::string& filename,
             << "Beam_size,"
             << "Prune_ratio,"
             << "Approx_ratio,"
+            << "L2_iter_threshold,"
+            << "L2_end_iter_threshold,"
+            << "L2_period,"
             << "Runtime,"
             << "Latency,"
             << "Throughput,"
@@ -666,8 +651,6 @@ inline void append_stats_to_csv(const std::string& filename,
             << "Total_full_dist_comp,"
             << "Total_iter,"
             << "Total_pruned,"
-            << "Total_neighbor_pruned,"
-            << "Total_visited_pruned,"
             << "Time_search_total,"
             << "Time_dist_comp,"
             << "Time_nbr_filter,"
@@ -677,29 +660,16 @@ inline void append_stats_to_csv(const std::string& filename,
             << "Time_candidate_buffer_management,"
             << "Time_nth_element,"
             << "Time_hash_filter,"
-            << "Time_query_prepare,"
-            << "Timer_calls,"
-            << "Timer_calls_search_total,"
-            << "Timer_calls_dist_comp,"
-            << "Timer_calls_nbr_filter,"
-            << "Timer_calls_dist_est,"
-            << "Timer_calls_queue_management,"
-            << "Timer_calls_pruning,"
-            << "Timer_calls_candidate_buffer_management,"
-            << "Timer_calls_nth_element,"
-            << "Timer_calls_hash_filter,"
-            << "Timer_calls_query_prepare,"
-            << "Hash_inserts,"
-            << "Hash_collisions,"
-            << "Hash_collision_ratio,"
-            << "Pushes,"
-            << "Duplicate_pushes\n";
+            << "\n";
     }
 
     out << k << ","
         << beam << ","
         << prune_ratio << ","
         << approx_ratio << ","
+        << l2_iter_threshold << ","
+        << l2_end_iter_threshold << ","
+        << l2_period << ","
         << stats.runtime << ","
         << stats.latency << ","
         << stats.throughput << ","
@@ -710,8 +680,6 @@ inline void append_stats_to_csv(const std::string& filename,
         << stats.total_full_dc << ","
         << stats.total_iter << ","
         << stats.total_pruned << ","
-        << stats.total_neighbor_pruned << ","
-        << stats.total_visited_pruned << ","
         << stats.time_search_total << ","
         << stats.time_dist_comp << ","
         << stats.time_nbr_filter << ","
@@ -720,24 +688,183 @@ inline void append_stats_to_csv(const std::string& filename,
         << stats.time_pruning << ","
         << stats.time_candidate_buffer_mgmt << ","
         << stats.time_nth_element << ","
-        << stats.time_hash_filter << ","
-        << stats.time_query_prepare << ","
-        << stats.total_timer_calls << ","
-        << stats.timer_calls_search_total << ","
-        << stats.timer_calls_dist_comp << ","
-        << stats.timer_calls_nbr_filter << ","
-        << stats.timer_calls_dist_est << ","
-        << stats.timer_calls_queue_mgmt << ","
-        << stats.timer_calls_pruning << ","
-        << stats.timer_calls_candidate_buffer_mgmt << ","
-        << stats.timer_calls_nth_element << ","
-        << stats.timer_calls_hash_filter << ","
-        << stats.timer_calls_query_prepare << ","
-        << stats.total_hash_inserts << ","
-        << stats.total_hash_collisions << ","
-        << (stats.total_hash_inserts > 0 ? (double)stats.total_hash_collisions / stats.total_hash_inserts : 0.0) << ","
-        << stats.total_pushes << ","
-        << stats.total_duplicate_pushes << "\n";
+        << stats.time_hash_filter << "\n";
+
+    out.close();
+}
+
+inline void merge_estimate_histograms(unordered_map<size_t, size_t>& dst,
+                                      const unordered_map<size_t, size_t>& src) {
+    for (const auto& [estimate_count, node_count] : src) {
+        dst[estimate_count] += node_count;
+    }
+}
+
+inline void merge_step_efficiency_vectors(vector<double>& sum_dst,
+                                          vector<size_t>& count_dst,
+                                          const vector<double>& src) {
+    if (src.empty()) return;
+    if (sum_dst.size() < src.size()) {
+        sum_dst.resize(src.size(), 0.0);
+        count_dst.resize(src.size(), 0);
+    }
+    for (size_t i = 0; i < src.size(); ++i) {
+        sum_dst[i] += src[i];
+        count_dst[i]++;
+    }
+}
+
+inline unordered_map<size_t, size_t> build_estimate_histogram(
+    const unordered_map<vidType, size_t>& estimate_counts) {
+    unordered_map<size_t, size_t> histogram;
+    for (const auto& [node, count] : estimate_counts) {
+        (void)node;
+        histogram[count]++;
+    }
+    return histogram;
+}
+
+inline size_t count_duplicate_estimates(
+    const unordered_map<vidType, size_t>& estimate_counts) {
+    size_t duplicates = 0;
+    for (const auto& [node, count] : estimate_counts) {
+        (void)node;
+        if (count > 1) duplicates += count - 1;
+    }
+    return duplicates;
+}
+
+inline void debug_print_candidate_entry(const std::pair<vidType, float>& candidate) {
+    cout << "    node=" << candidate.first
+         << ", est_dist=" << fixed << setprecision(6) << candidate.second << "\n";
+}
+
+template <typename CandidateT>
+inline void debug_print_candidate_entry(const CandidateT& candidate) {
+    cout << "    node=" << candidate.vid
+         << ", est_dist=" << fixed << setprecision(6) << candidate.dist << "\n";
+}
+
+template <typename CandidateT>
+inline void debug_print_candidates(
+    int iter, vidType cur_node, const vector<CandidateT>& candidates) {
+    cout << "[DEBUG] iteration " << iter << "\n";
+    cout << "  expanding node: " << cur_node << "\n";
+    cout << "  neighbors:";
+    if (candidates.empty()) {
+        cout << " []\n";
+        return;
+    }
+    cout << "\n";
+    for (const auto& candidate : candidates) {
+        debug_print_candidate_entry(candidate);
+    }
+}
+
+template <typename QueueT>
+inline void debug_print_beam_state(QueueT& frontier) {
+    cout << "  beam state:";
+    if (frontier.size() == 0) {
+        cout << " []\n";
+        return;
+    }
+    cout << "\n";
+    for (int i = 0; i < frontier.size(); i++) {
+        cout << "    idx=" << i
+             << ", node=" << frontier[i]
+             << ", dist=" << fixed << setprecision(6) << frontier.get_dist(i)
+             << ", expanded=" << (frontier.is_expanded(i) ? "true" : "false") << "\n";
+    }
+}
+
+template <typename QueueT>
+inline void debug_print_final_results(QueueT& result_pool) {
+    cout << "[DEBUG] final result pool:";
+    if (result_pool.size() == 0) {
+        cout << " []\n";
+        return;
+    }
+    cout << "\n";
+    for (int i = 0; i < result_pool.size(); i++) {
+        cout << "  rank=" << i
+             << ", node=" << result_pool[i]
+             << ", dist=" << fixed << setprecision(6) << result_pool.get_dist(i) << "\n";
+    }
+}
+
+inline void dump_estimate_stats(const std::string& filename, const RunStats& stats) {
+    std::ofstream out(filename);
+    if (!out.is_open()) {
+        std::cerr << "Error: cannot open estimate stats file " << filename << "\n";
+        return;
+    }
+
+    out << "# Estimate reuse stats\n";
+    out << "total_estimate_events," << stats.total_estimate_events << "\n";
+    out << "total_unique_estimated_nodes," << stats.total_unique_estimated_nodes << "\n";
+    out << "total_duplicate_estimates," << stats.total_duplicate_estimates << "\n";
+    out << "avg_estimates_per_unique_node,"
+        << (stats.total_unique_estimated_nodes > 0
+                ? (double)stats.total_estimate_events / stats.total_unique_estimated_nodes
+                : 0.0)
+        << "\n";
+
+    std::vector<std::pair<size_t, size_t>> histogram(
+        stats.estimate_count_histogram.begin(), stats.estimate_count_histogram.end());
+    std::sort(histogram.begin(), histogram.end());
+
+    out << "\n# Histogram\n";
+    out << "estimate_count,node_count\n";
+    for (const auto& [estimate_count, node_count] : histogram) {
+        out << estimate_count << "," << node_count << "\n";
+    }
+
+    if (!stats.estimated_count_by_node.empty()) {
+        std::vector<std::pair<vidType, size_t>> node_counts(
+            stats.estimated_count_by_node.begin(), stats.estimated_count_by_node.end());
+        std::sort(node_counts.begin(), node_counts.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
+
+        out << "\n# Node counts\n";
+        out << "node_id,estimate_count\n";
+        for (const auto& [node_id, estimate_count] : node_counts) {
+            out << node_id << "," << estimate_count << "\n";
+        }
+    } else {
+        out << "\n# Node counts\n";
+        out << "# omitted because estimate stats are aggregated per query,\n";
+        out << "# so node_id counts are no longer meaningful across the whole run.\n";
+    }
+
+    out.close();
+}
+
+inline void dump_step_efficiency_stats(const std::string& filename, const RunStats& stats) {
+    std::ofstream out(filename);
+    if (!out.is_open()) {
+        std::cerr << "Error: cannot open step efficiency stats file " << filename << "\n";
+        return;
+    }
+
+    out << "# Step efficiency stats\n";
+    out << "total_step_efficiency_events," << stats.total_step_efficiency_events << "\n";
+    out << "total_step_efficiency," << stats.total_step_efficiency << "\n";
+    out << "avg_step_efficiency,"
+        << (stats.total_step_efficiency_events > 0
+                ? stats.total_step_efficiency / stats.total_step_efficiency_events
+                : 0.0)
+        << "\n";
+    out << "max_recorded_step," << stats.step_efficiency_sums_by_step.size() << "\n";
+
+    out << "\n# Histogram\n";
+    out << "step,avg_step_efficiency,query_count\n";
+    for (size_t i = 0; i < stats.step_efficiency_sums_by_step.size(); ++i) {
+        const size_t count = i < stats.step_efficiency_counts_by_step.size()
+                                 ? stats.step_efficiency_counts_by_step[i]
+                                 : 0;
+        const double avg = count > 0 ? stats.step_efficiency_sums_by_step[i] / count : 0.0;
+        out << (i + 1) << "," << avg << "," << count << "\n";
+    }
 
     out.close();
 }
