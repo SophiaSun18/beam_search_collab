@@ -188,7 +188,7 @@ run_main() {
   export RABITQ_FACTOR_DQ_FILE="${RABITQ_FACTOR_DQ_FILE:-}"
   export RABITQ_FACTOR_VQ_FILE="${RABITQ_FACTOR_VQ_FILE:-}"
   export MAX_QUERIES="${MAX_QUERIES:-10000}"
-  "${BIN}" --warmup "${WARMUP}" --runs "${RUNS}" "${BASE}" "${QUERY}" "${GT}" "${GRAPH}" "${K}" "${BEAM}"
+  "${BIN}" "${BASE}" "${QUERY}" "${GT}" "${GRAPH}" "${K}" "${BEAM}" --warmup "${WARMUP}" --runs "${RUNS}"
 }
 {
   echo "PERSIST_TAG=${PERSIST_TAG}"
@@ -297,7 +297,7 @@ run_remote() {
       if printf '%s\n' "$out" | grep -Eq 'Submitted job'; then
         break
       fi
-      if printf '%s\n' "$out" | grep -Eq 'Job completed successfully\.' && printf '%s\n' "$out" | grep -Eq 'Throughput:' && printf '%s\n' "$out" | grep -Eq 'Recall@100 \(unique hit'; then
+      if printf '%s\n' "$out" | grep -Eq 'Job completed successfully\.' && printf '%s\n' "$out" | grep -Eq 'Throughput:' && printf '%s\n' "$out" | grep -Eq 'Recall@[0-9]+ \(unique hit'; then
         ok=1
         break 2
       fi
@@ -321,7 +321,7 @@ run_remote() {
         echo "__PRC__=$?"
       } 2>&1 || true)"
       printf '%s\n' "$pull_out" >> "$log"
-      if printf '%s\n' "$pull_out" | grep -Eq 'Throughput:' && printf '%s\n' "$pull_out" | grep -Eq 'Recall@100 \(unique hit' && ! printf '%s\n' "$pull_out" | grep -Eqi "$invalid_runtime_pattern"; then
+      if printf '%s\n' "$pull_out" | grep -Eq 'Throughput:' && printf '%s\n' "$pull_out" | grep -Eq 'Recall@[0-9]+ \(unique hit' && ! printf '%s\n' "$pull_out" | grep -Eqi "$invalid_runtime_pattern"; then
         ok=1
         break 2
       fi
@@ -337,7 +337,7 @@ run_remote() {
   fi
   local qps recall dc hops kernel
   qps="$(extract_metric "$log" 'Throughput:\s*([\-\+]?\d+(?:\.\d+)?(?:[eE][\-\+]?\d+)?)')"
-  recall="$(extract_metric "$log" 'Recall@100 \(unique hit, on \d+ queries\):\s*([\-\+]?\d+(?:\.\d+)?(?:[eE][\-\+]?\d+)?)')"
+  recall="$(extract_metric "$log" 'Recall@[0-9]+ \(unique hit, on \d+ queries\):\s*([\-\+]?\d+(?:\.\d+)?(?:[eE][\-\+]?\d+)?)')"
   dc="$(extract_metric "$log" 'average # distance computation:\s*([\-\+]?\d+(?:\.\d+)?(?:[eE][\-\+]?\d+)?)')"
   hops="$(extract_metric "$log" 'average # hops:\s*([\-\+]?\d+(?:\.\d+)?(?:[eE][\-\+]?\d+)?)')"
   kernel="$(extract_metric "$log" 'GPU kernel time \(BeamSearch \+ sync\):\s*([\-\+]?\d+(?:\.\d+)?(?:[eE][\-\+]?\d+)?) ms')"

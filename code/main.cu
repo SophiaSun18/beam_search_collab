@@ -298,9 +298,8 @@ static int parse_main_options(int argc, char** argv, MainOptions& opts) {
     }
 
     normalize_main_options(opts);
-    const int validate_rc = validate_main_options(opts, pos, argv[0]);
-    if (validate_rc != 0) {
-        return validate_rc;
+    if (static_cast<int>(pos.size()) < required_main_positional_count(opts)) {
+        return print_usage(argv[0], 1);
     }
     assign_main_positional_args(pos, opts);
     return validate_main_options(opts, pos, argv[0]);
