@@ -1,6 +1,7 @@
 #pragma once
 
 #include <vector>
+#include <algorithm>
 #include <stdint.h>
 #include <string.h>
 #include <cfloat>
@@ -470,6 +471,118 @@ public:
         else { next_idx2 = k; break; }
       }
     }
+    //_check_invariant();
+  }
+};
+
+template <typename T>
+class both_pqueue_t {
+private:
+  int queue_size;
+  int queue_capacity;
+  // maintain invariant that next_idx and next_idx2 are always the two smallest
+  // unexpanded positions. If they don't exist, then they equal queue_size.
+  int next_idx, next_idx2;
+  void _check_invariant() {
+    assert(queue_size <= queue_capacity);
+    assert(next_idx <= queue_size);
+    assert((next_idx == queue_size) || !expanded[next_idx]);
+    assert(next_idx2 <= queue_size);
+    assert((next_idx2 == queue_size) || !expanded[next_idx2]);
+    assert(next_idx <= next_idx2);
+    assert((next_idx == queue_size) || (next_idx < next_idx2));
+  }
+  std::vector<T> vid_queue;
+  std::vector<float> rabitq_dist;
+  std::vector<float> l2_dist;
+  std::vector<uint8_t> expanded;
+
+public:
+  both_pqueue_t(int L) {
+    next_idx = next_idx2 = 0;
+    queue_size = 0;
+    queue_capacity = L;
+    vid_queue.resize(L+1);
+    rabitq_dist.resize(L+1);
+    l2_dist.resize(L+1);
+    expanded.resize(L+1);
+    std::fill(l2_dist.begin(), l2_dist.end(), -1.0f);
+    std::fill(expanded.begin(), expanded.end(), 0);
+  }
+
+  T& operator[](size_t i) { return vid_queue[i]; }
+  const T& operator[](size_t i) const { return vid_queue[i]; }
+  int get_capacity() const { return queue_capacity; }
+  int get_next_index() const { return next_idx; }
+  int get_next_index2() const { return next_idx2; }
+  float get_tail_dist() const { return queue_size == 0 ? FLT_MAX : rabitq_dist[queue_size-1]; }
+  float get_dist(int idx) const { return rabitq_dist[idx]; }
+  float get_l2_dist(int idx) const { return l2_dist[idx]; }
+  void set_l2_dist(int idx, float dist) { l2_dist[idx] = dist; }
+  bool has_l2_dist(int idx) const { return l2_dist[idx] >= 0.0f; }
+  bool is_expanded(int idx) const { return expanded[idx] == 1 ? true : false; }
+  int size() { return queue_size; }
+  void clear() { queue_size = 0; next_idx = 0; next_idx2 = 0; }
+  
+  bool has_unexpanded() { return next_idx < queue_size; }
+  bool has_second_unexpanded() { return next_idx2 < queue_size; }
+  void recompute_front() {
+    next_idx = queue_size;
+    next_idx2 = queue_size;
+    for (int i = 0; i < queue_size; i++) {
+      if (!expanded[i]) {
+        if (next_idx == queue_size) next_idx = i;
+        else {
+          next_idx2 = i;
+          break;
+        }
+      }
+    }
+  }
+  void set_front_expanded() {
+    expanded[next_idx] = 1;
+    next_idx = next_idx2;
+    if (next_idx2 < queue_size) next_idx2++;
+    while ((next_idx2 < queue_size) && expanded[next_idx2]) next_idx2++;
+    //_check_invariant();
+  }
+  void set_expanded(int idx) {
+    if ((idx < 0) || (idx >= queue_size) || expanded[idx]) return;
+    expanded[idx] = 1;
+    recompute_front();
+  }
+  void push(T vid, float dist) {
+    if ((queue_size == queue_capacity) && (dist > rabitq_dist[queue_size-1]))
+      return; // queue is full
+    auto queue_start = &rabitq_dist[0];
+    const auto loc = std::lower_bound(queue_start, queue_start + queue_size, dist);
+    auto insert_loc = loc - queue_start;
+    if (insert_loc < queue_size) {
+      // if (vid_queue[insert_loc] == vid) return; // duplicate
+      auto num = queue_size - insert_loc;
+      memmove(reinterpret_cast<char *>(&vid_queue[insert_loc + 1]),
+              reinterpret_cast<char *>(&vid_queue[insert_loc]),
+              num * sizeof(T));
+      memmove(reinterpret_cast<char *>(&rabitq_dist[insert_loc + 1]),
+              reinterpret_cast<char *>(&rabitq_dist[insert_loc]),
+              num * sizeof(float));
+      memmove(reinterpret_cast<char *>(&l2_dist[insert_loc + 1]),
+              reinterpret_cast<char *>(&l2_dist[insert_loc]),
+              num * sizeof(float));
+      memmove(reinterpret_cast<char *>(&expanded[insert_loc + 1]),
+              reinterpret_cast<char *>(&expanded[insert_loc]),
+              num * sizeof(uint8_t));
+    }
+    vid_queue[insert_loc] = vid;
+    rabitq_dist[insert_loc] = dist;
+    l2_dist[insert_loc] = -1;
+    expanded[insert_loc] = 0;
+    if (queue_size < queue_capacity) queue_size++;
+    if (insert_loc <= next_idx) {
+      next_idx2 = (next_idx == queue_size) ? queue_size:next_idx+1;
+      next_idx = insert_loc;
+    }
+    else if (insert_loc <= next_idx2) next_idx2 = insert_loc;
     //_check_invariant();
   }
 };

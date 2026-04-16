@@ -22,6 +22,9 @@
 using namespace std;
 typedef uint32_t vidType;
 
+template <typename T>
+class both_pqueue_t;
+
 #define QG_BQUERY 6
 
 inline int* read_ivecs(const char* filename, size_t& n_out, size_t& d_out) {
@@ -622,7 +625,8 @@ inline vidType exact_nn(const float* data, const float* query, size_t num_points
 
 inline void append_stats_to_csv(const std::string& filename,
     int k, int beam, float prune_ratio, float approx_ratio,
-    const RunStats& stats, int l2_iter_threshold = 0, int l2_end_iter_threshold = 0, int l2_period = 0)
+    const RunStats& stats, int l2_iter_threshold = 0, int l2_end_iter_threshold = 0,
+    int l2_period = 0, int rerank_top_m = 1)
 {
     bool file_exists = std::filesystem::exists(filename);
 
@@ -641,6 +645,7 @@ inline void append_stats_to_csv(const std::string& filename,
             << "L2_iter_threshold,"
             << "L2_end_iter_threshold,"
             << "L2_period,"
+            << "Rerank_top_m,"
             << "Runtime,"
             << "Latency,"
             << "Throughput,"
@@ -670,6 +675,7 @@ inline void append_stats_to_csv(const std::string& filename,
         << l2_iter_threshold << ","
         << l2_end_iter_threshold << ","
         << l2_period << ","
+        << rerank_top_m << ","
         << stats.runtime << ","
         << stats.latency << ","
         << stats.throughput << ","
@@ -774,6 +780,27 @@ inline void debug_print_beam_state(QueueT& frontier) {
              << ", node=" << frontier[i]
              << ", dist=" << fixed << setprecision(6) << frontier.get_dist(i)
              << ", expanded=" << (frontier.is_expanded(i) ? "true" : "false") << "\n";
+    }
+}
+
+template <typename T>
+inline void debug_print_beam_state(both_pqueue_t<T>& frontier) {
+    cout << "  beam state:";
+    if (frontier.size() == 0) {
+        cout << " []\n";
+        return;
+    }
+    cout << "\n";
+    for (int i = 0; i < frontier.size(); i++) {
+        cout << "    idx=" << i
+             << ", node=" << frontier[i]
+             << ", rabitq_dist=" << fixed << setprecision(6) << frontier.get_dist(i);
+        if (frontier.has_l2_dist(i)) {
+            cout << ", l2_dist=" << fixed << setprecision(6) << frontier.get_l2_dist(i);
+        } else {
+            cout << ", l2_dist=NA";
+        }
+        cout << ", expanded=" << (frontier.is_expanded(i) ? "true" : "false") << "\n";
     }
 }
 

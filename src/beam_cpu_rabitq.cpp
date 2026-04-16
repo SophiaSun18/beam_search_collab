@@ -27,6 +27,7 @@ float APPROX_RATIO = 0.0;
 int L2_START_ITER_THRESHOLD = 0;
 int L2_END_ITER_THRESHOLD = 0;
 int L2_PERIOD = 0;
+int RERANK_TOP_M = 2;
 /* Duplicate handling */
 bool DUP_HANDLING_ENABLED = false;
 /* Stats collection */
@@ -56,7 +57,7 @@ SearchResult beam_cpu_rabitq(
     hash_filter<vidType> is_added(DUP_HANDLING_ENABLED ? BEAM_SIZE * BEAM_SIZE : 1);
     vector<Candidate> curr_candidate;
     curr_candidate.reserve(degree);
-    new_pqueue_t<vidType> frontier(BEAM_SIZE);
+    both_pqueue_t<vidType> frontier(BEAM_SIZE);
     new_pqueue_t<vidType> result_pool(K);
 
     // initialize the buffers for fastscan distance estimation
@@ -127,15 +128,15 @@ SearchResult beam_cpu_rabitq(
     auto push_frontier_candidates = [&]() {
         for (size_t i = 0; i < curr_candidate.size(); i++) {
             if (frontier.size() < BEAM_SIZE || curr_candidate[i].dist < frontier.get_tail_dist()) {
-                if (DUP_HANDLING_ENABLED) {
-                    if (is_added.add(curr_candidate[i].vid)) {
-                        frontier.push(curr_candidate[i].vid, curr_candidate[i].dist);
-                    } else {
-                        frontier.push_update(curr_candidate[i].vid, curr_candidate[i].dist);
-                    }
-                } else {
+                // if (DUP_HANDLING_ENABLED) {
+                //     if (is_added.add(curr_candidate[i].vid)) {
+                //         frontier.push(curr_candidate[i].vid, curr_candidate[i].dist);
+                //     } else {
+                //         frontier.push_update(curr_candidate[i].vid, curr_candidate[i].dist);
+                //     }
+                // } else {
                     frontier.push(curr_candidate[i].vid, curr_candidate[i].dist);
-                }
+                // }
             }
         }
     };
@@ -171,10 +172,44 @@ SearchResult beam_cpu_rabitq(
         curr_candidate.clear();
         TSTOP(tc_candidate_buffer_mgmt);
 
-        TSTART(tc_queue_mgmt);
         int idx = frontier.get_next_index();
         vidType cur_node = frontier[idx];
-        frontier.set_front_expanded();
+        float exact_dist = -1.0f;
+
+        TSTART(tc_queue_mgmt);
+        if (!use_exact_l2 && RERANK_TOP_M > 1) {
+            vector<int> rerank_indices;
+            rerank_indices.reserve(RERANK_TOP_M);
+            int best_idx = idx;
+            const int frontier_size = frontier.size();
+
+            for (int cand_idx = idx; cand_idx < frontier_size && static_cast<int>(rerank_indices.size()) < RERANK_TOP_M; cand_idx++) {
+                if (frontier.is_expanded(cand_idx)) {
+                    continue;
+                }
+                rerank_indices.push_back(cand_idx);
+            }
+
+            for (int cand_idx : rerank_indices) {
+                if (!frontier.has_l2_dist(cand_idx)) {
+                    TSTART(tc_dist_comp);
+                    frontier.set_l2_dist(cand_idx, compute_distance(dim, d_query, qg.get_row(frontier[cand_idx])));
+                    TSTOP(tc_dist_comp);
+                    dist_cmps++;
+                }
+
+                if (cand_idx == rerank_indices.front() || frontier.get_l2_dist(cand_idx) < frontier.get_l2_dist(best_idx)) {
+                    best_idx = cand_idx;
+                }
+            }
+
+            idx = best_idx;
+            cur_node = frontier[idx];
+            exact_dist = frontier.get_l2_dist(idx);
+            frontier.set_expanded(idx);
+        } else {
+            frontier.set_front_expanded();
+        }
         TSTOP(tc_queue_mgmt);
 
         TSTART(tc_hash_filter);
@@ -184,10 +219,17 @@ SearchResult beam_cpu_rabitq(
         }
         TSTOP(tc_hash_filter);
 
-        TSTART(tc_dist_comp);
-        float exact_dist = compute_distance(dim, d_query, qg.get_row(cur_node));
-        TSTOP(tc_dist_comp);
-        dist_cmps++;
+        if (exact_dist < 0.0f) {
+            if (frontier.has_l2_dist(idx)) {
+                exact_dist = frontier.get_l2_dist(idx);
+            } else {
+                TSTART(tc_dist_comp);
+                exact_dist = compute_distance(dim, d_query, qg.get_row(cur_node));
+                TSTOP(tc_dist_comp);
+                dist_cmps++;
+                frontier.set_l2_dist(idx, exact_dist);
+            }
+        }
 
         if (STEP_EFFICIENCY_ENABLED && has_prev_expanded_exact_dist) {
             step_efficiency_by_step.push_back(prev_expanded_exact_dist - exact_dist);
@@ -545,7 +587,7 @@ int main(int argc, char** argv) {
         << " [-qg <qg_codebook>]" << " [-graph <graph_index>]"
         << " [-rabitq <rabitq_table>]" << " [-sign <sign_table>]"
         << " [-beam <int>]" << " [-p_ratio <float>]" << " [-a_ratio <float>]"
-        << " [-l2_iter <int>]" << " [-l2_end_iter <int>]" << " [-l2_period <int>]"
+        << " [-l2_iter <int>]" << " [-l2_end_iter <int>]" << " [-l2_period <int>]" << " [-rerank_top_m <int>]"
         << " [-timer <on|off|1|0>]" << " [-debug <on|off|1|0>]"
         << " [-estimate_stats <on|off|1|0>]" << " [-estimate_stats_file <output.txt>]"
         << " [-step_efficiency <on|off|1|0>]" << " [-step_efficiency_file <output.txt>]"
@@ -618,6 +660,13 @@ int main(int argc, char** argv) {
             L2_PERIOD = atoi(argv[++i]);
             if (L2_PERIOD < 0) {
                 cerr << "Error: -l2_period must be >= 0.\n";
+                return 1;
+            }
+        }
+        else if (arg == "-rerank_top_m" && i + 1 < argc) {
+            RERANK_TOP_M = atoi(argv[++i]);
+            if (RERANK_TOP_M < 1) {
+                cerr << "Error: -rerank_top_m must be >= 1.\n";
                 return 1;
             }
         }
@@ -739,6 +788,7 @@ int main(int argc, char** argv) {
     } else {
         cout << "Exact L2 periodic adjustment: off\n";
     }
+    cout << "Estimated-path rerank top-m: " << RERANK_TOP_M << "\n";
     if (ESTIMATE_STATS_ENABLED && !ESTIMATE_STATS_FILE.empty()) {
         cout << "Estimate stats file: " << ESTIMATE_STATS_FILE << "\n";
     }
@@ -746,12 +796,12 @@ int main(int argc, char** argv) {
         cout << "Step efficiency stats file: " << STEP_EFFICIENCY_STATS_FILE << "\n";
     }
 
-    if (mode == "bins") {
-        std::string dump_txt = rabitq_table + ".dump.txt";
-        dump_rabitq_table(rabitq_table, dump_txt, static_cast<int>(dim_base), degree, 20);
-    } else {
-        cout << "Skipping dump_rabitq_table in codebook mode: helper expects standalone rabitq table format.\n";
-    }
+    // if (mode == "bins") {
+    //     std::string dump_txt = rabitq_table + ".dump.txt";
+    //     dump_rabitq_table(rabitq_table, dump_txt, static_cast<int>(dim_base), degree, 20);
+    // } else {
+    //     cout << "Skipping dump_rabitq_table in codebook mode: helper expects standalone rabitq table format.\n";
+    // }
 
     if (mode == "bins") {
         int actual_threads = 0;
@@ -770,7 +820,7 @@ int main(int argc, char** argv) {
 
     if (!csv_file.empty()) {
         append_stats_to_csv(csv_file, K, BEAM_SIZE, PRUNE_RATIO, APPROX_RATIO, stats,
-                            L2_START_ITER_THRESHOLD, L2_END_ITER_THRESHOLD, L2_PERIOD);
+                            L2_START_ITER_THRESHOLD, L2_END_ITER_THRESHOLD, L2_PERIOD, RERANK_TOP_M);
     }
     if (ESTIMATE_STATS_ENABLED && !ESTIMATE_STATS_FILE.empty()) {
         dump_estimate_stats(ESTIMATE_STATS_FILE, stats);
