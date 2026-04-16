@@ -4,15 +4,6 @@
 
 #pragma once
 
-static __device__ __forceinline__ int warp_read_volatile_shared_i32(
-    volatile int* ptr) {
-    int v = 0;
-    if ((threadIdx.x & (WARP_SIZE - 1)) == 0) {
-        v = *ptr;
-    }
-    return __shfl_sync(FULL_MASK, v, 0);
-}
-
 template <typename T>
 static __device__ __forceinline__ void rabitq_build_query_residual_words(
     const T* query,
@@ -66,21 +57,23 @@ static __device__ __forceinline__ bool rabitq_lane_keep_topk_smallest_i32(
     int value,
     bool valid,
     int keep_k) {
-    if (!valid || keep_k <= 0) {
-        return false;
-    }
     const int lane_id = threadIdx.x & (WARP_SIZE - 1);
+    // Invalid lanes carry INT_MAX — detected via value comparison,
+    // eliminating the need for a separate valid-flag shuffle.
+    const int my_value = valid ? value : INT_MAX;
     int better = 0;
     #pragma unroll
     for (int src = 0; src < WARP_SIZE; ++src) {
-        const int other_value = __shfl_sync(FULL_MASK, value, src);
-        const int other_valid = __shfl_sync(FULL_MASK, valid ? 1 : 0, src);
-        if (!other_valid) {
+        const int other_value = __shfl_sync(FULL_MASK, my_value, src);
+        if (other_value >= INT_MAX) {
             continue;
         }
-        if ((other_value < value) || ((other_value == value) && (src < lane_id))) {
+        if ((other_value < my_value) || ((other_value == my_value) && (src < lane_id))) {
             ++better;
         }
+    }
+    if (!valid || keep_k <= 0) {
+        return false;
     }
     return better < keep_k;
 }
@@ -89,21 +82,27 @@ static __device__ __forceinline__ bool rabitq_lane_keep_topk_smallest_f32(
     float value,
     bool valid,
     int keep_k) {
-    if (!valid || keep_k <= 0) {
-        return false;
-    }
+    // NOTE: do NOT early-return here — all 32 lanes must reach the
+    // __shfl_sync(FULL_MASK, ...) calls below.  Invalid lanes participate
+    // with FLT_MAX so they never win the topk selection.
+    // The valid flag is implicit: invalid lanes carry FLT_MAX, so
+    // 'other_value >= FLT_MAX' reliably signals invalidity.
+    // This halves the shuffle count (64 → 32 per call).
     const int lane_id = threadIdx.x & (WARP_SIZE - 1);
+    const float my_value = valid ? value : FLT_MAX;
     int better = 0;
     #pragma unroll
     for (int src = 0; src < WARP_SIZE; ++src) {
-        const float other_value = __shfl_sync(FULL_MASK, value, src);
-        const int other_valid = __shfl_sync(FULL_MASK, valid ? 1 : 0, src);
-        if (!other_valid) {
+        const float other_value = __shfl_sync(FULL_MASK, my_value, src);
+        if (other_value >= FLT_MAX) {
             continue;
         }
-        if ((other_value < value) || ((other_value == value) && (src < lane_id))) {
+        if ((other_value < my_value) || ((other_value == my_value) && (src < lane_id))) {
             ++better;
         }
+    }
+    if (!valid || keep_k <= 0) {
+        return false;
     }
     return better < keep_k;
 }
@@ -209,6 +208,52 @@ static __device__ __forceinline__ void block_seed_initial_frontier_from_start_po
                 frontier_idx[pos] = start_vid;
                 frontier_dist[pos] = FLT_MAX;
             }
+        }
+    }
+}
+
+static __device__ __forceinline__ void block_sort_candidates_by_dist(
+    INDEX_T* candidate_idx,
+    DISTANCE_T* candidate_dist,
+    int valid_count) {
+    const int tid = threadIdx.x;
+    if (valid_count <= 1) {
+        return;
+    }
+    int sort_size = 1;
+    while (sort_size < valid_count) sort_size <<= 1;
+    if (sort_size < 2) {
+        sort_size = 2;
+    }
+
+    for (int i = tid; i < sort_size; i += blockDim.x) {
+        if (i >= valid_count) {
+            candidate_idx[i] = MAX_INDEX;
+            candidate_dist[i] = FLT_MAX;
+        }
+    }
+    __syncthreads();
+
+    for (int k = 2; k <= sort_size; k <<= 1) {
+        for (int j = (k >> 1); j > 0; j >>= 1) {
+            for (int i = tid; i < sort_size; i += blockDim.x) {
+                const int ixj = i ^ j;
+                if (ixj > i && ixj < sort_size) {
+                    const bool up = ((i & k) == 0);
+                    const DISTANCE_T di = candidate_dist[i];
+                    const DISTANCE_T dj = candidate_dist[ixj];
+                    if ((di > dj) == up) {
+                        const DISTANCE_T tmp_dist = candidate_dist[i];
+                        candidate_dist[i] = candidate_dist[ixj];
+                        candidate_dist[ixj] = tmp_dist;
+
+                        const INDEX_T tmp_idx = candidate_idx[i];
+                        candidate_idx[i] = candidate_idx[ixj];
+                        candidate_idx[ixj] = tmp_idx;
+                    }
+                }
+            }
+            __syncthreads();
         }
     }
 }
@@ -420,14 +465,16 @@ static __device__ __forceinline__ void block_merge_candidates_into_frontier(
     int beam_size,
     INDEX_T* candidate_idx,
     DISTANCE_T* candidate_dist,
-    int candidate_count,
-    INDEX_T* merge_idx,
-    DISTANCE_T* merge_dist) {
+    int candidate_count) {
     const int tid = threadIdx.x;
     const int nf = min(*frontier_size, beam_size);
     const int nc = min(candidate_count, kCandidateBufferSize);
     const int total = nf + nc;
     const int output_size = min(total, beam_size);
+
+    DISTANCE_T local_dist[4];
+    INDEX_T local_idx[4];
+    int local_count = 0;
 
     for (int out_pos = tid; out_pos < output_size; out_pos += blockDim.x) {
         const int k = out_pos;
@@ -456,21 +503,24 @@ static __device__ __forceinline__ void block_merge_candidates_into_frontier(
         const DISTANCE_T front_out = front_valid ? frontier_dist[front_take] : FLT_MAX;
 
         if (cand_valid && cand_out <= front_out) {
-            merge_dist[out_pos] = cand_out;
-            merge_idx[out_pos] = candidate_idx[cand_take];
+            local_dist[local_count] = cand_out;
+            local_idx[local_count] = candidate_idx[cand_take];
         } else if (front_valid) {
-            merge_dist[out_pos] = front_out;
-            merge_idx[out_pos] = frontier_idx[front_take];
+            local_dist[local_count] = front_out;
+            local_idx[local_count] = frontier_idx[front_take];
         } else {
-            merge_dist[out_pos] = FLT_MAX;
-            merge_idx[out_pos] = MAX_INDEX;
+            local_dist[local_count] = FLT_MAX;
+            local_idx[local_count] = MAX_INDEX;
         }
+        local_count++;
     }
     __syncthreads();
 
-    for (int i = tid; i < output_size; i += blockDim.x) {
-        frontier_idx[i] = merge_idx[i];
-        frontier_dist[i] = merge_dist[i];
+    local_count = 0;
+    for (int out_pos = tid; out_pos < output_size; out_pos += blockDim.x) {
+        frontier_idx[out_pos] = local_idx[local_count];
+        frontier_dist[out_pos] = local_dist[local_count];
+        local_count++;
     }
     if (tid == 0) {
         *frontier_size = output_size;
@@ -558,6 +608,125 @@ static __device__ __forceinline__ DISTANCE_T rabitq_fixed_exact_distance_128(
     return warp_l2_distance_128(query, nvec);
 }
 
+template <int VALID_LANES>
+static __device__ __forceinline__ float warp_l2_distance_128_cached_prefix(
+    const float* __restrict__ query,
+    const float* __restrict__ nvec) {
+    const int lane = threadIdx.x & (WARP_SIZE - 1);
+    float sum = 0.0f;
+    if (lane < VALID_LANES) {
+        const int base = lane << 2;
+        const float dx0 = query[base + 0] - nvec[base + 0];
+        const float dx1 = query[base + 1] - nvec[base + 1];
+        const float dx2 = query[base + 2] - nvec[base + 2];
+        const float dx3 = query[base + 3] - nvec[base + 3];
+        sum = fmaf(dx0, dx0, fmaf(dx1, dx1, fmaf(dx2, dx2, dx3 * dx3)));
+    }
+    sum += __shfl_down_sync(FULL_MASK, sum, 16);
+    sum += __shfl_down_sync(FULL_MASK, sum, 8);
+    sum += __shfl_down_sync(FULL_MASK, sum, 4);
+    sum += __shfl_down_sync(FULL_MASK, sum, 2);
+    sum += __shfl_down_sync(FULL_MASK, sum, 1);
+    return __shfl_sync(FULL_MASK, sum, 0);
+}
+
+template <int START_LANE>
+static __device__ __forceinline__ float warp_l2_distance_128_cached_suffix(
+    const float* __restrict__ query,
+    const float* __restrict__ nvec) {
+    const int lane = threadIdx.x & (WARP_SIZE - 1);
+    float sum = 0.0f;
+    if (lane >= START_LANE) {
+        const int base = lane << 2;
+        const float dx0 = query[base + 0] - nvec[base + 0];
+        const float dx1 = query[base + 1] - nvec[base + 1];
+        const float dx2 = query[base + 2] - nvec[base + 2];
+        const float dx3 = query[base + 3] - nvec[base + 3];
+        sum = fmaf(dx0, dx0, fmaf(dx1, dx1, fmaf(dx2, dx2, dx3 * dx3)));
+    }
+    sum += __shfl_down_sync(FULL_MASK, sum, 16);
+    sum += __shfl_down_sync(FULL_MASK, sum, 8);
+    sum += __shfl_down_sync(FULL_MASK, sum, 4);
+    sum += __shfl_down_sync(FULL_MASK, sum, 2);
+    sum += __shfl_down_sync(FULL_MASK, sum, 1);
+    return __shfl_sync(FULL_MASK, sum, 0);
+}
+
+static __device__ __forceinline__ float warp_l2_distance_128_cached(
+    const float* __restrict__ query,
+    const float* __restrict__ nvec) {
+    const int lane = threadIdx.x & (WARP_SIZE - 1);
+    const int base = lane << 2;
+    const float dx0 = query[base + 0] - nvec[base + 0];
+    const float dx1 = query[base + 1] - nvec[base + 1];
+    const float dx2 = query[base + 2] - nvec[base + 2];
+    const float dx3 = query[base + 3] - nvec[base + 3];
+    float sum = fmaf(dx0, dx0, fmaf(dx1, dx1, fmaf(dx2, dx2, dx3 * dx3)));
+    sum += __shfl_down_sync(FULL_MASK, sum, 16);
+    sum += __shfl_down_sync(FULL_MASK, sum, 8);
+    sum += __shfl_down_sync(FULL_MASK, sum, 4);
+    sum += __shfl_down_sync(FULL_MASK, sum, 2);
+    sum += __shfl_down_sync(FULL_MASK, sum, 1);
+    return __shfl_sync(FULL_MASK, sum, 0);
+}
+
+template <bool FRONTIER_FULL>
+static __device__ __forceinline__ DISTANCE_T rabitq_fixed_exact_distance_128_cached(
+    const float* __restrict__ query,
+    const float* __restrict__ nvec,
+    DISTANCE_T pass_cutoff) {
+    if constexpr (FRONTIER_FULL) {
+        const float partial =
+            warp_l2_distance_128_cached_prefix<PARTIAL_L2_128_LANES>(query, nvec);
+        if (partial < pass_cutoff) {
+            const float tail =
+                warp_l2_distance_128_cached_suffix<PARTIAL_L2_128_LANES>(query, nvec);
+            return partial + tail;
+        }
+        return FLT_MAX;
+    }
+    (void)pass_cutoff;
+    return warp_l2_distance_128_cached(query, nvec);
+}
+
+static __device__ __forceinline__ bool bitonic_pair_less(
+    DISTANCE_T lhs_dist,
+    INDEX_T lhs_idx,
+    DISTANCE_T rhs_dist,
+    INDEX_T rhs_idx) {
+    if (lhs_dist < rhs_dist) return true;
+    if (lhs_dist > rhs_dist) return false;
+    return (lhs_idx & 0x7fffffffu) < (rhs_idx & 0x7fffffffu);
+}
+
+template <int N>
+static __device__ __forceinline__ void block_bitonic_sort_pairs(
+    INDEX_T* idx,
+    DISTANCE_T* dist) {
+    const int tid = threadIdx.x;
+    for (int k = 2; k <= N; k <<= 1) {
+        for (int j = (k >> 1); j > 0; j >>= 1) {
+            const int ixj = tid ^ j;
+            if (tid < N && ixj < N && ixj > tid) {
+                const bool ascending = ((tid & k) == 0);
+                const DISTANCE_T di = dist[tid];
+                const DISTANCE_T dj = dist[ixj];
+                const INDEX_T ii = idx[tid];
+                const INDEX_T ij = idx[ixj];
+                const bool lhs_less = bitonic_pair_less(di, ii, dj, ij);
+                const bool should_swap = ascending ? !lhs_less : lhs_less;
+                if (should_swap) {
+                    dist[tid] = dj;
+                    dist[ixj] = di;
+                    idx[tid] = ij;
+                    idx[ixj] = ii;
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+
 static __device__ __forceinline__ uint32_t hashtable_insert_noatomic(
     INDEX_T* const table, const unsigned bitlen, const INDEX_T key) {
     const uint32_t size = 1u << bitlen;
@@ -585,10 +754,10 @@ static __device__ __forceinline__ uint32_t hashtable_insert_noatomic(
 
 static __device__ __forceinline__ uint32_t hashtable_insert_adaptive(
     INDEX_T* const table, const unsigned bitlen, const INDEX_T key, const int staged_neighbors) {
-    if (staged_neighbors >= (int)HASH_INSERT_LIMIT_START_FILL) {
-        return hashtable_insert_limited(table, bitlen, key, (unsigned)HASH_INSERT_MAX_PROBES);
-    }
-    return hashtable_insert(table, bitlen, key);
+    (void)staged_neighbors;
+    // Always use limited probing to prevent infinite loops when hash table
+    // is nearly full (critical with BITLEN=10 and 7-point expansion).
+    return hashtable_insert_limited(table, bitlen, key, (unsigned)HASH_INSERT_MAX_PROBES);
 }
 
 static inline std::vector<uint32_t> load_sign_bit(const char* filename) {
@@ -632,7 +801,7 @@ static inline bool save_sign_bit(const char* filename, const uint32_t* data, siz
 }
 
 template <typename T>
-static __global__ void BeamSearch(
+static __global__ __launch_bounds__(BLOCK_SIZE, kMinBlocksPerSM) void BeamSearch(
     int K, int beam_size, int nq, int dim, size_t npoints,
     const T* __restrict__ d_queries,
     const T* __restrict__ d_data,
@@ -651,72 +820,94 @@ static __global__ void BeamSearch(
     const int* __restrict__ d_routea_query_sumq,
     GraphGPU<vid_t> gg
 ) {
+    (void)d_routea_query_lut;
+    (void)routea_lut_groups;
+    (void)d_routea_query_lower;
+    (void)d_routea_query_width;
+    (void)d_routea_query_sumq;
+
     const int qid = blockIdx.x;
     if (qid >= nq) return;
 
     const int tid = threadIdx.x;
-    const int warp_id = tid / 32;
-    const int lane_id = tid % 32;
-    const int num_warps = blockDim.x / 32;
+    const int warp_id = tid / WARP_SIZE;
+    const int lane_id = tid & (WARP_SIZE - 1);
+    const int num_warps = blockDim.x / WARP_SIZE;
     const int max_degree = gg.get_max_degree();
     const int rabitq_score_words = min(kStableRabitqScoreWords, (dim + 31) >> 5);
     const int sign_word_stride = max(0, sign_words_per_edge);
     if (beam_size <= 0 || beam_size > BEAM_SIZE) return;
 
-    constexpr INDEX_T kIndexMsbMask = 0x80000000;
-    __shared__ INDEX_T s_frontier_idx[BEAM_SIZE];
-    __shared__ DISTANCE_T s_frontier_dist[BEAM_SIZE];
+    constexpr INDEX_T kIndexMsbMask = 0x80000000u;
+    __shared__ INDEX_T s_all_idx[kUseBitonicMerge ? kResultBufferSize : BEAM_SIZE];
+    __shared__ DISTANCE_T s_all_dist[kUseBitonicMerge ? kResultBufferSize : BEAM_SIZE];
+    // Merge path: separate candidate + merge scratch buffers
+    __shared__ INDEX_T s_cand_idx[kUseBitonicMerge ? 1 : kCandidateBufferSize];
+    __shared__ DISTANCE_T s_cand_dist[kUseBitonicMerge ? 1 : kCandidateBufferSize];
+    __shared__ INDEX_T s_hash[kHashSize];
+    __shared__ float s_query_cache[128];
+    __shared__ uint32_t s_query_bp[6][kStableRabitqScoreWords];
+    __shared__ INDEX_T s_expand_pos[SEARCH_WIDTH];
     __shared__ int s_frontier_size;
+    __shared__ int s_candidate_count;
+    __shared__ int s_num_expanders;
     __shared__ int s_dc_count;
     __shared__ int s_iter_count;
     __shared__ int s_no_progress_iters;
     __shared__ int s_break_now;
-    __shared__ INDEX_T s_hash[kHashSize];
-    __shared__ INDEX_T s_neighbor_idx[kNeighborBufferSize];
-    __shared__ DISTANCE_T s_neighbor_dist[kNeighborBufferSize];
-    __shared__ int s_rabitq_dualpool_anchor_budget;
-    __shared__ int s_num_neighbors;
-    __shared__ INDEX_T s_candidate_idx[kCandidateBufferSize];
-    __shared__ DISTANCE_T s_candidate_dist[kCandidateBufferSize];
-    __shared__ int s_candidate_count;
-    __shared__ INDEX_T s_candidate_tmp_idx[kNeighborBufferSize];
-    __shared__ DISTANCE_T s_candidate_tmp_dist[kNeighborBufferSize];
-    __shared__ int s_candidate_tmp_count;
-    #define s_neighbor_approx s_candidate_tmp_dist
-    __shared__ INDEX_T s_expand_pos[SEARCH_WIDTH];
-    __shared__ int s_num_expanders;
     __shared__ DISTANCE_T s_rabitq_best_dist;
     __shared__ int s_rabitq_stall_iters;
     __shared__ int s_rabitq_break_now;
-    __shared__ uint16_t s_routea_q6_lut[kStableRabitqScoreWords * 8][16];
     __shared__ float s_routea_query_lower;
     __shared__ float s_routea_query_width;
     __shared__ int s_routea_query_sumq;
     __shared__ int s_routea_query_ready;
     __shared__ int s_pick_counts[WARPS_PER_BLOCK];
-    __shared__ int s_pick_num;
-    __shared__ int s_pick_round_base;
 
-    const T* query = d_queries + qid * dim;
+    const T* query = d_queries + static_cast<size_t>(qid) * static_cast<size_t>(dim);
+    const bool routea_static_ready =
+        (d_sign_bit != nullptr) &&
+        (d_rabitq_triple != nullptr) &&
+        (d_rabitq_factor_dq != nullptr) &&
+        (sign_word_stride >= rabitq_score_words) &&
+        (rabitq_score_words > 0) &&
+        (dim <= (kStableRabitqScoreWords << 5)) &&
+        (REFLOW_TOPN > 0) &&
+        (REFLOW_TOPN < 32) &&
+        (max_degree <= WARP_SIZE);
+
     hashtable_init(s_hash, BITLEN, 0);
-
-    for (int i = tid; i < BEAM_SIZE; i += blockDim.x) {
-        s_frontier_idx[i] = MAX_INDEX;
-        s_frontier_dist[i] = FLT_MAX;
+    if constexpr (kUseBitonicMerge) {
+        for (int i = tid; i < kResultBufferSize; i += blockDim.x) {
+            s_all_idx[i] = MAX_INDEX;
+            s_all_dist[i] = FLT_MAX;
+        }
+    } else {
+        for (int i = tid; i < BEAM_SIZE; i += blockDim.x) {
+            s_all_idx[i] = MAX_INDEX;
+            s_all_dist[i] = FLT_MAX;
+        }
+        for (int i = tid; i < kCandidateBufferSize; i += blockDim.x) {
+            s_cand_idx[i] = MAX_INDEX;
+            s_cand_dist[i] = FLT_MAX;
+        }
     }
-    for (int i = tid; i < kCandidateBufferSize; i += blockDim.x) {
-        s_candidate_idx[i] = MAX_INDEX;
-        s_candidate_dist[i] = FLT_MAX;
+    for (int i = tid; i < 128; i += blockDim.x) {
+        s_query_cache[i] = 0.0f;
     }
-
+    if (tid < 6 * kStableRabitqScoreWords) {
+        const int k = tid / kStableRabitqScoreWords;
+        const int w = tid % kStableRabitqScoreWords;
+        s_query_bp[k][w] = 0u;
+    }
     if (tid == 0) {
         s_frontier_size = 0;
+        s_candidate_count = 0;
+        s_num_expanders = 0;
         s_dc_count = 0;
         s_iter_count = 0;
         s_no_progress_iters = 0;
         s_break_now = 0;
-        s_num_neighbors = 0;
-        s_candidate_count = 0;
         s_rabitq_best_dist = FLT_MAX;
         s_rabitq_stall_iters = 0;
         s_rabitq_break_now = 0;
@@ -727,86 +918,133 @@ static __global__ void BeamSearch(
     }
     __syncthreads();
 
-    const int routea_expected_groups = min(routea_lut_groups, kStableRabitqScoreWords * 8);
-    const bool routea_query_available =
-        (d_routea_query_lut != nullptr) &&
-        (d_routea_query_lower != nullptr) &&
-        (d_routea_query_width != nullptr) &&
-        (d_routea_query_sumq != nullptr) &&
-        (routea_expected_groups > 0);
-    if (routea_query_available) {
-        const size_t q_lut_base =
-            static_cast<size_t>(qid) * static_cast<size_t>(routea_lut_groups) * 16u;
-        for (int i = tid; i < routea_expected_groups * 16; i += blockDim.x) {
-            const int g = i >> 4;
-            const int code = i & 15;
-            s_routea_q6_lut[g][code] = d_routea_query_lut[q_lut_base + static_cast<size_t>(i)];
+    for (int i = tid; i < dim && i < 128; i += blockDim.x) {
+        s_query_cache[i] = static_cast<float>(query[i]);
+    }
+    __syncthreads();
+
+    if (tid == 0 && routea_static_ready) {
+        float lo = FLT_MAX;
+        float hi = -FLT_MAX;
+        for (int i = 0; i < dim; ++i) {
+            const float v = s_query_cache[i];
+            lo = fminf(lo, v);
+            hi = fmaxf(hi, v);
         }
-        if (tid == 0) {
-            s_routea_query_lower = d_routea_query_lower[qid];
-            s_routea_query_width = d_routea_query_width[qid];
-            s_routea_query_sumq = d_routea_query_sumq[qid];
-            s_routea_query_ready = 1;
+        const float width = (hi > lo) ? ((hi - lo) / 63.0f) : 0.0f;
+        int sumq = 0;
+        for (int k = 0; k < 6; ++k) {
+            #pragma unroll
+            for (int w = 0; w < kStableRabitqScoreWords; ++w) {
+                s_query_bp[k][w] = 0u;
+            }
         }
+        for (int i = 0; i < dim; ++i) {
+            int qv = 0;
+            if (width > 0.0f) {
+                const float normalized = ((s_query_cache[i] - lo) / width) + 0.5f;
+                qv = __float2int_rn(normalized);
+                qv = max(0, min(63, qv));
+            }
+            sumq += qv;
+            #pragma unroll
+            for (int k = 0; k < 6; ++k) {
+                if (((qv >> k) & 1) != 0) {
+                    s_query_bp[k][i >> 5] |= (1u << (i & 31));
+                }
+            }
+        }
+        s_routea_query_lower = lo;
+        s_routea_query_width = width;
+        s_routea_query_sumq = sumq;
+        s_routea_query_ready = 1;
     }
     __syncthreads();
 
     block_seed_initial_frontier_from_start_points(
-        s_hash, s_frontier_idx, s_frontier_dist, &s_frontier_size,
+        s_hash, s_all_idx, s_all_dist, &s_frontier_size,
         K, beam_size, npoints, d_starting_points);
     __syncthreads();
 
-    for (int iter = 0; iter < (int)RABITQ_MAX_ITER_CAP; iter++) {
-        if (tid == 0) {
-            s_break_now = 0;
+    int dc_local = 0;
+    if (dim == 128) {
+        for (int n = warp_id; n < s_frontier_size; n += num_warps) {
+            const vid_t neighbor = s_all_idx[n] & ~kIndexMsbMask;
+            const float* nvec128 =
+                reinterpret_cast<const float*>(d_data + static_cast<size_t>(neighbor) * static_cast<size_t>(dim));
+            const DISTANCE_T dist = warp_l2_distance_128_cached(s_query_cache, nvec128);
+            if (lane_id == 0) {
+                s_all_dist[n] = dist;
+                dc_local++;
+            }
         }
-        __syncthreads();
+    } else {
+        for (int n = warp_id; n < s_frontier_size; n += num_warps) {
+            const vid_t neighbor = s_all_idx[n] & ~kIndexMsbMask;
+            const T* nvec = d_data + static_cast<size_t>(neighbor) * static_cast<size_t>(dim);
+            const DISTANCE_T dist = warp_l2_distance(dim, query, nvec);
+            if (lane_id == 0) {
+                s_all_dist[n] = dist;
+                dc_local++;
+            }
+        }
+    }
+    if (lane_id == 0) {
+        s_pick_counts[warp_id] = dc_local;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        int dc_sum = 0;
+        #pragma unroll
+        for (int w = 0; w < WARPS_PER_BLOCK; ++w) {
+            dc_sum += s_pick_counts[w];
+        }
+        s_dc_count += dc_sum;
+    }
+    // Parallel padding: all 256 threads cooperate instead of tid==0 serial loop
+    for (int i = s_frontier_size + tid; i < BEAM_SIZE; i += blockDim.x) {
+        s_all_idx[i] = MAX_INDEX;
+        s_all_dist[i] = FLT_MAX;
+    }
+    __syncthreads();
+    if constexpr (kUseBitonicMerge) {
+        block_bitonic_sort_pairs<kResultBufferSize>(s_all_idx, s_all_dist);
+    } else {
+        block_sort_candidates_by_dist(s_all_idx, s_all_dist, s_frontier_size);
+    }
+    if (tid == 0) {
+        s_frontier_size = min(s_frontier_size, beam_size);
+    }
+    __syncthreads();
 
+    for (int iter = 0; iter < (int)RABITQ_MAX_ITER_CAP; ++iter) {
         if (iter > 0 && (iter % SMALL_HASH_RESET_INTERVAL) == 0) {
             hashtable_init(s_hash, BITLEN, 0);
             __syncthreads();
-            hashtable_restore(s_hash, BITLEN, s_frontier_idx, min(s_frontier_size, beam_size), 0);
+            hashtable_restore(s_hash, BITLEN, s_all_idx, min(s_frontier_size, beam_size), 0);
             __syncthreads();
         }
-
-        int expand_width = max(1, (int)REFLOW_POP_BATCH);
-        const int M = min(s_frontier_size, beam_size);
-        const int picked_expanders = block_pick_new_parents_to_expand(
-            s_frontier_idx, M, expand_width, s_expand_pos,
-            s_pick_counts, &s_pick_num, &s_pick_round_base, kIndexMsbMask);
-        if (tid == 0) s_num_expanders = picked_expanders;
-        __syncthreads();
-        if (s_num_expanders == 0) break;
-
-        if (tid == 0) {
-            s_iter_count++;
-        }
-        if (tid == 0) s_num_neighbors = 0;
-        __syncthreads();
 
         if (tid == 0 && iter > 0) {
             const int nf = min(s_frontier_size, beam_size);
             DISTANCE_T curr_best = FLT_MAX;
             if (nf > 0) {
                 const int kpos = min(max(K, 1), nf) - 1;
-                curr_best = s_frontier_dist[kpos];
+                curr_best = s_all_dist[kpos];
             }
-            const DISTANCE_T prev_best = s_rabitq_best_dist;
             DISTANCE_T improve_need = (DISTANCE_T)RABITQ_STALL_IMPROVE_EPS_ABS;
             const DISTANCE_T rel_need =
-                (DISTANCE_T)(fabsf((float)prev_best) * (float)RABITQ_STALL_IMPROVE_EPS_REL);
-            if (rel_need > improve_need) improve_need = rel_need;
-            const DISTANCE_T improve = prev_best - curr_best;
+                (DISTANCE_T)(fabsf((float)s_rabitq_best_dist) * (float)RABITQ_STALL_IMPROVE_EPS_REL);
+            if (rel_need > improve_need) {
+                improve_need = rel_need;
+            }
+            const DISTANCE_T improve = s_rabitq_best_dist - curr_best;
             if (improve > improve_need) {
                 s_rabitq_best_dist = curr_best;
                 s_rabitq_stall_iters = 0;
             } else {
                 s_rabitq_stall_iters++;
             }
-        }
-        __syncthreads();
-
-        if (tid == 0) {
             const bool stop_ok =
                 (iter >= (int)RABITQ_EARLY_STOP_WARMUP_ITERS) &&
                 (s_frontier_size >= beam_size);
@@ -818,124 +1056,136 @@ static __global__ void BeamSearch(
             break;
         }
 
-        const int rabitq_cool_start = (int)RABITQ_MAX_ITER_CAP;
-        const bool routea_static_ready =
-            (s_routea_query_ready == 1) &&
-            (d_sign_bit != nullptr) &&
-            (d_rabitq_triple != nullptr) &&
-            (d_rabitq_factor_dq != nullptr) &&
-            (sign_word_stride >= rabitq_score_words) &&
-            (routea_expected_groups >= (rabitq_score_words << 3)) &&
-            (dim <= (kStableRabitqScoreWords << 5)) &&
-            (REFLOW_TOPN > 0) &&
-            (REFLOW_TOPN < 32) &&
-            (rabitq_score_words > 0);
+        if (tid == 0) {
+            s_break_now = 0;
+            s_candidate_count = 0;
+            s_num_expanders = 0;
+            const int nf = min(s_frontier_size, beam_size);
+            for (int j = 0; j < nf && s_num_expanders < SEARCH_WIDTH; ++j) {
+                const INDEX_T index = s_all_idx[j];
+                const INDEX_T clean = index & ~kIndexMsbMask;
+                if (clean >= npoints) {
+                    continue;
+                }
+                if ((index & kIndexMsbMask) == 0) {
+                    s_expand_pos[s_num_expanders++] = j;
+                    s_all_idx[j] = index | kIndexMsbMask;
+                }
+            }
+        }
+        __syncthreads();
+        if (s_num_expanders == 0) {
+            break;
+        }
+
+        if (tid == 0) {
+            s_iter_count++;
+        }
+
         const bool routea_filter_gate =
-            routea_static_ready &&
-            (iter < rabitq_cool_start);
+            routea_static_ready && (s_routea_query_ready == 1);
+        const int rabitq_score_dims = min(dim, rabitq_score_words << 5);
+        const int tail_bits = rabitq_score_dims & 31;
+        const uint32_t tail_mask =
+            (tail_bits == 0) ? 0xFFFFFFFFu : ((1u << tail_bits) - 1u);
 
         for (int e = warp_id; e < s_num_expanders; e += num_warps) {
-            INDEX_T expand_pos = s_expand_pos[e];
-            if (expand_pos >= beam_size) continue;
-            vid_t current = s_frontier_idx[expand_pos] & ~kIndexMsbMask;
-            if (current >= npoints) continue;
-            const int rabitq_score_dims = min(dim, rabitq_score_words << 5);
+            const int expand_pos = s_expand_pos[e];
+            const vid_t current = s_all_idx[expand_pos] & ~kIndexMsbMask;
+            if (current >= npoints) {
+                continue;
+            }
+            const DISTANCE_T parent_dist = s_all_dist[expand_pos];
             const vid_t* neighbors = gg.N(current);
-            for (int base = 0; base < max_degree; base += 32) {
-                const int deg = min(32, max_degree - base);
-                const bool routea_active_base =
-                    routea_filter_gate && (deg > 1);
-                const int n = base + lane_id;
-                vid_t neighbor = (lane_id < deg) ? neighbors[n] : UINT_MAX;
-                const bool valid = (lane_id < deg) && (neighbor < npoints);
-                bool keep = valid;
-                DISTANCE_T neighbor_approx = FLT_MAX;
+            const int deg = min(max_degree, WARP_SIZE);
+            const vid_t neighbor = (lane_id < deg) ? neighbors[lane_id] : MAX_INDEX;
+            const bool valid = (lane_id < deg) && (neighbor < npoints);
 
-                if (routea_filter_gate && routea_active_base) {
-                    float routea_neighbor_approx = FLT_MAX;
-                    if (valid) {
-                        const size_t edge_pos =
-                            (size_t)current * (size_t)max_degree + (size_t)n;
-                        const uint32_t* sign_words =
-                            d_sign_bit + edge_pos * (size_t)sign_word_stride;
-                        int set_sum = 0;
-                        int pop_sum = 0;
-                        const int tail_bits = rabitq_score_dims & 31;
-                        const uint32_t tail_mask =
-                            (tail_bits == 0) ? 0xFFFFFFFFu : ((1u << tail_bits) - 1u);
+            float approx = FLT_MAX;
+            bool keep = valid;
+            if (routea_filter_gate) {
+                if (valid) {
+                    const size_t edge_pos =
+                        static_cast<size_t>(current) * static_cast<size_t>(max_degree) +
+                        static_cast<size_t>(lane_id);
+                    const uint32_t* sign_words =
+                        d_sign_bit + edge_pos * static_cast<size_t>(sign_word_stride);
+                    uint32_t sw[kStableRabitqScoreWords] = {0u, 0u, 0u, 0u};
+                    #pragma unroll
+                    for (int w = 0; w < kStableRabitqScoreWords; ++w) {
+                        if (w < rabitq_score_words) {
+                            sw[w] = sign_words[w];
+                        }
+                    }
+                    if (tail_bits != 0 && rabitq_score_words > 0) {
+                        sw[rabitq_score_words - 1] &= tail_mask;
+                    }
+                    int set_sum = 0;
+                    #pragma unroll
+                    for (int k = 0; k < 6; ++k) {
+                        int plane_sum = 0;
                         #pragma unroll
                         for (int w = 0; w < kStableRabitqScoreWords; ++w) {
-                            if (w >= rabitq_score_words) {
-                                break;
-                            }
-                            uint32_t sw = sign_words[w];
-                            if ((w == rabitq_score_words - 1) && (tail_bits != 0)) {
-                                sw &= tail_mask;
-                            }
-                            pop_sum += __popc(sw);
-                            const int lut_base = w << 3;
-                            set_sum += (int)s_routea_q6_lut[lut_base + 0][(sw >> 0) & 0xFu];
-                            set_sum += (int)s_routea_q6_lut[lut_base + 1][(sw >> 4) & 0xFu];
-                            set_sum += (int)s_routea_q6_lut[lut_base + 2][(sw >> 8) & 0xFu];
-                            set_sum += (int)s_routea_q6_lut[lut_base + 3][(sw >> 12) & 0xFu];
-                            set_sum += (int)s_routea_q6_lut[lut_base + 4][(sw >> 16) & 0xFu];
-                            set_sum += (int)s_routea_q6_lut[lut_base + 5][(sw >> 20) & 0xFu];
-                            set_sum += (int)s_routea_q6_lut[lut_base + 6][(sw >> 24) & 0xFu];
-                            set_sum += (int)s_routea_q6_lut[lut_base + 7][(sw >> 28) & 0xFu];
+                            plane_sum += __popc(s_query_bp[k][w] & sw[w]);
                         }
-                        const int signed_sum = (set_sum << 1) - s_routea_query_sumq;
-                        const float triple = d_rabitq_triple[edge_pos];
-                        const float fdq = d_rabitq_factor_dq[edge_pos];
-                        const int sign_sum = (pop_sum << 1) - rabitq_score_dims;
-                        const float fvq = fdq * (float)sign_sum;
-                        routea_neighbor_approx =
-                            s_frontier_dist[expand_pos] + triple +
-                            (fdq * (s_routea_query_width * (float)signed_sum)) +
-                            (fvq * s_routea_query_lower);
-                        if (!(routea_neighbor_approx > 0.0f) ||
-                            (routea_neighbor_approx != routea_neighbor_approx) ||
-                            (routea_neighbor_approx >= FLT_MAX)) {
-                            routea_neighbor_approx = FLT_MAX * 0.5f;
-                        }
+                        set_sum += (plane_sum << k);
                     }
-                    neighbor_approx = (DISTANCE_T)routea_neighbor_approx;
-                    const int keep_k = min((int)REFLOW_TOPN, deg);
-                    keep = rabitq_lane_keep_topk_smallest_f32(
-                        routea_neighbor_approx, valid, keep_k);
+                    int pop_sum = 0;
+                    #pragma unroll
+                    for (int w = 0; w < kStableRabitqScoreWords; ++w) {
+                        pop_sum += __popc(sw[w]);
+                    }
+                    const int signed_sum = (set_sum << 1) - s_routea_query_sumq;
+                    const float triple = d_rabitq_triple[edge_pos];
+                    const float fdq = d_rabitq_factor_dq[edge_pos];
+                    const int sign_sum = (pop_sum << 1) - rabitq_score_dims;
+                    const float fvq = fdq * (float)sign_sum;
+                    approx = parent_dist + triple +
+                             (fdq * (s_routea_query_width * (float)signed_sum)) +
+                             (fvq * s_routea_query_lower);
+                    if (!(approx > 0.0f) || (approx != approx) || (approx >= FLT_MAX)) {
+                        approx = FLT_MAX * 0.5f;
+                    }
                 }
+                const int keep_k = min((int)REFLOW_TOPN, deg);
+                keep = rabitq_lane_keep_topk_smallest_f32(approx, valid, keep_k);
+            }
 
-                uint32_t is_new = 0;
-                const uint32_t active = __ballot_sync(FULL_MASK, keep);
-                if (active != 0u) {
-                    const int staged_neighbors_base =
-                        warp_read_volatile_shared_i32((volatile int*)&s_num_neighbors);
-                    if (keep) {
-                        is_new = hashtable_insert_adaptive(
-                            s_hash, BITLEN, neighbor, staged_neighbors_base);
-                    }
-                }
-                const uint32_t ballot = __ballot_sync(FULL_MASK, is_new);
-                const int warp_count = __popc(ballot);
-                int base_offset = 0;
-                if (lane_id == 0 && warp_count > 0) {
-                    base_offset = atomicAdd(&s_num_neighbors, warp_count);
-                }
-                base_offset = __shfl_sync(FULL_MASK, base_offset, 0);
-                if (is_new) {
-                    const int my_offset = __popc(ballot & ((1u << lane_id) - 1));
-                    const int slot = base_offset + my_offset;
-                    if (slot < kNeighborBufferSize) {
-                        s_neighbor_idx[slot] = neighbor;
-                        s_neighbor_approx[slot] = neighbor_approx;
+            uint32_t is_new = 0u;
+            if (keep) {
+                // Note: do NOT call warp_read_volatile_shared_i32 here —
+                // it contains __shfl_sync(FULL_MASK) which deadlocks when
+                // called inside a divergent branch (keep is false for
+                // ~12/32 lanes after RouteA topk filtering).
+                is_new = hashtable_insert_limited(
+                    s_hash, BITLEN, neighbor, (unsigned)HASH_INSERT_MAX_PROBES);
+            }
+            const uint32_t ballot = __ballot_sync(FULL_MASK, is_new != 0u);
+            const int warp_count = __popc(ballot);
+            int base_offset = 0;
+            if (lane_id == 0 && warp_count > 0) {
+                base_offset = atomicAdd(&s_candidate_count, warp_count);
+            }
+            base_offset = __shfl_sync(FULL_MASK, base_offset, 0);
+            if (is_new) {
+                const int prefix = __popc(ballot & ((1u << lane_id) - 1u));
+                const int slot = base_offset + prefix;
+                if (slot < kCandidateBufferSize) {
+                    if constexpr (kUseBitonicMerge) {
+                        s_all_idx[BEAM_SIZE + slot] = neighbor;
+                        s_all_dist[BEAM_SIZE + slot] = FLT_MAX;
+                    } else {
+                        s_cand_idx[slot] = neighbor;
+                        s_cand_dist[slot] = FLT_MAX;
                     }
                 }
             }
         }
         __syncthreads();
 
-        int num_neighbors = min(s_num_neighbors, kNeighborBufferSize);
+        const int cand_count = min(s_candidate_count, kCandidateBufferSize);
         if (tid == 0) {
-            if (num_neighbors == 0) {
+            if (cand_count == 0) {
                 s_no_progress_iters++;
                 if (s_no_progress_iters >= kNoProgressBreakIters) {
                     s_break_now = 1;
@@ -945,142 +1195,92 @@ static __global__ void BeamSearch(
             }
         }
         __syncthreads();
-        if (s_break_now) break;
-        if (num_neighbors == 0) continue;
+        if (s_break_now) {
+            break;
+        }
+        if (cand_count == 0) {
+            continue;
+        }
 
         const bool frontier_full = (s_frontier_size >= beam_size);
-        const DISTANCE_T cutoff = frontier_full ? s_frontier_dist[beam_size - 1] : FLT_MAX;
-        int dc_warp = 0;
-        int dc_local = 0;
-        if (tid == 0) {
-            s_rabitq_dualpool_anchor_budget = 0;
-        }
-        __syncthreads();
-
-        if (tid == 0 &&
-            routea_filter_gate &&
-            (num_neighbors > 0)) {
-            const int tiles_per_expander = max(1, (max_degree + 31) / 32);
-            const int shortlist_cap = (int)REFLOW_TOPN;
-            const int per_pop = max(shortlist_cap, 0) * tiles_per_expander;
-            int budget = per_pop * max(s_num_expanders, 1);
-            if (budget < 1) budget = 1;
-            if (budget > num_neighbors) budget = num_neighbors;
-            s_rabitq_dualpool_anchor_budget = budget;
-        }
-        __syncthreads();
-
-        int exact_limit = num_neighbors;
-        if (routea_filter_gate) {
-            exact_limit =
-                min(num_neighbors, max(s_rabitq_dualpool_anchor_budget, 0));
-        }
-        const DISTANCE_T pass_cutoff = cutoff;
-        const bool need_routea_approx_order =
-            routea_filter_gate &&
-            (num_neighbors > 1) &&
-            (exact_limit < num_neighbors);
-
-        if (need_routea_approx_order) {
-            block_sort_neighbor_prefix_by_dist(
-                s_neighbor_idx, s_neighbor_approx, s_neighbor_dist, num_neighbors);
-        }
-        __syncthreads();
-
+        const DISTANCE_T cutoff = frontier_full ? s_all_dist[beam_size - 1] : FLT_MAX;
+        int dc_round = 0;
         if (dim == 128) {
-            if (frontier_full) {
-                for (int n = warp_id; n < exact_limit; n += num_warps) {
-                    vid_t neighbor = s_neighbor_idx[n];
-                    const float* nvec128 = (const float*)(d_data + (size_t)neighbor * (size_t)dim);
-                    bool computed_full = true;
-                    const DISTANCE_T dist =
-                        rabitq_fixed_exact_distance_128<true>(
-                            (const float*)query, nvec128, pass_cutoff, &computed_full);
-                    if (lane_id == 0) {
-                        s_neighbor_dist[n] = dist;
-                        dc_local++;
-                    }
+            for (int n = warp_id; n < cand_count; n += num_warps) {
+                const vid_t neighbor = kUseBitonicMerge ? s_all_idx[BEAM_SIZE + n] : s_cand_idx[n];
+                const float* nvec128 =
+                    reinterpret_cast<const float*>(d_data + static_cast<size_t>(neighbor) * static_cast<size_t>(dim));
+                DISTANCE_T dist = FLT_MAX;
+                if (frontier_full) {
+                    dist = rabitq_fixed_exact_distance_128_cached<true>(
+                        s_query_cache, nvec128, cutoff);
+                } else {
+                    dist = rabitq_fixed_exact_distance_128_cached<false>(
+                        s_query_cache, nvec128, cutoff);
                 }
-            } else {
-                for (int n = warp_id; n < exact_limit; n += num_warps) {
-                    vid_t neighbor = s_neighbor_idx[n];
-                    const float* nvec128 = (const float*)(d_data + (size_t)neighbor * (size_t)dim);
-                    bool computed_full = true;
-                    const DISTANCE_T dist =
-                        rabitq_fixed_exact_distance_128<false>(
-                            (const float*)query, nvec128, pass_cutoff, &computed_full);
-                    if (lane_id == 0) {
-                        s_neighbor_dist[n] = dist;
-                        dc_local++;
+                if (lane_id == 0) {
+                    if constexpr (kUseBitonicMerge) {
+                        s_all_dist[BEAM_SIZE + n] = dist;
+                    } else {
+                        s_cand_dist[n] = dist;
                     }
+                    dc_round++;
                 }
             }
         } else {
-            for (int n = warp_id; n < exact_limit; n += num_warps) {
-                vid_t neighbor = s_neighbor_idx[n];
-                const T* nvec = d_data + neighbor * dim;
+            for (int n = warp_id; n < cand_count; n += num_warps) {
+                const vid_t neighbor = kUseBitonicMerge ? s_all_idx[BEAM_SIZE + n] : s_cand_idx[n];
+                const T* nvec = d_data + static_cast<size_t>(neighbor) * static_cast<size_t>(dim);
                 const DISTANCE_T dist = warp_l2_distance(dim, query, nvec);
                 if (lane_id == 0) {
-                    s_neighbor_dist[n] = dist;
-                    dc_local++;
+                    if constexpr (kUseBitonicMerge) {
+                        s_all_dist[BEAM_SIZE + n] = dist;
+                    } else {
+                        s_cand_dist[n] = dist;
+                    }
+                    dc_round++;
                 }
             }
         }
-        __syncthreads();
-
         if (lane_id == 0) {
-            dc_warp = dc_local;
+            s_pick_counts[warp_id] = dc_round;
         }
-        if (lane_id == 0) {
-            s_pick_counts[warp_id] = dc_warp;
-        }
-
         __syncthreads();
         if (tid == 0) {
             int dc_sum = 0;
             #pragma unroll
-            for (int w = 0; w < WARPS_PER_BLOCK; w++) {
-                if (w < num_warps) dc_sum += s_pick_counts[w];
+            for (int w = 0; w < WARPS_PER_BLOCK; ++w) {
+                dc_sum += s_pick_counts[w];
             }
             s_dc_count += dc_sum;
         }
         __syncthreads();
 
-        const int candidate_neighbor_count =
-            routea_filter_gate ? exact_limit : num_neighbors;
-        const DISTANCE_T candidate_cutoff = cutoff;
-        s_candidate_count = block_select_candidates_from_neighbors(
-            s_neighbor_idx, s_neighbor_dist, candidate_neighbor_count, candidate_cutoff,
-            s_frontier_size, beam_size,
-            s_candidate_idx, s_candidate_dist,
-            s_candidate_tmp_idx, s_candidate_tmp_dist,
-            &s_pick_num, &s_candidate_count, &s_candidate_tmp_count);
-
-        if (tid == 0) {
-            if (s_candidate_count == 0) {
-                s_no_progress_iters++;
-                if (s_no_progress_iters >= kNoProgressBreakIters) {
-                    s_break_now = 1;
-                }
-            } else {
-                s_no_progress_iters = 0;
+        if constexpr (kUseBitonicMerge) {
+            for (int i = BEAM_SIZE + cand_count + tid; i < kResultBufferSize; i += blockDim.x) {
+                s_all_idx[i] = MAX_INDEX;
+                s_all_dist[i] = FLT_MAX;
             }
+            __syncthreads();
+            block_bitonic_sort_pairs<kResultBufferSize>(s_all_idx, s_all_dist);
+            if (tid == 0) {
+                s_frontier_size = min(beam_size, s_frontier_size + cand_count);
+            }
+            __syncthreads();
+        } else {
+            // Merge path: sort candidates, then binary merge into frontier
+            block_sort_candidates_by_dist(
+                s_cand_idx, s_cand_dist, cand_count);
+            block_merge_candidates_into_frontier(
+                s_all_idx, s_all_dist, &s_frontier_size, beam_size,
+                s_cand_idx, s_cand_dist, cand_count);
+            __syncthreads();
         }
-        __syncthreads();
-
-        if (s_break_now) break;
-        if (s_candidate_count == 0) continue;
-
-        block_merge_candidates_into_frontier(
-            s_frontier_idx, s_frontier_dist, &s_frontier_size, beam_size,
-            s_candidate_idx, s_candidate_dist, s_candidate_count,
-            s_neighbor_idx, s_neighbor_dist);
-        __syncthreads();
     }
 
     for (int i = tid; i < K; i += blockDim.x) {
         if (i < s_frontier_size) {
-            d_results[qid * K + i] = s_frontier_idx[i] & ~kIndexMsbMask;
+            d_results[qid * K + i] = s_all_idx[i] & ~kIndexMsbMask;
         } else {
             d_results[qid * K + i] = 0;
         }
@@ -1091,5 +1291,4 @@ static __global__ void BeamSearch(
             atomicAdd(d_total_hops, (gpu_long_t)s_iter_count);
         }
     }
-    #undef s_neighbor_approx
 }

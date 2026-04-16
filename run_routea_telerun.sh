@@ -28,6 +28,7 @@ K="${K:-100}"
 RUNS="${RUNS:-1}"
 WARMUP="${WARMUP:-1}"
 MAX_QUERIES="${MAX_QUERIES:-10000}"
+COMPILE_BEAM_SIZE="${COMPILE_BEAM_SIZE:-128}"
 
 case "$DATASET" in
   sift1m|sift10m)
@@ -35,11 +36,16 @@ case "$DATASET" in
   *) echo "ERROR: unsupported DATASET=$DATASET" >&2; exit 2 ;;
 esac
 
-BITLEN=12
+if [[ "$BEAM" -gt "$COMPILE_BEAM_SIZE" ]]; then
+  echo "ERROR: runtime BEAM=$BEAM exceeds COMPILE_BEAM_SIZE=$COMPILE_BEAM_SIZE" >&2
+  exit 2
+fi
+
+BITLEN=11
 SEARCH_WIDTH=7
 
 NVFLAGS="--use_fast_math -std=c++17 -O3 -gencode arch=compute_89,code=sm_89"
-NVFLAGS+=" -DBEAM_SIZE=${BEAM}"
+NVFLAGS+=" -DBEAM_SIZE=${COMPILE_BEAM_SIZE}"
 NVFLAGS+=" -DBITLEN=${BITLEN}"
 NVFLAGS+=" -DSEARCH_WIDTH=${SEARCH_WIDTH}"
 

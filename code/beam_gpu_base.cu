@@ -112,9 +112,9 @@ void print_search_runtime_banner_once(
          (int)RABITQ_EARLY_STOP_STALL_ITERS,
          (int)RABITQ_EARLY_STOP_WARMUP_ITERS,
          (int)RABITQ_MAX_ITER_CAP);
-  printf("Search compile-time: BITLEN=%d, SMALL_HASH_RESET_INTERVAL=%d, NEIGHBOR_BUFFER_SIZE=%d\n",
+  printf("Search compile-time: BITLEN=%d, SMALL_HASH_RESET_INTERVAL=%d, CANDIDATE_BUFFER_SIZE=%d, RESULT_BUFFER_SIZE=%d\n",
          (int)BITLEN, (int)SMALL_HASH_RESET_INTERVAL,
-         kNeighborBufferSize);
+         kCandidateBufferSize, kResultBufferSize);
   std::cout << "num_blocks = " << num_blocks << " num_threads = " << num_threads << "\n";
 
   const cudaDeviceProp prop = load_device_properties_with_fallback();
@@ -649,9 +649,7 @@ void IndexGraph<T>::search(int nq, const T* queries, int K, vid_t *result_idx, i
 
   const StableRabitqSidecars sidecars =
       ensure_rabitq_sidecars(this, cache, h_data, npoints, dim, max_degree);
-  build_and_upload_routea_query_sidecars(cache, queries, nq, dim);
-  const RouteAQuerySidecars routea_query_sidecars =
-      routea_query_sidecars_from_cache(cache);
+  const RouteAQuerySidecars routea_query_sidecars{};
   const float kernel_ms = run_beam_search_kernel(
       K, beam_sz, nq, dim, npoints, num_blocks, num_threads,
       cache, sidecars, routea_query_sidecars);
@@ -660,7 +658,6 @@ void IndexGraph<T>::search(int nq, const T* queries, int K, vid_t *result_idx, i
     printf("Approx filter mode: %s\n",
            routea_runtime_enabled() ? "routea" : "off");
     const bool routea_active =
-        (routea_query_sidecars.d_lut != nullptr) &&
         (sidecars.d_sign_bit != nullptr) &&
         (sidecars.d_rabitq_triple != nullptr) &&
         (sidecars.d_rabitq_factor_dq != nullptr);
