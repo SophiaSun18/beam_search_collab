@@ -447,7 +447,8 @@ public:
     inline void set_entry_point(vidType entry_point) { entry_point_ = entry_point; }
 
     void gpu_search(int nq, const float* queries, int K, float* result_vec,
-                    vidType* result_idx, int beam_sz, double& elapsed);
+                    vidType* result_idx, int beam_sz, double& elapsed,
+                    GpuRunStats* gpu_stats = nullptr);
 
 private:
     void init_layout(bool bins_mode) {

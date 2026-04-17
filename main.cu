@@ -14,7 +14,7 @@ int main(int argc, char** argv) {
     if (argc < 6) {
         cerr << "Usage: " << argv[0] 
              << " <mode:gpu_base|gpu_rabitq> <data.fvecs> <query.fvecs> <gt.ivecs> <graph_or_codebook>"
-             << " [K=100] [beam_size=128] [degree=32]\n";
+             << " [K=100] [beam_size=128] [degree=32] [-csv output.csv]\n";
         return 1;
     }
 
@@ -43,16 +43,30 @@ int main(int argc, char** argv) {
     double elapsed = 0.0;
     int K = 100;
     int beam_size = 128;
+    string csv_file;
+    GpuRunStats gpu_stats;
 
     if (mode == "gpu_base") {
         if (argc < 6) {
-            cerr << "gpu_base requires: <mode> <data> <query> <gt> <graph_index> [K] [beam_size]\n";
+            cerr << "gpu_base requires: <mode> <data> <query> <gt> <graph_index> [K] [beam_size] [-csv output.csv]\n";
             return 1;
         }
         const char* graph_prefix = argv[5];
-        K = (argc >= 7) ? atoi(argv[6]) : 100;
-        beam_size = (argc >= 8) ? atoi(argv[7]) : 128;
+        int arg_idx = 6;
+        if (arg_idx < argc && argv[arg_idx][0] != '-') K = atoi(argv[arg_idx++]);
+        if (arg_idx < argc && argv[arg_idx][0] != '-') beam_size = atoi(argv[arg_idx++]);
+        while (arg_idx < argc) {
+            string arg = argv[arg_idx];
+            if (arg == "-csv" && arg_idx + 1 < argc) {
+                csv_file = argv[++arg_idx];
+            } else {
+                cerr << "Unknown argument: " << arg << "\n";
+                return 1;
+            }
+            ++arg_idx;
+        }
         cout << "Graph prefix: " << graph_prefix << "\n";
+        if (!csv_file.empty()) cout << "CSV output: " << csv_file << "\n";
         cout << "========================================\n\n";
 
         IndexGraph<float> index;
@@ -71,17 +85,30 @@ int main(int argc, char** argv) {
         results.resize(nq * K);
         distances.resize(nq * K);
         
-        index.search(static_cast<int>(nq), queries.data(), K, distances.data(), results.data(), beam_size, elapsed);
+        index.search(static_cast<int>(nq), queries.data(), K, distances.data(), results.data(), beam_size, elapsed, &gpu_stats);
     } else if (mode == "gpu_rabitq") {
-        if (argc < 7) {
-            cerr << "gpu_rabitq requires: <mode> <data> <query> <gt> <qg_codebook> [K] [beam_size] [degree]\n";
+        if (argc < 6) {
+            cerr << "gpu_rabitq requires: <mode> <data> <query> <gt> <qg_codebook> [K] [beam_size] [degree] [-csv output.csv]\n";
             return 1;
         }
         const char* qg_codebook = argv[5];
-        K = (argc >= 7) ? atoi(argv[6]) : 100;
-        beam_size = (argc >= 8) ? atoi(argv[7]) : 128;
-        int degree = (argc >= 9) ? atoi(argv[8]) : 32;
+        int arg_idx = 6;
+        if (arg_idx < argc && argv[arg_idx][0] != '-') K = atoi(argv[arg_idx++]);
+        if (arg_idx < argc && argv[arg_idx][0] != '-') beam_size = atoi(argv[arg_idx++]);
+        int degree = 32;
+        if (arg_idx < argc && argv[arg_idx][0] != '-') degree = atoi(argv[arg_idx++]);
+        while (arg_idx < argc) {
+            string arg = argv[arg_idx];
+            if (arg == "-csv" && arg_idx + 1 < argc) {
+                csv_file = argv[++arg_idx];
+            } else {
+                cerr << "Unknown argument: " << arg << "\n";
+                return 1;
+            }
+            ++arg_idx;
+        }
         cout << "QG codebook: " << qg_codebook << "\n";
+        if (!csv_file.empty()) cout << "CSV output: " << csv_file << "\n";
         cout << "========================================\n\n";
 
         IndexGraph<float> index;
@@ -100,7 +127,7 @@ int main(int argc, char** argv) {
         distances.resize(nq * K);
 
         QuantizationGraph qg(index.ntotal, index.d, degree, qg_codebook);
-        qg.gpu_search(static_cast<int>(nq), queries.data(), K, distances.data(), results.data(), beam_size, elapsed);
+        qg.gpu_search(static_cast<int>(nq), queries.data(), K, distances.data(), results.data(), beam_size, elapsed, &gpu_stats);
     } else {
         cerr << "Unknown mode: " << mode << "\n";
         return 1;
@@ -119,6 +146,16 @@ int main(int argc, char** argv) {
     cout << "Avg latency: " << latency_ms << " ms/query\n";
     cout << "Recall@" << K << ": " << recall << "\n";
     cout << "========================================\n";
+
+    gpu_stats.common.runtime = elapsed;
+    gpu_stats.common.latency = latency_ms;
+    gpu_stats.common.throughput = qps;
+    gpu_stats.common.recall = recall;
+
+    if (!csv_file.empty()) {
+        append_gpu_stats_to_csv(csv_file, K, beam_size, gpu_stats);
+        cout << "Saved GPU stats CSV row to: " << csv_file << "\n";
+    }
     
     return 0;
 }

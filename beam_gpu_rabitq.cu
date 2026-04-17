@@ -8,10 +8,11 @@
 #include <cstddef>
 #include <array>
 
-#define USE_TENSOR_RABITQ 1
+#define USE_TENSOR_RABITQ 0
 
 void QuantizationGraph::gpu_search(int nq, const float* queries, int K, float* result_vec,
-                                   vidType* result_idx, int beam_sz, double& elapsed) {
+                                   vidType* result_idx, int beam_sz, double& elapsed,
+                                   GpuRunStats* gpu_stats) {
   if (this->is_bins_mode()) {
     throw std::runtime_error("gpu_search currently supports only codebook-mode QuantizationGraph");
   }
@@ -157,6 +158,20 @@ void QuantizationGraph::gpu_search(int nq, const float* queries, int K, float* r
     std::cout << "average cycles per warp_l2_distance: " << avg_l2_cycles << "\n";
     std::cout << "total # est timing calls: " << total_timing[GPU_TIMING_EST_CALLS] << "\n";
     std::cout << "average cycles per estimated_distance_gpu: " << avg_est_cycles << "\n";
+  }
+
+  if (gpu_stats != nullptr) {
+    gpu_stats->common.total_dc = static_cast<int64_t>(total_stats[GPU_SEARCH_STAT_DIST_CMPS]);
+    gpu_stats->common.total_ds = static_cast<int64_t>(total_stats[GPU_SEARCH_STAT_DIST_EST]);
+    gpu_stats->common.total_extra_dc = 0;
+    gpu_stats->common.total_full_dc = static_cast<int64_t>(total_stats[GPU_SEARCH_STAT_DIST_CMPS]);
+    gpu_stats->common.total_iter = static_cast<int64_t>(total_stats[GPU_SEARCH_STAT_ITERATIONS]);
+    gpu_stats->common.total_pruned = 0;
+    gpu_stats->common.time_search_total = elapsed;
+    gpu_stats->gpu_l2_calls = static_cast<int64_t>(total_timing[GPU_TIMING_L2_CALLS]);
+    gpu_stats->gpu_l2_cycles = static_cast<int64_t>(total_timing[GPU_TIMING_L2_CYCLES]);
+    gpu_stats->gpu_est_calls = static_cast<int64_t>(total_timing[GPU_TIMING_EST_CALLS]);
+    gpu_stats->gpu_est_cycles = static_cast<int64_t>(total_timing[GPU_TIMING_EST_CYCLES]);
   }
 
   (void)result_vec;

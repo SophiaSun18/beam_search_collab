@@ -85,24 +85,25 @@ PRUNE_RATIOS=(0)
 # APPROX_RATIOS=(0.1 0.2 0.3 0.4 0.5)
 APPROX_RATIOS=(0)
 # L2_START_ITERS=(0 10 20 30 40 50 60 70 80 90 100)
-L2_START_ITERS=10
-L2_END_ITER=50
+L2_START_ITERS=0
+L2_END_ITER=0
 L2_PERIOD=0
+RERANK_TOP_M=1
 TRIALS=1
-MODE="fastscan"               # "fastscan" = enabled, "sequential" = fastscan disabled
+MODE="sequential"               # "fastscan" = enabled, "sequential" = fastscan disabled
 RABITQ_LOAD_MODE="codebook"  # "bins" = -graph + -rabitq + -sign, "codebook" = -qg
 ESTIMATE_STATS="off"          # "on" = write estimate reuse stats, "off" = disable
 STEP_EFFICIENCY="off"         # "on" = write per-step exact-distance reduction stats
 ACC32=""
 
 BIN_DIR="bin"
-RESULT_ROOT="result/4.13CheckL2Start=10End=50DEBUG"
+RESULT_ROOT="result/4.17FixGPUBeamSize256"
 
 # --------------------------------------------
 # List of dataset prefixes and K values
 # --------------------------------------------
-# DATASETS=("sift" 32)
-DATASETS=("sift" 32 "gist" 32 "deep10m" 32 "fanns" 32)
+DATASETS=("sift" 32)
+# DATASETS=("sift" 32 "gist" 32 "deep10m" 32 "deep1M" 32)
 # DATASETS=("sift10m" 32 "gist" 32 "deep10m" 32 "deep1M" 32)
 
 # ============================================================
@@ -287,9 +288,9 @@ run_cpu_rabitq() {
                 for ar in "${APPROX_RATIOS[@]}"; do
                     for l2_iter in "${L2_START_ITERS[@]}"; do
                         CSV_FILE="${LOG_ROOT}/${PREFIX}_deg${K}_top${TOPK}_threads${t}_rabitq_${LOAD_MODE_SUFFIX}.csv"
-                        LOG_FILE="${LOG_ROOT_2}/${BIN_NAME}_${LOAD_MODE_SUFFIX}_beam${beam}_threads${t}_pr${pr}_a${ar}_l2i${l2_iter}_l2e${L2_END_ITER}_l2p${L2_PERIOD}.log"
-                        ESTIMATE_STATS_FILE="${LOG_ROOT_2}/${BIN_NAME}_${LOAD_MODE_SUFFIX}_beam${beam}_threads${t}_pr${pr}_a${ar}_l2i${l2_iter}_l2e${L2_END_ITER}_l2p${L2_PERIOD}.estimate_stats.txt"
-                        STEP_EFFICIENCY_FILE="${LOG_ROOT_2}/${BIN_NAME}_${LOAD_MODE_SUFFIX}_beam${beam}_threads${t}_pr${pr}_a${ar}_l2i${l2_iter}_l2e${L2_END_ITER}_l2p${L2_PERIOD}.step_efficiency.txt"
+                        LOG_FILE="${LOG_ROOT_2}/${BIN_NAME}_${LOAD_MODE_SUFFIX}_beam${beam}_threads${t}_pr${pr}_a${ar}_l2i${l2_iter}_l2e${L2_END_ITER}_l2p${L2_PERIOD}_rtm${RERANK_TOP_M}.log"
+                        ESTIMATE_STATS_FILE="${LOG_ROOT_2}/${BIN_NAME}_${LOAD_MODE_SUFFIX}_beam${beam}_threads${t}_pr${pr}_a${ar}_l2i${l2_iter}_l2e${L2_END_ITER}_l2p${L2_PERIOD}_rtm${RERANK_TOP_M}.estimate_stats.txt"
+                        STEP_EFFICIENCY_FILE="${LOG_ROOT_2}/${BIN_NAME}_${LOAD_MODE_SUFFIX}_beam${beam}_threads${t}_pr${pr}_a${ar}_l2i${l2_iter}_l2e${L2_END_ITER}_l2p${L2_PERIOD}_rtm${RERANK_TOP_M}.step_efficiency.txt"
                         ESTIMATE_STATS_ARGS=(
                             -estimate_stats "$ESTIMATE_STATS"
                         )
@@ -323,6 +324,7 @@ run_cpu_rabitq() {
                                 -l2_iter $l2_iter \
                                 -l2_end_iter $L2_END_ITER \
                                 -l2_period $L2_PERIOD \
+                                -rerank_top_m $RERANK_TOP_M \
                                 -timer "$TIMER_MODE" \
                                 -debug "$DEBUG_MODE" \
                                 "${ESTIMATE_STATS_ARGS[@]}" \
@@ -341,6 +343,7 @@ run_cpu_rabitq() {
                                 -l2_iter $l2_iter \
                                 -l2_end_iter $L2_END_ITER \
                                 -l2_period $L2_PERIOD \
+                                -rerank_top_m $RERANK_TOP_M \
                                 -timer "$TIMER_MODE" \
                                 -debug "$DEBUG_MODE" \
                                 "${ESTIMATE_STATS_ARGS[@]}" \
@@ -362,6 +365,7 @@ run_cpu_rabitq() {
 run_gpu_base() {
     BINARY="$BIN_DIR/gpu_search"
     BIN_NAME="gpu_base"
+    CSV_FILE="${LOG_ROOT}/${PREFIX}_deg${K}_top${TOPK}_${BIN_NAME}.csv"
 
     for beam in "${BEAM_SIZES[@]}"; do
         LOG_FILE="${LOG_ROOT_2}/${BIN_NAME}_beam${beam}_topk${TOPK}.log"
@@ -378,7 +382,8 @@ run_gpu_base() {
                 "$GT_FILE" \
                 "$GRAPH_FILE" \
                 "$TOPK" \
-                "$beam" >> "$LOG_FILE" 2>&1
+                "$beam" \
+                -csv "$CSV_FILE" >> "$LOG_FILE" 2>&1
 
             "$BINARY" \
                 gpu_base \
@@ -387,7 +392,8 @@ run_gpu_base() {
                 "$GT_FILE" \
                 "$GRAPH_FILE" \
                 "$TOPK" \
-                "$beam" >> "$LOG_FILE" 2>&1
+                "$beam" \
+                -csv "$CSV_FILE" >> "$LOG_FILE" 2>&1
 
             echo >> "$LOG_FILE"
         done
@@ -400,6 +406,7 @@ run_gpu_base() {
 run_gpu_rabitq() {
     BINARY="$BIN_DIR/gpu_search"
     BIN_NAME="gpu_rabitq"
+    CSV_FILE="${LOG_ROOT}/${PREFIX}_deg${K}_top${TOPK}_${BIN_NAME}.csv"
 
     for beam in "${BEAM_SIZES[@]}"; do
         LOG_FILE="${LOG_ROOT_2}/${BIN_NAME}_beam${beam}_topk${TOPK}_degree${DEGREE}.log"
@@ -417,7 +424,8 @@ run_gpu_rabitq() {
                 "$QG_CODEBOOK" \
                 "$TOPK" \
                 "$beam" \
-                "$DEGREE" >> "$LOG_FILE" 2>&1
+                "$DEGREE" \
+                -csv "$CSV_FILE" >> "$LOG_FILE" 2>&1
 
             "$BINARY" \
                 gpu_rabitq \
@@ -427,7 +435,8 @@ run_gpu_rabitq() {
                 "$QG_CODEBOOK" \
                 "$TOPK" \
                 "$beam" \
-                "$DEGREE" >> "$LOG_FILE" 2>&1
+                "$DEGREE" \
+                -csv "$CSV_FILE" >> "$LOG_FILE" 2>&1
 
             echo >> "$LOG_FILE"
         done

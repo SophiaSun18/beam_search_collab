@@ -252,6 +252,14 @@ struct RunStats {
     vector<size_t> step_efficiency_counts_by_step;
 };
 
+struct GpuRunStats {
+    RunStats common{};
+    int64_t gpu_l2_calls = 0;
+    int64_t gpu_l2_cycles = 0;
+    int64_t gpu_est_calls = 0;
+    int64_t gpu_est_cycles = 0;
+};
+
 struct SearchResult {
     vector<int> neighbors;
     size_t dist_cmps;
@@ -695,6 +703,88 @@ inline void append_stats_to_csv(const std::string& filename,
         << stats.time_candidate_buffer_mgmt << ","
         << stats.time_nth_element << ","
         << stats.time_hash_filter << "\n";
+
+    out.close();
+}
+
+inline void append_gpu_stats_to_csv(const std::string& filename,
+    int k, int beam, const GpuRunStats& gpu_stats)
+{
+    bool file_exists = std::filesystem::exists(filename);
+
+    std::ofstream out(filename, std::ios::app);
+    if (!out.is_open()) {
+        std::cerr << "Error: cannot open CSV file " << filename << "\n";
+        return;
+    }
+
+    if (!file_exists) {
+        out << "TopK,"
+            << "Beam_size,"
+            << "Prune_ratio,"
+            << "Approx_ratio,"
+            << "L2_iter_threshold,"
+            << "L2_end_iter_threshold,"
+            << "L2_period,"
+            << "Rerank_top_m,"
+            << "Runtime,"
+            << "Latency,"
+            << "Throughput,"
+            << "Recall,"
+            << "Total_dist_comp,"
+            << "Total_dist_est,"
+            << "Total_extra_dist_comp,"
+            << "Total_full_dist_comp,"
+            << "Total_iter,"
+            << "Total_pruned,"
+            << "Time_search_total,"
+            << "Time_dist_comp,"
+            << "Time_nbr_filter,"
+            << "Time_dist_est,"
+            << "Time_queue_management,"
+            << "Time_pruning,"
+            << "Time_candidate_buffer_management,"
+            << "Time_nth_element,"
+            << "Time_hash_filter,"
+            << "Gpu_l2_calls,"
+            << "Gpu_l2_cycles,"
+            << "Gpu_est_calls,"
+            << "Gpu_est_cycles,"
+            << "\n";
+    }
+
+    const RunStats& stats = gpu_stats.common;
+    out << k << ","
+        << beam << ","
+        << 0 << ","
+        << 0 << ","
+        << 0 << ","
+        << 0 << ","
+        << 0 << ","
+        << 1 << ","
+        << stats.runtime << ","
+        << stats.latency << ","
+        << stats.throughput << ","
+        << stats.recall << ","
+        << stats.total_dc << ","
+        << stats.total_ds << ","
+        << stats.total_extra_dc << ","
+        << stats.total_full_dc << ","
+        << stats.total_iter << ","
+        << stats.total_pruned << ","
+        << stats.time_search_total << ","
+        << stats.time_dist_comp << ","
+        << stats.time_nbr_filter << ","
+        << stats.time_dist_est << ","
+        << stats.time_queue_mgmt << ","
+        << stats.time_pruning << ","
+        << stats.time_candidate_buffer_mgmt << ","
+        << stats.time_nth_element << ","
+        << stats.time_hash_filter << ","
+        << gpu_stats.gpu_l2_calls << ","
+        << gpu_stats.gpu_l2_cycles << ","
+        << gpu_stats.gpu_est_calls << ","
+        << gpu_stats.gpu_est_cycles << "\n";
 
     out.close();
 }

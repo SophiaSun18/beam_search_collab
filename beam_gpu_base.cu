@@ -11,7 +11,8 @@
 #include <chrono>
 
 template <typename T>
-void IndexGraph<T>::search(int nq, const T* queries, int K, T *result_vec, vid_t *result_idx, int beam_sz, double& elapsed) {
+void IndexGraph<T>::search(int nq, const T* queries, int K, T *result_vec, vid_t *result_idx, int beam_sz, double& elapsed,
+                           GpuRunStats* gpu_stats) {
   auto dim = this->d;
   auto npoints = this->ntotal;
   auto max_degree = this->maxDeg;
@@ -135,6 +136,20 @@ void IndexGraph<T>::search(int nq, const T* queries, int K, T *result_vec, vid_t
         total_timing[GPU_TIMING_L2_CALLS] ? static_cast<double>(total_timing[GPU_TIMING_L2_CYCLES]) / total_timing[GPU_TIMING_L2_CALLS] : 0.0;
     std::cout << "total # l2 timing calls: " << total_timing[GPU_TIMING_L2_CALLS] << "\n";
     std::cout << "average cycles per warp_l2_distance: " << avg_l2_cycles << "\n";
+  }
+
+  if (gpu_stats != nullptr) {
+    gpu_stats->common.total_dc = static_cast<int64_t>(total_stats[GPU_SEARCH_STAT_DIST_CMPS]);
+    gpu_stats->common.total_ds = static_cast<int64_t>(total_stats[GPU_SEARCH_STAT_DIST_EST]);
+    gpu_stats->common.total_extra_dc = 0;
+    gpu_stats->common.total_full_dc = static_cast<int64_t>(total_stats[GPU_SEARCH_STAT_DIST_CMPS]);
+    gpu_stats->common.total_iter = static_cast<int64_t>(total_stats[GPU_SEARCH_STAT_ITERATIONS]);
+    gpu_stats->common.total_pruned = 0;
+    gpu_stats->common.time_search_total = elapsed;
+    gpu_stats->gpu_l2_calls = static_cast<int64_t>(total_timing[GPU_TIMING_L2_CALLS]);
+    gpu_stats->gpu_l2_cycles = static_cast<int64_t>(total_timing[GPU_TIMING_L2_CYCLES]);
+    gpu_stats->gpu_est_calls = static_cast<int64_t>(total_timing[GPU_TIMING_EST_CALLS]);
+    gpu_stats->gpu_est_cycles = static_cast<int64_t>(total_timing[GPU_TIMING_EST_CYCLES]);
   }
 }
 
