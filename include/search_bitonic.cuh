@@ -2,25 +2,24 @@
 #include "utils.cuh"
 #include "distance.cuh"
 #include <cuda_runtime.h>
-#define INTERNAL_TOPK   128
-#define SEARCH_WIDTH    1     // MAX: 2 nodes * 32 degree = 64 neighbors = CANDIDATE_BUFFER_SIZE
-#define BITLEN          10
-#define MAX_ITERATIONS  1024
-#define TEAM_SIZE       8
-#define USE_SEED        0
-#define PRUNE_CONFIG    0
-#define THRESHOLD_CONFIG    0
-#define HASH_TABLE_CONFIG   1
-#define CANDIDATE_BUFFER_SIZE 64
-#define RESULT_BUFFER_SIZE INTERNAL_TOPK + CANDIDATE_BUFFER_SIZE
 
-static __host__ inline uint32_t calculate_shared_mem_size(int dim, int topk, int max_deg, 
-                                                           int search_width, int bitlen) {
+inline constexpr int kSearchWidth = 1;     // MAX: 2 nodes * 32 degree = 64 neighbors = candidate buffer
+inline constexpr int kMaxIterations = 1024;
+inline constexpr int kTeamSize = 8;
+inline constexpr int kUseSeed = 0;
+inline constexpr int kPruneConfig = 0;
+inline constexpr int kThresholdConfig = 0;
+inline constexpr int kHashTableConfig = 1;
+inline constexpr int kCandidateBufferSize = 64;
+
+template <int kInternalTopk, int kBitlen>
+static __host__ inline uint32_t calculate_shared_mem_size(int dim) {
+    constexpr uint32_t kResultBufferSize = kInternalTopk + kCandidateBufferSize;
     size_t size = 0;    
-    size += hashtable_getsize(BITLEN) * sizeof(INDEX_T);    // hash table
-    size += RESULT_BUFFER_SIZE * sizeof(INDEX_T);           // top k and candidate index
-    size += RESULT_BUFFER_SIZE * sizeof(DISTANCE_T);        // top k and candidate distance
-    size += SEARCH_WIDTH * sizeof(INDEX_T);                 // next expanders / parent buffer
+    size += hashtable_getsize(kBitlen) * sizeof(INDEX_T);   // hash table
+    size += kResultBufferSize * sizeof(INDEX_T);            // top k and candidate index
+    size += kResultBufferSize * sizeof(DISTANCE_T);         // top k and candidate distance
+    size += kSearchWidth * sizeof(INDEX_T);                 // next expanders / parent buffer
     size += dim * 4;                                        // query buffer size
     size += 2 * 4;                                          // terminate flag and counter
     if (GPU_SEARCH_STATS) {
@@ -40,7 +39,7 @@ static inline std::vector<uint32_t> load_sign_bit(const char* filename) {
     return std::vector<uint32_t>();
 }
 
-template <typename T>
+template <typename T, int kInternalTopk, int kBitlen>
 static __global__ GPU_LAUNCH_BOUNDS(BLOCK_SIZE)
 void BeamSearch(
     int K, int nq, int dim, size_t npoints,
@@ -52,14 +51,18 @@ void BeamSearch(
     vid_t* d_starting_points,
     vid_t* d_seed_map,
     uint32_t* d_sign_bit,
-    GraphGPU<vid_t> gg
+    GraphGPU<vid_t> gg,
+    int active_beam
 ) {
+    static_assert(kInternalTopk % WARP_SIZE == 0, "kInternalTopk must be divisible by warp size");
+    static_assert(kCandidateBufferSize <= 64, "candidate buffer assumes at most 64 entries");
+    constexpr uint32_t kResultBufferSize = kInternalTopk + kCandidateBufferSize;
+
     // basic information about this block and thread
     const int query_id = blockIdx.x;
     if (query_id > nq) return;
     const T* query = d_queries + query_id * dim;
     const uint32_t maxDegree = gg.get_max_degree();
-    INDEX_T* d_graph_ptr = gg.N(0);
 
     const int tid = threadIdx.x;
     const int warp_id = tid / WARP_SIZE;
@@ -69,15 +72,15 @@ void BeamSearch(
     extern __shared__ char shared_memory[];
     INDEX_T* ALL_INDEX = (INDEX_T*)shared_memory;
     INDEX_T* TOP_K_INDEX      = ALL_INDEX;
-    INDEX_T* CANDIDATE_INDEX  = ALL_INDEX + INTERNAL_TOPK;
+    INDEX_T* CANDIDATE_INDEX  = ALL_INDEX + kInternalTopk;
 
-    DISTANCE_T* ALL_DISTANCE = (DISTANCE_T*)(ALL_INDEX + RESULT_BUFFER_SIZE);
+    DISTANCE_T* ALL_DISTANCE = (DISTANCE_T*)(ALL_INDEX + kResultBufferSize);
     DISTANCE_T* TOP_K_DISTANCE      = ALL_DISTANCE;
-    DISTANCE_T* CANDIDATE_DISTANCE  = ALL_DISTANCE + INTERNAL_TOPK;
+    DISTANCE_T* CANDIDATE_DISTANCE  = ALL_DISTANCE + kInternalTopk;
 
-    INDEX_T* HASH_TABLE = (INDEX_T*)(ALL_DISTANCE + RESULT_BUFFER_SIZE);
-    INDEX_T* PARENT_LIST = (INDEX_T*)(HASH_TABLE + hashtable_getsize(BITLEN));
-    DATA_T* QUERY_BUFFER = (DATA_T*)(PARENT_LIST + SEARCH_WIDTH);
+    INDEX_T* HASH_TABLE = (INDEX_T*)(ALL_DISTANCE + kResultBufferSize);
+    INDEX_T* PARENT_LIST = (INDEX_T*)(HASH_TABLE + hashtable_getsize(kBitlen));
+    DATA_T* QUERY_BUFFER = (DATA_T*)(PARENT_LIST + kSearchWidth);
     uint32_t* counter = (uint32_t*)(QUERY_BUFFER + dim);
     uint32_t* hops = (uint32_t*)(counter + 1);
     uint32_t* stats = hops + 1;
@@ -99,7 +102,7 @@ void BeamSearch(
     }
 
     // initialize the hash table to record visited (computed) nodes
-    if (HASH_TABLE_CONFIG) hashtable_init(HASH_TABLE, BITLEN);
+    if (kHashTableConfig) hashtable_init(HASH_TABLE, kBitlen);
 
     // load query into shared memory
     for (int i = tid; i < dim; i += blockDim.x) {
@@ -107,13 +110,13 @@ void BeamSearch(
     }
     
     // load the top k list with dummy initial values
-    for (int i = tid; i < INTERNAL_TOPK; i += blockDim.x) {
+    for (int i = tid; i < kInternalTopk; i += blockDim.x) {
         TOP_K_INDEX[i] = MAX_INDEX;
         TOP_K_DISTANCE[i] = FLT_MAX;
     }
 
     // load the candidate buffer with starting points
-    for (int i = warp_id; i < CANDIDATE_BUFFER_SIZE; i += WARPS_PER_BLOCK) {
+    for (int i = warp_id; i < kCandidateBufferSize; i += WARPS_PER_BLOCK) {
         CANDIDATE_INDEX[i] = d_starting_points[i];
         DISTANCE_T dist = FLT_MAX;
         gpu_long_t l2_start = 0;
@@ -124,7 +127,7 @@ void BeamSearch(
         if (lane_id == 0) {     // warp computes, only lane 0 writes
             if (CANDIDATE_INDEX[i] != MAX_INDEX) {
                 atomicAdd(&counter[0], 1);
-                hashtable_insert(HASH_TABLE, BITLEN, CANDIDATE_INDEX[i]);
+                hashtable_insert(HASH_TABLE, kBitlen, CANDIDATE_INDEX[i]);
                 if (GPU_DISTANCE_TIMING) {
                     atomicAdd(&timing[GPU_TIMING_L2_CALLS], gpu_long_t(1));
                     atomicAdd(&timing[GPU_TIMING_L2_CYCLES], gpu_globaltimer() - l2_start);
@@ -136,27 +139,27 @@ void BeamSearch(
     __syncthreads();
     
     // loop end condition: either entire topK expanded, or reach max iteration limit
-    for (int iter = 0; iter < MAX_ITERATIONS; iter++) {
+    for (int iter = 0; iter < kMaxIterations; iter++) {
 
         // forgettable hash table management according to the CARGA paper
-        if (HASH_TABLE_CONFIG) {
+        if (kHashTableConfig) {
             if ((iter + 1) % SMALL_HASH_RESET_INTERVAL == 0) {
-                hashtable_init(HASH_TABLE, BITLEN);
+                hashtable_init(HASH_TABLE, kBitlen);
                 __syncthreads();
-                hashtable_restore(HASH_TABLE, BITLEN, TOP_K_INDEX, INTERNAL_TOPK);
+                hashtable_restore(HASH_TABLE, kBitlen, TOP_K_INDEX, active_beam);
             }
             __syncthreads();
         }
       
         // use warp level sort to find the actual closest top K elements and update the topK list
-        topk_by_bitonic_sort<2, INTERNAL_TOPK / WARP_SIZE>(ALL_INDEX, ALL_DISTANCE, RESULT_BUFFER_SIZE,
-            CANDIDATE_BUFFER_SIZE, INTERNAL_TOPK, (iter == 0));
+        topk_by_bitonic_sort<2, kInternalTopk / WARP_SIZE>(ALL_INDEX, ALL_DISTANCE, kResultBufferSize,
+            kCandidateBufferSize, kInternalTopk, (iter == 0));
         __syncthreads();
 
         // warp 0 pick the top-N unexpanded nodes and store in shared memory
         // this already marks the expanded nodes MSB to 1, no need to mark again
         if (warp_id == 0) {
-            keep_expanding = pick_expanders(SEARCH_WIDTH, PARENT_LIST, INTERNAL_TOPK, TOP_K_INDEX);
+            keep_expanding = pick_expanders(kSearchWidth, PARENT_LIST, active_beam, TOP_K_INDEX);
         }
         __syncthreads();
         if (!keep_expanding) {
@@ -182,11 +185,11 @@ void BeamSearch(
         }
         __syncthreads();
 
-        for (int i = tid; i < CANDIDATE_BUFFER_SIZE; i += blockDim.x) {
+        for (int i = tid; i < kCandidateBufferSize; i += blockDim.x) {
             INDEX_T child_id = (i < maxDegree) ? neighbors[i] : MAX_INDEX;      // only in-bound threads take from the neighbor list
 
             if (child_id != MAX_INDEX) {    // check if visited already
-                if (hashtable_insert(HASH_TABLE, BITLEN, child_id) == 0) {
+                if (hashtable_insert(HASH_TABLE, kBitlen, child_id) == 0) {
                     child_id = MAX_INDEX;
                     CANDIDATE_DISTANCE[i] = FLT_MAX;
                 } else {
@@ -198,7 +201,7 @@ void BeamSearch(
         __syncthreads();
 
         // all warps work together to compute candidate distance
-        for (int i = warp_id; i < CANDIDATE_BUFFER_SIZE; i += WARPS_PER_BLOCK) {
+        for (int i = warp_id; i < kCandidateBufferSize; i += WARPS_PER_BLOCK) {
             // visited candidates are marked as invalid
             if (CANDIDATE_INDEX[i] == MAX_INDEX) continue;
 
@@ -219,8 +222,8 @@ void BeamSearch(
     }
 
     // final sort before writeback
-    topk_by_bitonic_sort<2, INTERNAL_TOPK / WARP_SIZE>(ALL_INDEX, ALL_DISTANCE, RESULT_BUFFER_SIZE,
-        CANDIDATE_BUFFER_SIZE, INTERNAL_TOPK, false);
+    topk_by_bitonic_sort<2, kInternalTopk / WARP_SIZE>(ALL_INDEX, ALL_DISTANCE, kResultBufferSize,
+        kCandidateBufferSize, kInternalTopk, false);
     __syncthreads();
 
     // return the top K result

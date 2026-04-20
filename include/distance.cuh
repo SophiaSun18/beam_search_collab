@@ -1,8 +1,18 @@
 #pragma once
 
 #include "utils.cuh"
-#include <curand_kernel.h>
 #define MAX_DIM 128
+
+__device__ __forceinline__ uint32_t gpu_fast_rand_u32(uint32_t x) {
+    x ^= x >> 17;
+    x *= 0xed5ad4bbU;
+    x ^= x >> 11;
+    x *= 0xac4c1b51U;
+    x ^= x >> 15;
+    x *= 0x31848babU;
+    x ^= x >> 14;
+    return x;
+}
 
 template<uint32_t TEAM_SIZE>
 __device__ DISTANCE_T compute_similarity_vector_load_full(
@@ -293,9 +303,9 @@ __device__ void compute_distance_to_random_nodes(
       INDEX_T seed_index;
       if (valid_i) {
         uint32_t gid = threadIdx.x + (blockDim.x * (i + (max_i * j)));
-        curandState state;
-        curand_init(clock64(), gid, 0, &state);
-        seed_index = curand_uniform(&state) * DATASET_SIZE;
+        uint32_t seed = gid ^ static_cast<uint32_t>(clock64());
+        seed = gpu_fast_rand_u32(seed);
+        seed_index = seed % DATASET_SIZE;
       }
       auto norm2 = compute_similarity_vector_load_full<TEAM_SIZE>(dim, dataset_ptr,
           query_ptr, seed_index, valid_i);

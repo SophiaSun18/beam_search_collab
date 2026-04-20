@@ -174,7 +174,9 @@ __device__ inline void swap_if_needed(K& k0, V& v0, K& k1, V& v1, const bool asc
 
 template <class K, class V, unsigned _N, unsigned warp_size>
 __device__ inline void warp_merge_core(K k[2], V v[2], const std::uint32_t range, const bool asc) {
-  if (_N == 2) {
+  static_assert((_N & (_N - 1)) == 0, "warp_merge_core requires power-of-two lane payload");
+
+  if constexpr (_N == 2) {
     constexpr unsigned N = 2;
     const auto lane_id   = threadIdx.x % warp_size;
 
@@ -194,8 +196,8 @@ __device__ inline void warp_merge_core(K k[2], V v[2], const std::uint32_t range
     }
     const auto p = ((lane_id & b) == 0);
     swap_if_needed<float, uint32_t>(k[0], v[0], k[1], v[1], p);
-  } else if (_N == 4) {
-    constexpr unsigned N = 4;
+  } else if constexpr (_N >= 4) {
+    constexpr unsigned N = _N;
     const auto lane_id = threadIdx.x % warp_size;
     if (range == 1) {
       for (std::uint32_t b = 2; b <= N; b <<= 1) {
@@ -230,6 +232,8 @@ __device__ inline void warp_merge_core(K k[2], V v[2], const std::uint32_t range
         swap_if_needed(k[i], v[i], k[j], v[j], p);
       }
     }
+  } else {
+    static_assert(_N >= 2, "warp_merge_core unsupported payload size");
   }
 }
 
