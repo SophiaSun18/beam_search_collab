@@ -1,10 +1,10 @@
 #pragma once
 #include <cfloat>
+#include <cassert>
 #include <climits>
 #include <iostream>
 #include <stdio.h>
 #include <cuda_runtime.h>
-#include <cub/cub.cuh>
 
 #define FULL_MASK     0xffffffff
 #define BLOCK_SIZE    256
@@ -346,12 +346,12 @@ __device__ void candidate_by_bitonic_sort_inverse(
 }
 
 template <unsigned N_1, unsigned N_2>
-__device__ void topk_by_bitonic_sort(
+__device__ void topk_128_by_bitonic_sort(
     INDEX_T* result_indices_ptr,
     DISTANCE_T* result_distances_ptr,
     uint32_t RESULT_BUFFER_SIZE,
     uint32_t CANDIDATE_BUFFER_SIZE,
-    uint32_t INTERNAL_TOPK,
+    uint32_t internal_topk,
     bool first) {
   const unsigned lane_id = threadIdx.x % 32;
   const unsigned warp_id = threadIdx.x / 32;
@@ -362,8 +362,8 @@ __device__ void topk_by_bitonic_sort(
   
   DISTANCE_T key_1[N_1];
   INDEX_T val_1[N_1];
-  auto candidate_distances = result_distances_ptr + INTERNAL_TOPK;
-  auto candidate_indices = result_indices_ptr + INTERNAL_TOPK;
+  auto candidate_distances = result_distances_ptr + internal_topk;
+  auto candidate_indices = result_indices_ptr + internal_topk;
   /* Candidates -> Reg */
   for (unsigned i = 0; i < N_1; i++) {
     unsigned j = lane_id + (32 * i);
@@ -380,7 +380,7 @@ __device__ void topk_by_bitonic_sort(
   /* Reg -> Temp_itopk */
   for (unsigned i = 0; i < N_1; i++) {
     unsigned j = (N_1 * lane_id) + i;
-    if (j < CANDIDATE_BUFFER_SIZE && j < INTERNAL_TOPK) {
+    if (j < CANDIDATE_BUFFER_SIZE && j < internal_topk) {
       candidate_distances[j] = key_1[i];
       candidate_indices[j]   = val_1[i];
     }
@@ -394,7 +394,7 @@ __device__ void topk_by_bitonic_sort(
     /* Load itopk results */
     for (unsigned i = 0; i < N_2; i++) {
       unsigned j = lane_id + (32 * i);
-      if (j < INTERNAL_TOPK) {
+      if (j < internal_topk) {
         key_2[i] = result_distances_ptr[j];
         val_2[i] = result_indices_ptr[j];
       } else {
@@ -408,7 +408,7 @@ __device__ void topk_by_bitonic_sort(
     /* Load itopk results */
     for (unsigned i = 0; i < N_2; i++) {
       unsigned j = (N_2 * lane_id) + i;
-      if (j < INTERNAL_TOPK) {
+      if (j < internal_topk) {
         key_2[i] = result_distances_ptr[j];
         val_2[i] = result_indices_ptr[j];
       } else {
@@ -421,8 +421,8 @@ __device__ void topk_by_bitonic_sort(
   /* Merge candidates */
   for (unsigned i = 0; i < N_2; i++) {
     unsigned j = (N_2 * lane_id) + i;  // [0:MAX_ITOPK-1]
-    unsigned k = INTERNAL_TOPK - 1 - j;
-    if (k >= INTERNAL_TOPK || k >= CANDIDATE_BUFFER_SIZE) continue;
+    unsigned k = internal_topk - 1 - j;
+    if (k >= internal_topk || k >= CANDIDATE_BUFFER_SIZE) continue;
     auto candidate_key = candidate_distances[k];
     if (key_2[i] > candidate_key) {
       key_2[i] = candidate_key;
@@ -435,10 +435,140 @@ __device__ void topk_by_bitonic_sort(
   /* Store new itopk results */
   for (unsigned i = 0; i < N_2; i++) {
     unsigned j = (N_2 * lane_id) + i;
-    if (j < INTERNAL_TOPK) {
+    if (j < internal_topk) {
       result_distances_ptr[j] = key_2[i];
       result_indices_ptr[j]   = val_2[i];
     }
+  }
+
+  (void)RESULT_BUFFER_SIZE;
+  (void)first;
+}
+
+__device__ inline int merge_path_partition(
+    const DISTANCE_T* a,
+    int a_count,
+    const DISTANCE_T* b,
+    int b_count,
+    int diag) {
+  int low = max(0, diag - b_count);
+  int high = min(diag, a_count);
+
+  while (low <= high) {
+    const int a_idx = (low + high) >> 1;
+    const int b_idx = diag - a_idx;
+
+    const DISTANCE_T a_left = (a_idx > 0) ? a[a_idx - 1] : -FLT_MAX;
+    const DISTANCE_T a_right = (a_idx < a_count) ? a[a_idx] : FLT_MAX;
+    const DISTANCE_T b_left = (b_idx > 0) ? b[b_idx - 1] : -FLT_MAX;
+    const DISTANCE_T b_right = (b_idx < b_count) ? b[b_idx] : FLT_MAX;
+
+    if (a_left > b_right) {
+      high = a_idx - 1;
+    } else if (b_left > a_right) {
+      low = a_idx + 1;
+    } else {
+      return a_idx;
+    }
+  }
+
+  return low;
+}
+
+template <unsigned N_1, unsigned N_2>
+__device__ void topk_by_candidate_sort_and_merge(
+    INDEX_T* result_indices_ptr,
+    DISTANCE_T* result_distances_ptr,
+    uint32_t RESULT_BUFFER_SIZE,
+    uint32_t CANDIDATE_BUFFER_SIZE,
+    uint32_t internal_topk,
+    bool first) {
+  __shared__ DISTANCE_T candidate_snapshot_dist_shared[64];
+  __shared__ INDEX_T candidate_snapshot_index_shared[64];
+  __shared__ DISTANCE_T merged_topk_dist_shared[N_2 * WARP_SIZE];
+  __shared__ INDEX_T merged_topk_index_shared[N_2 * WARP_SIZE];
+
+  auto candidate_indices = result_indices_ptr + internal_topk;
+  auto candidate_distances = result_distances_ptr + internal_topk;
+
+  candidate_by_bitonic_sort<N_1, 0>(candidate_indices, candidate_distances, CANDIDATE_BUFFER_SIZE);
+  __syncthreads();
+
+  for (unsigned i = threadIdx.x; i < CANDIDATE_BUFFER_SIZE; i += blockDim.x) {
+    candidate_snapshot_dist_shared[i] = candidate_distances[i];
+    candidate_snapshot_index_shared[i] = candidate_indices[i];
+  }
+  __syncthreads();
+
+  constexpr int kItemsPerThread = 4;
+  int active_threads = (internal_topk + kItemsPerThread - 1) / kItemsPerThread;
+  active_threads = min(static_cast<int>(blockDim.x),
+                       ((active_threads + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE);
+
+  if (threadIdx.x < active_threads) {
+    const int out_begin =
+        min(internal_topk, (static_cast<int>(threadIdx.x) * internal_topk) / active_threads);
+    const int out_end =
+        min(internal_topk, (static_cast<int>(threadIdx.x + 1) * internal_topk) / active_threads);
+
+    const int top_begin = merge_path_partition(
+        result_distances_ptr, static_cast<int>(internal_topk),
+        candidate_snapshot_dist_shared, static_cast<int>(CANDIDATE_BUFFER_SIZE),
+        out_begin);
+    const int top_end = merge_path_partition(
+        result_distances_ptr, static_cast<int>(internal_topk),
+        candidate_snapshot_dist_shared, static_cast<int>(CANDIDATE_BUFFER_SIZE),
+        out_end);
+
+    int top_i = top_begin;
+    int cand_i = out_begin - top_begin;
+    const int cand_end = out_end - top_end;
+
+    for (int out_i = out_begin; out_i < out_end; ++out_i) {
+      const bool take_topk =
+          (cand_i >= cand_end) ||
+          (top_i < top_end &&
+           result_distances_ptr[top_i] <= candidate_snapshot_dist_shared[cand_i]);
+
+      if (take_topk) {
+        merged_topk_dist_shared[out_i] = result_distances_ptr[top_i];
+        merged_topk_index_shared[out_i] = result_indices_ptr[top_i];
+        ++top_i;
+      } else {
+        merged_topk_dist_shared[out_i] = candidate_snapshot_dist_shared[cand_i];
+        merged_topk_index_shared[out_i] = candidate_snapshot_index_shared[cand_i];
+        ++cand_i;
+      }
+    }
+  }
+  __syncthreads();
+
+  for (unsigned i = threadIdx.x; i < internal_topk; i += blockDim.x) {
+    result_distances_ptr[i] = merged_topk_dist_shared[i];
+    result_indices_ptr[i] = merged_topk_index_shared[i];
+  }
+  __syncthreads();
+
+  (void)RESULT_BUFFER_SIZE;
+  (void)first;
+}
+
+template <unsigned N_1, unsigned N_2>
+__device__ void topk_by_sort_candidates_and_merge(
+    INDEX_T* result_indices_ptr,
+    DISTANCE_T* result_distances_ptr,
+    uint32_t RESULT_BUFFER_SIZE,
+    uint32_t CANDIDATE_BUFFER_SIZE,
+    uint32_t internal_topk,
+    bool first) {
+  if constexpr (N_2 == 2 || N_2 == 4) {
+    topk_128_by_bitonic_sort<N_1, N_2>(
+        result_indices_ptr, result_distances_ptr, RESULT_BUFFER_SIZE,
+        CANDIDATE_BUFFER_SIZE, internal_topk, first);
+  } else {
+    topk_by_candidate_sort_and_merge<N_1, N_2>(
+        result_indices_ptr, result_distances_ptr, RESULT_BUFFER_SIZE,
+        CANDIDATE_BUFFER_SIZE, internal_topk, first);
   }
 }
 

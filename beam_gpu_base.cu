@@ -10,6 +10,7 @@
 #endif
 
 #include <chrono>
+#include <array>
 #include <cfloat>
 #include <vector>
 

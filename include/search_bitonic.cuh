@@ -152,7 +152,7 @@ void BeamSearch(
         }
       
         // use warp level sort to find the actual closest top K elements and update the topK list
-        topk_by_bitonic_sort<2, INTERNAL_TOPK / WARP_SIZE>(ALL_INDEX, ALL_DISTANCE, RESULT_BUFFER_SIZE,
+        topk_by_sort_candidates_and_merge<2, INTERNAL_TOPK / WARP_SIZE>(ALL_INDEX, ALL_DISTANCE, RESULT_BUFFER_SIZE,
             CANDIDATE_BUFFER_SIZE, INTERNAL_TOPK, (iter == 0));
         __syncthreads();
 
@@ -256,7 +256,7 @@ void BeamSearch(
     }
 
     // final sort before writeback
-    topk_by_bitonic_sort<2, INTERNAL_TOPK / WARP_SIZE>(ALL_INDEX, ALL_DISTANCE, RESULT_BUFFER_SIZE,
+    topk_by_sort_candidates_and_merge<2, INTERNAL_TOPK / WARP_SIZE>(ALL_INDEX, ALL_DISTANCE, RESULT_BUFFER_SIZE,
         CANDIDATE_BUFFER_SIZE, INTERNAL_TOPK, false);
     __syncthreads();
 
