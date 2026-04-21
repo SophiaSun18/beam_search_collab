@@ -38,6 +38,10 @@ static __host__ inline uint32_t calculate_shared_mem_size(int dim, int topk, int
     if (GPU_SEARCH_STATS) {
         size += GPU_SEARCH_STAT_COUNT * sizeof(uint32_t);   // search stats
     }
+    size += topk * sizeof(INDEX_T);                         // result pool index
+    size += topk * sizeof(DISTANCE_T);                      // result pool distance
+    size += 2 * sizeof(uint32_t);                           // result pool size and worst idx
+    size += sizeof(DISTANCE_T);                             // result pool worst dist
 #if GPU_DISTANCE_TIMING
     size = align_up(size, alignof(gpu_long_t));             // align timing stats
     size += GPU_TIMING_COUNT * sizeof(gpu_long_t);          // timing stats
@@ -104,9 +108,14 @@ void QuantizedBeamSearch(
     uint32_t* counter = reinterpret_cast<uint32_t*>(STAGED_FACTOR_BUFFER + 3 * max_degree);
     uint32_t* hops = counter + 1;
     uint32_t* stats = hops + 1;
+    INDEX_T* RESULT_POOL_INDEX = reinterpret_cast<INDEX_T*>(stats + (GPU_SEARCH_STATS ? GPU_SEARCH_STAT_COUNT : 0));
+    DISTANCE_T* RESULT_POOL_DISTANCE = reinterpret_cast<DISTANCE_T*>(RESULT_POOL_INDEX + K);
+    uint32_t* result_pool_size = reinterpret_cast<uint32_t*>(RESULT_POOL_DISTANCE + K);
+    uint32_t* result_pool_worst_idx = result_pool_size + 1;
+    DISTANCE_T* result_pool_worst_dist = reinterpret_cast<DISTANCE_T*>(result_pool_worst_idx + 1);
     gpu_long_t* timing = nullptr;
 #if GPU_DISTANCE_TIMING
-    char* timing_base = reinterpret_cast<char*>(stats + (GPU_SEARCH_STATS ? GPU_SEARCH_STAT_COUNT : 0));
+    char* timing_base = reinterpret_cast<char*>(result_pool_worst_dist + 1);
     timing_base = reinterpret_cast<char*>((reinterpret_cast<uintptr_t>(timing_base) + alignof(gpu_long_t) - 1) &
                                           ~(static_cast<uintptr_t>(alignof(gpu_long_t)) - 1));
     timing = reinterpret_cast<gpu_long_t*>(timing_base);
@@ -132,6 +141,9 @@ void QuantizedBeamSearch(
                 stats[i] = 0;
             }
         }
+        result_pool_size[0] = 0;
+        result_pool_worst_idx[0] = 0;
+        result_pool_worst_dist[0] = -FLT_MAX;
         if (GPU_DISTANCE_TIMING) {
             for (int i = 0; i < GPU_TIMING_COUNT; i++) {
                 timing[i] = 0;
@@ -151,6 +163,10 @@ void QuantizedBeamSearch(
     for (int i = tid; i < RESULT_BUFFER_SIZE; i += blockDim.x) {
         ALL_INDEX[i] = MAX_INDEX;
         ALL_DISTANCE[i] = FLT_MAX;
+    }
+    for (int i = tid; i < K; i += blockDim.x) {
+        RESULT_POOL_INDEX[i] = MAX_INDEX;
+        RESULT_POOL_DISTANCE[i] = FLT_MAX;
     }
 
     // only the first slot in candidate list is actually initialized with valid entry point
@@ -231,21 +247,10 @@ void QuantizedBeamSearch(
             atomicAdd(&timing[GPU_TIMING_PICK_CYCLES], gpu_globaltimer() - pick_start);
         }
 
-        if (debug_mode && query_id == 0 && tid == 0) {
-            const INDEX_T parent_slot = PARENT_LIST[0];
-            const INDEX_T parent_raw =
-                (keep_expanding && parent_slot < INTERNAL_TOPK) ? TOP_K_INDEX[parent_slot] : MAX_INDEX;
-            const DISTANCE_T parent_dist =
-                (keep_expanding && parent_slot < INTERNAL_TOPK) ? TOP_K_DISTANCE[parent_slot] : FLT_MAX;
-            if (keep_expanding) {
-                printf("  expanding node: %u\n", parent_raw & 0x7fffffff);
-                printf("  expanding slot: %u, dist=%.6f\n", parent_slot, parent_dist);
-            } else {
+        if (!keep_expanding) {
+            if (debug_mode && query_id == 0 && tid == 0) {
                 printf("  expanding node: none\n");
             }
-        }
-
-        if (!keep_expanding) {
             if (tid == 0) {
                 hops[0] = iter;
             }
@@ -263,6 +268,14 @@ void QuantizedBeamSearch(
         if (!current_expanded) {
             continue;
         }
+
+        if (debug_mode && query_id == 0 && tid == 0) {
+            const INDEX_T parent_slot = PARENT_LIST[0];
+            const DISTANCE_T parent_dist =
+                (parent_slot < INTERNAL_TOPK) ? TOP_K_DISTANCE[parent_slot] : FLT_MAX;
+            printf("  expanding node: %u\n", current_node);
+            printf("  expanding slot: %u, dist=%.6f\n", parent_slot, parent_dist);
+        }
         const float* current_row = d_qg_data + static_cast<size_t>(current_node) * row_offset;
         const vidType* current_neighbors = reinterpret_cast<const vidType*>(current_row + neighbor_offset);
         const uint64_t* current_codes = reinterpret_cast<const uint64_t*>(current_row + code_offset);
@@ -278,6 +291,22 @@ void QuantizedBeamSearch(
         if (GPU_SEARCH_STATS && tid == 0) {
             stats[GPU_SEARCH_STAT_ITERATIONS]++;
             stats[GPU_SEARCH_STAT_DIST_CMPS]++;
+        }
+        gpu_long_t result_pool_start = 0;
+        if (GPU_DISTANCE_TIMING && tid == 0) result_pool_start = gpu_globaltimer();
+        if (tid == 0) {
+            result_pool_push_unique_unsorted(
+                RESULT_POOL_INDEX,
+                RESULT_POOL_DISTANCE,
+                result_pool_size,
+                result_pool_worst_idx,
+                result_pool_worst_dist,
+                K,
+                current_node,
+                exact_dist);
+        }
+        if (GPU_DISTANCE_TIMING && tid == 0) {
+            atomicAdd(&timing[GPU_TIMING_RESULT_POOL_CYCLES], gpu_globaltimer() - result_pool_start);
         }
         gpu_long_t visited_start = 0;
         if (GPU_DISTANCE_TIMING && tid == 0) visited_start = gpu_globaltimer();
@@ -375,18 +404,23 @@ void QuantizedBeamSearch(
     if (tid == 0) {
 
         if (debug_mode && query_id == 0) {
-            printf("[DEBUG] final frontier topk\n");
-            for (int i = 0; i < K; ++i) {
-                printf("  idx=%d, node=%u, dist=%.6f, expanded=%s\n",
+            printf("[DEBUG] final result pool\n");
+            for (uint32_t i = 0; i < result_pool_size[0]; ++i) {
+                printf("  idx=%u, node=%u, dist=%.6f\n",
                        i,
-                       TOP_K_INDEX[i] & 0x7fffffff,
-                       TOP_K_DISTANCE[i],
-                       (TOP_K_INDEX[i] & 0x80000000u) ? "true" : "false");
+                       RESULT_POOL_INDEX[i],
+                       RESULT_POOL_DISTANCE[i]);
             }
         }
 
+        const uint32_t pool_size = result_pool_size[0];
         for (int i = 0; i < K; ++i) {
-            d_results[query_id * K + i] = TOP_K_INDEX[i] & 0x7fffffff;
+            if (i < static_cast<int>(pool_size)) {
+                d_results[query_id * K + i] = RESULT_POOL_INDEX[i];
+            } else {
+                // if there's not enough value in result pool, fill the rest with other top K
+                d_results[query_id * K + i] = TOP_K_INDEX[i] & 0x7fffffff;
+            }
         }
         if (GPU_SEARCH_STATS) {
             stats[GPU_SEARCH_STAT_DIST_EST] = counter[0];

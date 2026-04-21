@@ -555,6 +555,75 @@ static __device__ uint32_t pick_expanders(int N, INDEX_T* output_list, int M, IN
   return num_exp;
 }
 
+static __device__ inline void result_pool_recompute_worst(
+    const DISTANCE_T* pool_distance,
+    uint32_t pool_size,
+    uint32_t* worst_idx,
+    DISTANCE_T* worst_dist) {
+  if (pool_size == 0) {
+    *worst_idx = 0;
+    *worst_dist = -FLT_MAX;
+    return;
+  }
+  uint32_t local_worst_idx = 0;
+  DISTANCE_T local_worst_dist = pool_distance[0];
+  for (uint32_t i = 1; i < pool_size; ++i) {
+    if (pool_distance[i] > local_worst_dist) {
+      local_worst_dist = pool_distance[i];
+      local_worst_idx = i;
+    }
+  }
+  *worst_idx = local_worst_idx;
+  *worst_dist = local_worst_dist;
+}
+
+static __device__ inline void result_pool_push_unique_unsorted(
+    INDEX_T* pool_index,
+    DISTANCE_T* pool_distance,
+    uint32_t* pool_size,
+    uint32_t* worst_idx,
+    DISTANCE_T* worst_dist,
+    int capacity,
+    INDEX_T node,
+    DISTANCE_T distance) {
+  uint32_t size = *pool_size;
+
+  if (size < static_cast<uint32_t>(capacity)) {
+    pool_index[size] = node;
+    pool_distance[size] = distance;
+    *pool_size = size + 1;
+    if (size == 0 || distance > *worst_dist) {
+      *worst_idx = size;
+      *worst_dist = distance;
+    }
+    return;
+  }
+
+  if (distance >= *worst_dist) return;
+
+  pool_index[*worst_idx] = node;
+  pool_distance[*worst_idx] = distance;
+  result_pool_recompute_worst(pool_distance, size, worst_idx, worst_dist);
+}
+
+static __device__ inline void result_pool_sort_small(
+    INDEX_T* pool_index,
+    DISTANCE_T* pool_distance,
+    uint32_t pool_size) {
+  for (uint32_t i = 1; i < pool_size; ++i) {
+    INDEX_T key_index = pool_index[i];
+    DISTANCE_T key_dist = pool_distance[i];
+    int j = static_cast<int>(i) - 1;
+    while (j >= 0 && pool_distance[j] > key_dist) {
+      pool_distance[j + 1] = pool_distance[j];
+      pool_index[j + 1] = pool_index[j];
+      --j;
+    }
+    pool_distance[j + 1] = key_dist;
+    pool_index[j + 1] = key_index;
+  }
+}
+
 /*-------------------------------------------- rabitq --------------------------------------------*/
 static __device__ inline void rotate_vector_gpu(const float* src, float* dst,
    const float* signs, int dim, int padded_dim) {
