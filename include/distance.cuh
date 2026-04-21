@@ -323,7 +323,7 @@ __device__ void compute_distance_to_random_nodes(
   }
 }
 
-template <uint32_t TEAM_SIZE, uint32_t INTERNAL_TOPK>
+template <uint32_t TEAM_SIZE, uint32_t INTERNAL_TOPK_SIZE>
 __device__ void compute_distance_to_child_nodes(
     uint32_t dim,
     INDEX_T* parent_buffer,
@@ -352,7 +352,7 @@ __device__ void compute_distance_to_child_nodes(
     //if (blockIdx.x == 0 && threadIdx.x < 4) printf("block %d, thread %d expanding node %d 's %d th child node %d \n", blockIdx.x, i, parent_id, i, child_id);
     if (!HASH_TABLE_CONFIG) {
       // check with internal topk
-      for (int32_t internal_topk_ptr = 0; internal_topk_ptr < INTERNAL_TOPK; internal_topk_ptr++) {
+      for (int32_t internal_topk_ptr = 0; internal_topk_ptr < INTERNAL_TOPK_SIZE; internal_topk_ptr++) {
         INDEX_T internal_topk_id = internal_topk_list[internal_topk_ptr] & ~index_msb_1_mask;
         if (child_id == internal_topk_id) {
           child_id = invalid_index;

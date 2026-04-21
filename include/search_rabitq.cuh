@@ -116,6 +116,7 @@ void QuantizedBeamSearch(
 
     // initialize the block-wise total distance computation count
     __shared__ uint32_t keep_expanding;
+    __shared__ uint32_t current_expanded;
     if (tid == 0) {
         qf.rotated_query = ROTATED_QUERY_BUFFER;
         qf.quantized_query = QUANTIZED_QUERY_BUFFER;
@@ -138,7 +139,7 @@ void QuantizedBeamSearch(
         }
     }
 
-    // initialize the hash table to record visited (computed) nodes
+    // initialize the hash table to record expanded nodes
     if (HASH_TABLE_CONFIG) hashtable_init(HASH_TABLE, BITLEN);
 
     // load query into shared memory
@@ -162,7 +163,6 @@ void QuantizedBeamSearch(
             atomicAdd(&timing[GPU_TIMING_L2_CALLS], gpu_long_t(1));
             atomicAdd(&timing[GPU_TIMING_L2_CYCLES], gpu_globaltimer() - l2_start);
         }
-        hashtable_insert(HASH_TABLE, BITLEN, entry_point);
     }
     __syncthreads();
 
@@ -183,7 +183,7 @@ void QuantizedBeamSearch(
             if ((iter + 1) % SMALL_HASH_RESET_INTERVAL == 0) {
                 hashtable_init(HASH_TABLE, BITLEN);
                 __syncthreads();
-                hashtable_restore(HASH_TABLE, BITLEN, TOP_K_INDEX, INTERNAL_TOPK);
+                hashtable_restore_expand_only(HASH_TABLE, BITLEN, TOP_K_INDEX, INTERNAL_TOPK);
             }
             __syncthreads();
         }
@@ -255,6 +255,14 @@ void QuantizedBeamSearch(
         // collect the neighbors of the expanding node and add into candidate list if not visited before
         // make sure to mark the invalid neighbor using dummy large values
         INDEX_T current_node = TOP_K_INDEX[PARENT_LIST[0]] & 0x7fffffff;
+
+        if (tid == 0) {
+            current_expanded = hashtable_insert(HASH_TABLE, BITLEN, current_node);
+        }
+        __syncthreads();
+        if (!current_expanded) {
+            continue;
+        }
         const float* current_row = d_qg_data + static_cast<size_t>(current_node) * row_offset;
         const vidType* current_neighbors = reinterpret_cast<const vidType*>(current_row + neighbor_offset);
         const uint64_t* current_codes = reinterpret_cast<const uint64_t*>(current_row + code_offset);
@@ -274,17 +282,12 @@ void QuantizedBeamSearch(
         gpu_long_t visited_start = 0;
         if (GPU_DISTANCE_TIMING && tid == 0) visited_start = gpu_globaltimer();
         for (int i = tid; i < CANDIDATE_BUFFER_SIZE; i += blockDim.x) {
-            INDEX_T child_id = (i < max_degree) ? current_neighbors[i] : MAX_INDEX;      // only in-bound threads take from the neighbor list
-
-            if (child_id != MAX_INDEX) {    // check if visited already
-                if (hashtable_insert(HASH_TABLE, BITLEN, child_id) == 0) {
-                    child_id = MAX_INDEX;
-                    CANDIDATE_DISTANCE[i] = FLT_MAX;
-                } else {
-                    CANDIDATE_DISTANCE[i] = 0;
-                }
+            INDEX_T child_id = (i < max_degree) ? current_neighbors[i] : MAX_INDEX;
+            if (child_id != MAX_INDEX && hashtable_contains(HASH_TABLE, BITLEN, child_id)) {
+                child_id = MAX_INDEX;
             }
             CANDIDATE_INDEX[i] = child_id;
+            CANDIDATE_DISTANCE[i] = (child_id == MAX_INDEX) ? FLT_MAX : 0;
         }
         __syncthreads();
         if (GPU_DISTANCE_TIMING && tid == 0) {

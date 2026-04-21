@@ -476,6 +476,23 @@ __device__ inline uint32_t hashtable_insert(INDEX_T* const table, const unsigned
   return 0;
 }
 
+__device__ inline uint32_t hashtable_contains(INDEX_T* const table, const unsigned bitlen, const INDEX_T key) {
+    const uint32_t size     = hashtable_getsize(bitlen);
+    const uint32_t bit_mask = size - 1;
+
+    INDEX_T index             = (key ^ (key >> bitlen)) & bit_mask;
+    constexpr uint32_t stride = 1;
+
+    // only check if the slot is filled, no actual insertion
+    for (unsigned i = 0; i < size; i++) {
+        const INDEX_T old = table[index];
+        if (old == key) return 1;
+        if (old == ~static_cast<INDEX_T>(0)) return 0;
+        index = (index + stride) & bit_mask;
+    }
+    return 0;
+}
+
 __device__ inline void hashtable_restore(   
     INDEX_T* const table, 
     const unsigned BITLEN,
@@ -486,6 +503,23 @@ __device__ inline void hashtable_restore(
   if (threadIdx.x < first_tid) return;
   for (unsigned i = threadIdx.x - first_tid; i < itopk_size; i += blockDim.x - first_tid) {
     auto key = itopk_indices[i] & ~index_msb_1_mask;  // clear most significant bit
+    hashtable_insert(table, BITLEN, key);
+  }
+}
+
+__device__ inline void hashtable_restore_expand_only(
+    INDEX_T* const table,
+    const unsigned BITLEN,
+    const INDEX_T* itopk_indices,
+    const uint32_t itopk_size,
+    const uint32_t first_tid = 0) {
+  constexpr INDEX_T index_msb_1_mask = 0x80000000;
+  if (threadIdx.x < first_tid) return;
+  for (unsigned i = threadIdx.x - first_tid; i < itopk_size; i += blockDim.x - first_tid) {
+    const INDEX_T raw = itopk_indices[i];
+    // only restore nodes that are expanded already (MSB is 0)
+    if ((raw & index_msb_1_mask) == 0 || raw == MAX_INDEX) continue;
+    const INDEX_T key = raw & ~index_msb_1_mask;
     hashtable_insert(table, BITLEN, key);
   }
 }
