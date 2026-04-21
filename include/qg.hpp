@@ -448,7 +448,8 @@ public:
 
     void gpu_search(int nq, const float* queries, int K, float* result_vec,
                     vidType* result_idx, int beam_sz, double& elapsed,
-                    GpuRunStats* gpu_stats = nullptr);
+                    GpuRunStats* gpu_stats = nullptr,
+                    bool debug_mode = false);
 
 private:
     void init_layout(bool bins_mode) {

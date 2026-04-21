@@ -43,6 +43,7 @@ int main(int argc, char** argv) {
     double elapsed = 0.0;
     int K = 100;
     int beam_size = 128;
+    bool debug_mode = false;
     string csv_file;
     GpuRunStats gpu_stats;
 
@@ -59,6 +60,16 @@ int main(int argc, char** argv) {
             string arg = argv[arg_idx];
             if (arg == "-csv" && arg_idx + 1 < argc) {
                 csv_file = argv[++arg_idx];
+            } else if (arg == "-debug" && arg_idx + 1 < argc) {
+                string debug_arg = argv[++arg_idx];
+                if (debug_arg == "on" || debug_arg == "1" || debug_arg == "true") {
+                    debug_mode = true;
+                } else if (debug_arg == "off" || debug_arg == "0" || debug_arg == "false") {
+                    debug_mode = false;
+                } else {
+                    cerr << "Error: -debug must be one of on, off, 1, 0, true, false.\n";
+                    return 1;
+                }
             } else {
                 cerr << "Unknown argument: " << arg << "\n";
                 return 1;
@@ -75,6 +86,10 @@ int main(int argc, char** argv) {
 
         int query_dim = 0;
         queries = IndexGraph<float>::load_queries(query_file, nq, query_dim);
+        if (debug_mode) {
+            cout << "[DEBUG] debug mode enabled: running only query 0\n";
+            nq = std::min<size_t>(nq, 1);
+        }
         if (nq > 10000) {
             cout << "Limiting queries to 10000\n";
             nq = 10000;
@@ -85,7 +100,7 @@ int main(int argc, char** argv) {
         results.resize(nq * K);
         distances.resize(nq * K);
         
-        index.search(static_cast<int>(nq), queries.data(), K, distances.data(), results.data(), beam_size, elapsed, &gpu_stats);
+        index.search(static_cast<int>(nq), queries.data(), K, distances.data(), results.data(), beam_size, elapsed, &gpu_stats, debug_mode);
     } else if (mode == "gpu_rabitq") {
         if (argc < 6) {
             cerr << "gpu_rabitq requires: <mode> <data> <query> <gt> <qg_codebook> [K] [beam_size] [degree] [-csv output.csv]\n";
@@ -101,6 +116,16 @@ int main(int argc, char** argv) {
             string arg = argv[arg_idx];
             if (arg == "-csv" && arg_idx + 1 < argc) {
                 csv_file = argv[++arg_idx];
+            } else if (arg == "-debug" && arg_idx + 1 < argc) {
+                string debug_arg = argv[++arg_idx];
+                if (debug_arg == "on" || debug_arg == "1" || debug_arg == "true") {
+                    debug_mode = true;
+                } else if (debug_arg == "off" || debug_arg == "0" || debug_arg == "false") {
+                    debug_mode = false;
+                } else {
+                    cerr << "Error: -debug must be one of on, off, 1, 0, true, false.\n";
+                    return 1;
+                }
             } else {
                 cerr << "Unknown argument: " << arg << "\n";
                 return 1;
@@ -116,6 +141,10 @@ int main(int argc, char** argv) {
 
         int query_dim = 0;
         queries = IndexGraph<float>::load_queries(query_file, nq, query_dim);
+        if (debug_mode) {
+            cout << "[DEBUG] debug mode enabled: running only query 0\n";
+            nq = std::min<size_t>(nq, 1);
+        }
         if (nq > 10000) {
             cout << "Limiting queries to 10000\n";
             nq = 10000;
@@ -127,7 +156,7 @@ int main(int argc, char** argv) {
         distances.resize(nq * K);
 
         QuantizationGraph qg(index.ntotal, index.d, degree, qg_codebook);
-        qg.gpu_search(static_cast<int>(nq), queries.data(), K, distances.data(), results.data(), beam_size, elapsed, &gpu_stats);
+        qg.gpu_search(static_cast<int>(nq), queries.data(), K, distances.data(), results.data(), beam_size, elapsed, &gpu_stats, debug_mode);
     } else {
         cerr << "Unknown mode: " << mode << "\n";
         return 1;

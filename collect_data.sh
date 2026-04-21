@@ -66,20 +66,30 @@ esac
 # --------------------------------------------
 # Build only the selected binary
 # --------------------------------------------
-echo "Cleaning and building $MAKE_TARGET ..."
-make clean
-make "$MAKE_TARGET"
-# make preprocess_rabitq
-echo "Build done."
+if [[ "$RUN_TARGET" == "all" ]]; then
+    echo "Cleaning and building cpu ..."
+    make clean
+    make cpu EXTRA_NVFLAGS="${EXTRA_NVFLAGS_OVERRIDE:-}"
+    echo "CPU build done."
+elif [[ "$RUN_TARGET" != "gpu_base" && "$RUN_TARGET" != "gpu_rabitq" ]]; then
+    echo "Cleaning and building $MAKE_TARGET ..."
+    make clean
+    make "$MAKE_TARGET" EXTRA_NVFLAGS="${EXTRA_NVFLAGS_OVERRIDE:-}"
+    echo "Build done."
+fi
 
 # --------------------------------------------
 # Configurations
 # --------------------------------------------
 THREADS=(16)
-TOPK=100
-DEGREE=32
+TOPK="${TOPK_OVERRIDE:-100}"
+DEGREE="${DEGREE_OVERRIDE:-32}"
 # BEAM_SIZES=(100 150 200 250 300 400 500 600 700 800 1000)
-BEAM_SIZES=(100 200 300 400 500 600)
+if [ -n "${BEAM_SIZES_OVERRIDE:-}" ]; then
+    IFS=',' read -r -a BEAM_SIZES <<< "$BEAM_SIZES_OVERRIDE"
+else
+    BEAM_SIZES=(128 256)
+fi
 # PRUNE_RATIOS=(0 0.125 0.25 0.375 0.5 0.625 0.75 0.875)
 PRUNE_RATIOS=(0)
 # APPROX_RATIOS=(0.1 0.2 0.3 0.4 0.5)
@@ -89,6 +99,7 @@ L2_START_ITERS=0
 L2_END_ITER=0
 L2_PERIOD=0
 RERANK_TOP_M=1
+# TRIALS=${TRIALS_OVERRIDE:-1}
 TRIALS=1
 MODE="sequential"               # "fastscan" = enabled, "sequential" = fastscan disabled
 RABITQ_LOAD_MODE="codebook"  # "bins" = -graph + -rabitq + -sign, "codebook" = -qg
@@ -97,7 +108,8 @@ STEP_EFFICIENCY="off"         # "on" = write per-step exact-distance reduction s
 ACC32=""
 
 BIN_DIR="bin"
-RESULT_ROOT="result/4.17FixGPUBeamSize256"
+RESULT_ROOT="${RESULT_ROOT_OVERRIDE:-result/4.18GpuRabitqDEBUG3WithResultPool}"
+# RESULT_ROOT="${RESULT_ROOT_OVERRIDE:-result/4.16GPUTensorCore_2}"
 
 # --------------------------------------------
 # List of dataset prefixes and K values
@@ -105,6 +117,20 @@ RESULT_ROOT="result/4.17FixGPUBeamSize256"
 DATASETS=("sift" 32)
 # DATASETS=("sift" 32 "gist" 32 "deep10m" 32 "deep1M" 32)
 # DATASETS=("sift10m" 32 "gist" 32 "deep10m" 32 "deep1M" 32)
+
+build_gpu_for_beam() {
+    local beam="$1"
+    local extra_nvflags="${EXTRA_NVFLAGS_OVERRIDE:-}"
+    if [ -n "$extra_nvflags" ]; then
+        extra_nvflags="$extra_nvflags -DINTERNAL_TOPK=$beam"
+    else
+        extra_nvflags="-DINTERNAL_TOPK=$beam"
+    fi
+    echo "Cleaning and building gpu with INTERNAL_TOPK=$beam ..."
+    make clean
+    make gpu EXTRA_NVFLAGS="$extra_nvflags"
+    echo "Build done for INTERNAL_TOPK=$beam."
+}
 
 # ============================================================
 # Function: Preprocess RaBitQ
@@ -368,6 +394,7 @@ run_gpu_base() {
     CSV_FILE="${LOG_ROOT}/${PREFIX}_deg${K}_top${TOPK}_${BIN_NAME}.csv"
 
     for beam in "${BEAM_SIZES[@]}"; do
+        build_gpu_for_beam "$beam"
         LOG_FILE="${LOG_ROOT_2}/${BIN_NAME}_beam${beam}_topk${TOPK}.log"
         > "$LOG_FILE"
 
@@ -383,6 +410,7 @@ run_gpu_base() {
                 "$GRAPH_FILE" \
                 "$TOPK" \
                 "$beam" \
+                -debug "$DEBUG_MODE" \
                 -csv "$CSV_FILE" >> "$LOG_FILE" 2>&1
 
             "$BINARY" \
@@ -393,6 +421,7 @@ run_gpu_base() {
                 "$GRAPH_FILE" \
                 "$TOPK" \
                 "$beam" \
+                -debug "$DEBUG_MODE" \
                 -csv "$CSV_FILE" >> "$LOG_FILE" 2>&1
 
             echo >> "$LOG_FILE"
@@ -409,6 +438,7 @@ run_gpu_rabitq() {
     CSV_FILE="${LOG_ROOT}/${PREFIX}_deg${K}_top${TOPK}_${BIN_NAME}.csv"
 
     for beam in "${BEAM_SIZES[@]}"; do
+        build_gpu_for_beam "$beam"
         LOG_FILE="${LOG_ROOT_2}/${BIN_NAME}_beam${beam}_topk${TOPK}_degree${DEGREE}.log"
         > "$LOG_FILE"
 
@@ -425,6 +455,7 @@ run_gpu_rabitq() {
                 "$TOPK" \
                 "$beam" \
                 "$DEGREE" \
+                -debug "$DEBUG_MODE" \
                 -csv "$CSV_FILE" >> "$LOG_FILE" 2>&1
 
             "$BINARY" \
@@ -436,6 +467,7 @@ run_gpu_rabitq() {
                 "$TOPK" \
                 "$beam" \
                 "$DEGREE" \
+                -debug "$DEBUG_MODE" \
                 -csv "$CSV_FILE" >> "$LOG_FILE" 2>&1
 
             echo >> "$LOG_FILE"

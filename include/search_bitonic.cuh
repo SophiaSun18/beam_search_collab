@@ -2,7 +2,9 @@
 #include "utils.cuh"
 #include "distance.cuh"
 #include <cuda_runtime.h>
+#ifndef INTERNAL_TOPK
 #define INTERNAL_TOPK   128
+#endif
 #define SEARCH_WIDTH    1     // MAX: 2 nodes * 32 degree = 64 neighbors = CANDIDATE_BUFFER_SIZE
 #define BITLEN          10
 #define MAX_ITERATIONS  1024
@@ -12,7 +14,7 @@
 #define THRESHOLD_CONFIG    0
 #define HASH_TABLE_CONFIG   1
 #define CANDIDATE_BUFFER_SIZE 64
-#define RESULT_BUFFER_SIZE INTERNAL_TOPK + CANDIDATE_BUFFER_SIZE
+#define RESULT_BUFFER_SIZE (INTERNAL_TOPK + CANDIDATE_BUFFER_SIZE)
 
 static __host__ inline uint32_t calculate_shared_mem_size(int dim, int topk, int max_deg, 
                                                            int search_width, int bitlen) {
@@ -52,7 +54,8 @@ void BeamSearch(
     vid_t* d_starting_points,
     vid_t* d_seed_map,
     uint32_t* d_sign_bit,
-    GraphGPU<vid_t> gg
+    GraphGPU<vid_t> gg,
+    bool debug_mode
 ) {
     // basic information about this block and thread
     const int query_id = blockIdx.x;
@@ -153,12 +156,46 @@ void BeamSearch(
             CANDIDATE_BUFFER_SIZE, INTERNAL_TOPK, (iter == 0));
         __syncthreads();
 
+        if (debug_mode && query_id == 0 && tid == 0) {
+            printf("[DEBUG] iteration %d\n", iter + 1);
+            printf("  beam state:\n");
+            for (int i = 0; i < INTERNAL_TOPK; ++i) {
+                const INDEX_T raw = TOP_K_INDEX[i];
+                const bool expanded = (raw & 0x80000000u) != 0;
+                printf("    idx=%d, node=%u, dist=%.6f, expanded=%s\n",
+                       i,
+                       raw & 0x7fffffff,
+                       TOP_K_DISTANCE[i],
+                       expanded ? "true" : "false");
+            }
+            printf("  candidate buffer:\n");
+            for (int i = 0; i < CANDIDATE_BUFFER_SIZE; ++i) {
+                printf("    idx=%d, node=%u, dist=%.6f\n",
+                       i,
+                       CANDIDATE_INDEX[i] & 0x7fffffff,
+                       CANDIDATE_DISTANCE[i]);
+            }
+        }
+
         // warp 0 pick the top-N unexpanded nodes and store in shared memory
         // this already marks the expanded nodes MSB to 1, no need to mark again
         if (warp_id == 0) {
             keep_expanding = pick_expanders(SEARCH_WIDTH, PARENT_LIST, INTERNAL_TOPK, TOP_K_INDEX);
         }
         __syncthreads();
+        if (debug_mode && query_id == 0 && tid == 0) {
+            const INDEX_T parent_slot = PARENT_LIST[0];
+            const INDEX_T parent_raw =
+                (keep_expanding && parent_slot < INTERNAL_TOPK) ? TOP_K_INDEX[parent_slot] : MAX_INDEX;
+            const DISTANCE_T parent_dist =
+                (keep_expanding && parent_slot < INTERNAL_TOPK) ? TOP_K_DISTANCE[parent_slot] : FLT_MAX;
+            if (keep_expanding) {
+                printf("  expanding node: %u\n", parent_raw & 0x7fffffff);
+                printf("  expanding slot: %u, dist=%.6f\n", parent_slot, parent_dist);
+            } else {
+                printf("  expanding node: none\n");
+            }
+        }
         if (!keep_expanding) {
             if (tid == 0) {
                 hops[0] = iter;

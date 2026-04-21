@@ -7,12 +7,44 @@
 #include <chrono>
 #include <cstddef>
 #include <array>
+#include <cfloat>
+#include <vector>
 
+#ifndef USE_TENSOR_RABITQ
 #define USE_TENSOR_RABITQ 0
+#endif
+
+static vidType compute_gpu_rabitq_entry_point(const float* data, size_t npoints,
+                                              size_t dim, size_t row_offset) {
+  std::vector<float> centroid(dim, 0.0f);
+  const float inv_npoints = 1.0f / static_cast<float>(npoints);
+  for (size_t i = 0; i < npoints; ++i) {
+    const float* row = data + i * row_offset;
+    for (size_t d = 0; d < dim; ++d) {
+      centroid[d] += row[d] * inv_npoints;
+    }
+  }
+
+  vidType best = 0;
+  float best_dist = FLT_MAX;
+  for (size_t i = 0; i < npoints; ++i) {
+    const float* row = data + i * row_offset;
+    float dist = 0.0f;
+    for (size_t d = 0; d < dim; ++d) {
+      const float diff = row[d] - centroid[d];
+      dist += diff * diff;
+    }
+    if (dist < best_dist) {
+      best_dist = dist;
+      best = static_cast<vidType>(i);
+    }
+  }
+  return best;
+}
 
 void QuantizationGraph::gpu_search(int nq, const float* queries, int K, float* result_vec,
                                    vidType* result_idx, int beam_sz, double& elapsed,
-                                   GpuRunStats* gpu_stats) {
+                                   GpuRunStats* gpu_stats, bool debug_mode) {
   if (this->is_bins_mode()) {
     throw std::runtime_error("gpu_search currently supports only codebook-mode QuantizationGraph");
   }
@@ -21,9 +53,10 @@ void QuantizationGraph::gpu_search(int nq, const float* queries, int K, float* r
   auto npoints = this->num_nodes_;
   auto max_degree = this->degree_;
   auto beam_size = beam_sz;
-  printf("\nBeam search on GPU: K=%d, nq=%d, dim=%ld, npoints=%ld, beam_size=%d\n", K, nq, dim, npoints, beam_size);
+  const int active_nq = GPU_DISTANCE_TIMING ? 1 : nq;
+  printf("\nBeam search on GPU: K=%d, nq=%d, dim=%ld, npoints=%ld, beam_size=%d, internal_topk=%d\n", K, active_nq, dim, npoints, beam_size, INTERNAL_TOPK);
   size_t num_threads = BLOCK_SIZE;
-  size_t num_blocks = GPU_DISTANCE_TIMING ? 1 : nq;
+  size_t num_blocks = active_nq;
   std::cout << "\nnum_blocks = " << num_blocks << " num_threads = " << num_threads << "\n";
   cudaDeviceProp prop;
   int dev;
@@ -41,8 +74,8 @@ void QuantizationGraph::gpu_search(int nq, const float* queries, int K, float* r
   size_t total_mem_bytes = 0;
   CUDA_SAFE_CALL(cudaMemGetInfo(&free_mem_bytes, &total_mem_bytes));
 
-  const size_t query_bytes = static_cast<size_t>(nq) * dim * sizeof(float);
-  const size_t results_bytes = static_cast<size_t>(nq) * K * sizeof(vidType);
+  const size_t query_bytes = static_cast<size_t>(active_nq) * dim * sizeof(float);
+  const size_t results_bytes = static_cast<size_t>(active_nq) * K * sizeof(vidType);
   const size_t qg_data_bytes = this->get_data_bytes();
   const size_t qg_signs_bytes = this->get_signs_bytes();
   const size_t required_bytes = query_bytes + results_bytes + qg_data_bytes + qg_signs_bytes;
@@ -58,33 +91,35 @@ void QuantizationGraph::gpu_search(int nq, const float* queries, int K, float* r
     throw std::runtime_error("QG upload exceeds currently available GPU memory");
   }
 
-  CUDA_SAFE_CALL(cudaMalloc((void**)&d_queries, static_cast<size_t>(nq) * dim * sizeof(float)));
-  CUDA_SAFE_CALL(cudaMemcpy(d_queries, queries, static_cast<size_t>(nq) * dim * sizeof(float), cudaMemcpyHostToDevice));
+  CUDA_SAFE_CALL(cudaMalloc((void**)&d_queries, static_cast<size_t>(active_nq) * dim * sizeof(float)));
+  CUDA_SAFE_CALL(cudaMemcpy(d_queries, queries, static_cast<size_t>(active_nq) * dim * sizeof(float), cudaMemcpyHostToDevice));
   CUDA_SAFE_CALL(cudaMalloc((void**)&d_qg_data, qg_data_bytes));
   CUDA_SAFE_CALL(cudaMemcpy(d_qg_data, this->get_data_ptr(), qg_data_bytes, cudaMemcpyHostToDevice));
   CUDA_SAFE_CALL(cudaMalloc((void**)&d_qg_signs, qg_signs_bytes));
   CUDA_SAFE_CALL(cudaMemcpy(d_qg_signs, this->get_signs_ptr(), qg_signs_bytes, cudaMemcpyHostToDevice));
 
   vidType* d_results = nullptr;
-  CUDA_SAFE_CALL(cudaMalloc((void**)&d_results, static_cast<size_t>(nq) * K * sizeof(vidType)));
+  CUDA_SAFE_CALL(cudaMalloc((void**)&d_results, static_cast<size_t>(active_nq) * K * sizeof(vidType)));
 
   gpu_long_t* d_total_stats = nullptr;
   std::array<gpu_long_t, GPU_SEARCH_STAT_COUNT> total_stats{};
   if (GPU_SEARCH_STATS) {
-    CUDA_SAFE_CALL(cudaMalloc((void**)&d_total_stats, GPU_SEARCH_STAT_COUNT * sizeof(gpu_long_t)));
-    CUDA_SAFE_CALL(cudaMemcpy(d_total_stats, total_stats.data(), GPU_SEARCH_STAT_COUNT * sizeof(gpu_long_t), cudaMemcpyHostToDevice));
+    CUDA_SAFE_CALL(cudaMalloc((void**)&d_total_stats, num_blocks * GPU_SEARCH_STAT_COUNT * sizeof(gpu_long_t)));
   }
   gpu_long_t* d_total_timing = nullptr;
   std::array<gpu_long_t, GPU_TIMING_COUNT> total_timing{};
-  CUDA_SAFE_CALL(cudaMalloc((void**)&d_total_timing, GPU_TIMING_COUNT * sizeof(gpu_long_t)));
-  CUDA_SAFE_CALL(cudaMemcpy(d_total_timing, total_timing.data(), GPU_TIMING_COUNT * sizeof(gpu_long_t), cudaMemcpyHostToDevice));
+  if (GPU_DISTANCE_TIMING) {
+    CUDA_SAFE_CALL(cudaMalloc((void**)&d_total_timing, num_blocks * GPU_TIMING_COUNT * sizeof(gpu_long_t)));
+  }
   CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
-  vidType entry_point = this->get_entry_point();
+  vidType entry_point =
+      compute_gpu_rabitq_entry_point(this->get_data_ptr(), npoints, dim, this->get_row_offset());
+  printf("GPU rabitq entry point: %u\n", entry_point);
 
   uint32_t shm_size = USE_TENSOR_RABITQ
-      ? calculate_shared_mem_size_tensor(static_cast<int>(dim), INTERNAL_TOPK, max_degree, SEARCH_WIDTH, BITLEN)
-      : calculate_shared_mem_size(static_cast<int>(dim), INTERNAL_TOPK, max_degree, SEARCH_WIDTH, BITLEN);
+      ? calculate_shared_mem_size_tensor(static_cast<int>(dim), INTERNAL_TOPK, max_degree, SEARCH_WIDTH, BITLEN, K)
+      : calculate_shared_mem_size(static_cast<int>(dim), INTERNAL_TOPK, max_degree, SEARCH_WIDTH, BITLEN, K);
   if (USE_TENSOR_RABITQ) {
     CUDA_SAFE_CALL(cudaFuncSetAttribute(
         TensorCoreQuantizedBeamSearch,
@@ -112,14 +147,14 @@ void QuantizationGraph::gpu_search(int nq, const float* queries, int K, float* r
   auto start = std::chrono::high_resolution_clock::now();
   if (USE_TENSOR_RABITQ) {
     TensorCoreQuantizedBeamSearch<<<num_blocks, num_threads, shm_size>>>(
-        K, nq, static_cast<int>(dim), max_degree, npoints, d_queries, d_qg_data, d_qg_signs, d_results,
+        K, active_nq, static_cast<int>(dim), max_degree, npoints, d_queries, d_qg_data, d_qg_signs, d_results,
         d_total_stats, d_total_timing, entry_point, this->get_row_offset(), this->get_neighbor_offset(),
-        this->get_code_offset(), this->get_factor_offset());
+        this->get_code_offset(), this->get_factor_offset(), debug_mode);
   } else {
     QuantizedBeamSearch<<<num_blocks, num_threads, shm_size>>>(
-        K, nq, static_cast<int>(dim), max_degree, npoints, d_queries, d_qg_data, d_qg_signs, d_results,
+        K, active_nq, static_cast<int>(dim), max_degree, npoints, d_queries, d_qg_data, d_qg_signs, d_results,
         d_total_stats, d_total_timing, entry_point, this->get_row_offset(), this->get_neighbor_offset(),
-        this->get_code_offset(), this->get_factor_offset());
+        this->get_code_offset(), this->get_factor_offset(), debug_mode);
   }
   CUDA_SAFE_CALL(cudaGetLastError());
   cudaDeviceSynchronize();
@@ -127,11 +162,25 @@ void QuantizationGraph::gpu_search(int nq, const float* queries, int K, float* r
   elapsed = std::chrono::duration<double>(end - start).count();
 
   CUDA_SAFE_CALL(cudaDeviceSynchronize());
-  CUDA_SAFE_CALL(cudaMemcpy(result_idx, d_results, static_cast<size_t>(nq) * K * sizeof(int), cudaMemcpyDeviceToHost));
+  CUDA_SAFE_CALL(cudaMemcpy(result_idx, d_results, static_cast<size_t>(active_nq) * K * sizeof(int), cudaMemcpyDeviceToHost));
   if (GPU_SEARCH_STATS) {
-    CUDA_SAFE_CALL(cudaMemcpy(total_stats.data(), d_total_stats, GPU_SEARCH_STAT_COUNT * sizeof(gpu_long_t), cudaMemcpyDeviceToHost));
+    std::vector<gpu_long_t> h_block_stats(num_blocks * GPU_SEARCH_STAT_COUNT);
+    CUDA_SAFE_CALL(cudaMemcpy(h_block_stats.data(), d_total_stats, h_block_stats.size() * sizeof(gpu_long_t), cudaMemcpyDeviceToHost));
+    for (size_t b = 0; b < num_blocks; ++b) {
+      for (int i = 0; i < GPU_SEARCH_STAT_COUNT; ++i) {
+        total_stats[i] += h_block_stats[b * GPU_SEARCH_STAT_COUNT + i];
+      }
+    }
   }
-  CUDA_SAFE_CALL(cudaMemcpy(total_timing.data(), d_total_timing, GPU_TIMING_COUNT * sizeof(gpu_long_t), cudaMemcpyDeviceToHost));
+  if (GPU_DISTANCE_TIMING) {
+    std::vector<gpu_long_t> h_block_timing(num_blocks * GPU_TIMING_COUNT);
+    CUDA_SAFE_CALL(cudaMemcpy(h_block_timing.data(), d_total_timing, h_block_timing.size() * sizeof(gpu_long_t), cudaMemcpyDeviceToHost));
+    for (size_t b = 0; b < num_blocks; ++b) {
+      for (int i = 0; i < GPU_TIMING_COUNT; ++i) {
+        total_timing[i] += h_block_timing[b * GPU_TIMING_COUNT + i];
+      }
+    }
+  }
   CUDA_SAFE_CALL(cudaFree(d_queries));
   CUDA_SAFE_CALL(cudaFree(d_qg_data));
   CUDA_SAFE_CALL(cudaFree(d_qg_signs));
@@ -139,25 +188,54 @@ void QuantizationGraph::gpu_search(int nq, const float* queries, int K, float* r
   if (GPU_SEARCH_STATS) {
     CUDA_SAFE_CALL(cudaFree(d_total_stats));
   }
-  CUDA_SAFE_CALL(cudaFree(d_total_timing));
+  if (GPU_DISTANCE_TIMING) {
+    CUDA_SAFE_CALL(cudaFree(d_total_timing));
+  }
 
   if (GPU_SEARCH_STATS) {
     std::cout << "total # exact distance computations: " << total_stats[GPU_SEARCH_STAT_DIST_CMPS] << "\n";
-    std::cout << "average # exact distance computations: " << static_cast<double>(total_stats[GPU_SEARCH_STAT_DIST_CMPS]) / nq << "\n";
+    std::cout << "average # exact distance computations: " << static_cast<double>(total_stats[GPU_SEARCH_STAT_DIST_CMPS]) / active_nq << "\n";
     std::cout << "total # distance estimations: " << total_stats[GPU_SEARCH_STAT_DIST_EST] << "\n";
-    std::cout << "average # distance estimations: " << static_cast<double>(total_stats[GPU_SEARCH_STAT_DIST_EST]) / nq << "\n";
+    std::cout << "average # distance estimations: " << static_cast<double>(total_stats[GPU_SEARCH_STAT_DIST_EST]) / active_nq << "\n";
     std::cout << "total # expansion steps: " << total_stats[GPU_SEARCH_STAT_ITERATIONS] << "\n";
-    std::cout << "average # expansion steps: " << static_cast<double>(total_stats[GPU_SEARCH_STAT_ITERATIONS]) / nq << "\n";
+    std::cout << "average # expansion steps: " << static_cast<double>(total_stats[GPU_SEARCH_STAT_ITERATIONS]) / active_nq << "\n";
   }
   if (GPU_DISTANCE_TIMING) {
     const double avg_l2_cycles =
         total_timing[GPU_TIMING_L2_CALLS] ? static_cast<double>(total_timing[GPU_TIMING_L2_CYCLES]) / total_timing[GPU_TIMING_L2_CALLS] : 0.0;
     const double avg_est_cycles =
         total_timing[GPU_TIMING_EST_CALLS] ? static_cast<double>(total_timing[GPU_TIMING_EST_CYCLES]) / total_timing[GPU_TIMING_EST_CALLS] : 0.0;
+    const double avg_est_region_cycles =
+        total_timing[GPU_TIMING_EST_REGION_CANDIDATES]
+            ? static_cast<double>(total_timing[GPU_TIMING_EST_REGION_CYCLES]) / total_timing[GPU_TIMING_EST_REGION_CANDIDATES]
+            : 0.0;
     std::cout << "total # l2 timing calls: " << total_timing[GPU_TIMING_L2_CALLS] << "\n";
     std::cout << "average cycles per warp_l2_distance: " << avg_l2_cycles << "\n";
     std::cout << "total # est timing calls: " << total_timing[GPU_TIMING_EST_CALLS] << "\n";
     std::cout << "average cycles per estimated_distance_gpu: " << avg_est_cycles << "\n";
+    std::cout << "total # est region candidates: " << total_timing[GPU_TIMING_EST_REGION_CANDIDATES] << "\n";
+    std::cout << "average cycles per estimation region candidate: " << avg_est_region_cycles << "\n";
+    const struct {
+      int idx;
+      const char* label;
+    } timing_sections[] = {
+        {GPU_TIMING_QUERY_PREP_CYCLES, "query_prepare cycles"},
+        {GPU_TIMING_SORT_CYCLES, "topk sort cycles"},
+        {GPU_TIMING_PICK_CYCLES, "pick expander cycles"},
+        {GPU_TIMING_VISITED_CYCLES, "visited check cycles"},
+        {GPU_TIMING_STAGE_CYCLES, "stage code/factor cycles"},
+        {GPU_TIMING_FINAL_SORT_CYCLES, "final sort cycles"},
+        {GPU_TIMING_RESULT_POOL_CYCLES, "result pool update cycles"},
+        {GPU_TIMING_TENSOR_QUERY_TILE_CYCLES, "tensor query tile cycles"},
+        {GPU_TIMING_TENSOR_UNPACK_CYCLES, "tensor unpack cycles"},
+        {GPU_TIMING_TENSOR_MMA_CYCLES, "tensor mma cycles"},
+        {GPU_TIMING_TENSOR_FINAL_FACTOR_CYCLES, "tensor final factor cycles"},
+    };
+    for (const auto& section : timing_sections) {
+      if (total_timing[section.idx] != 0) {
+        std::cout << section.label << ": " << total_timing[section.idx] << "\n";
+      }
+    }
   }
 
   if (gpu_stats != nullptr) {

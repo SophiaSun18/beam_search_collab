@@ -6,7 +6,7 @@ CXXFLAGS = -Wall -Wextra -Ofast -lrt -march=native -fpic -fopenmp -ftree-vectori
 NVCC      := nvcc
 ARCH      = sm_89
 CXXSTD    := c++20
-NVFLAGS   := -std=$(CXXSTD) -O3 -arch=$(ARCH)
+NVFLAGS   := -std=$(CXXSTD) -O3 -arch=$(ARCH) $(EXTRA_NVFLAGS)
 PTXAS_FLAGS := -Xptxas -v
 INCLUDES  := -I.
 HEADERS_DIR := include/

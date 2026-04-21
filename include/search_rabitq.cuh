@@ -2,14 +2,16 @@
 #include "utils.cuh"
 #include "distance.cuh"
 #include <cuda_runtime.h>
+#ifndef INTERNAL_TOPK
+#define INTERNAL_TOPK   128
+#endif
 #define SEARCH_WIDTH    1     // MAX: 2 nodes * 32 degree = 64 neighbors = CANDIDATE_BUFFER_SIZE
 #define BITLEN          10
 #define MAX_ITERATIONS  1024
 #define TEAM_SIZE       8
 #define HASH_TABLE_CONFIG   1
-#define INTERNAL_TOPK   128
 #define CANDIDATE_BUFFER_SIZE 64
-#define RESULT_BUFFER_SIZE INTERNAL_TOPK + CANDIDATE_BUFFER_SIZE
+#define RESULT_BUFFER_SIZE (INTERNAL_TOPK + CANDIDATE_BUFFER_SIZE)
 
 static __host__ inline uint32_t calculate_shared_mem_size(int dim, int topk, int max_deg, 
                                                            int search_width, int bitlen) {
@@ -36,8 +38,10 @@ static __host__ inline uint32_t calculate_shared_mem_size(int dim, int topk, int
     if (GPU_SEARCH_STATS) {
         size += GPU_SEARCH_STAT_COUNT * sizeof(uint32_t);   // search stats
     }
+#if GPU_DISTANCE_TIMING
     size = align_up(size, alignof(gpu_long_t));             // align timing stats
     size += GPU_TIMING_COUNT * sizeof(gpu_long_t);          // timing stats
+#endif
     printf("shared memory size: %ld\n", size);
     return size;
 }
@@ -49,13 +53,14 @@ void QuantizedBeamSearch(
     const float* __restrict__ d_qg_data,
     const float* __restrict__ d_qg_signs,
     vidType* __restrict__ d_results,
-    gpu_long_t* d_total_stats,
-    gpu_long_t* d_total_timing,
+    gpu_long_t* d_block_stats,
+    gpu_long_t* d_block_timing,
     vidType entry_point,
     size_t row_offset,
     size_t neighbor_offset,
     size_t code_offset,
-    size_t factor_offset
+    size_t factor_offset,
+    bool debug_mode
 ) {
     // basic information about this block and thread
     const int query_id = blockIdx.x;
@@ -99,10 +104,13 @@ void QuantizedBeamSearch(
     uint32_t* counter = reinterpret_cast<uint32_t*>(STAGED_FACTOR_BUFFER + 3 * max_degree);
     uint32_t* hops = counter + 1;
     uint32_t* stats = hops + 1;
+    gpu_long_t* timing = nullptr;
+#if GPU_DISTANCE_TIMING
     char* timing_base = reinterpret_cast<char*>(stats + (GPU_SEARCH_STATS ? GPU_SEARCH_STAT_COUNT : 0));
     timing_base = reinterpret_cast<char*>((reinterpret_cast<uintptr_t>(timing_base) + alignof(gpu_long_t) - 1) &
                                           ~(static_cast<uintptr_t>(alignof(gpu_long_t)) - 1));
-    gpu_long_t* timing = reinterpret_cast<gpu_long_t*>(timing_base);
+    timing = reinterpret_cast<gpu_long_t*>(timing_base);
+#endif
 
     __shared__ QueryFactors qf;
 
@@ -159,8 +167,13 @@ void QuantizedBeamSearch(
     __syncthreads();
 
     // query preparation, quantize the query
+    gpu_long_t query_prep_start = 0;
+    if (GPU_DISTANCE_TIMING && tid == 0) query_prep_start = gpu_globaltimer();
     query_prepare_gpu(QUERY_BUFFER, qf, d_qg_signs, dim, padded_dim);
     __syncthreads();
+    if (GPU_DISTANCE_TIMING && tid == 0) {
+        atomicAdd(&timing[GPU_TIMING_QUERY_PREP_CYCLES], gpu_globaltimer() - query_prep_start);
+    }
     
     // loop end condition: either entire topK expanded, or reach max iteration limit
     for (int iter = 0; iter < MAX_ITERATIONS; iter++) {
@@ -176,16 +189,62 @@ void QuantizedBeamSearch(
         }
 
         // use warp level sort to find the actual closest top K elements and update the topK list
+        gpu_long_t sort_start = 0;
+        if (GPU_DISTANCE_TIMING && tid == 0) sort_start = gpu_globaltimer();
         topk_by_bitonic_sort<2, INTERNAL_TOPK / WARP_SIZE>(ALL_INDEX, ALL_DISTANCE, RESULT_BUFFER_SIZE,
             CANDIDATE_BUFFER_SIZE, INTERNAL_TOPK, (iter == 0));
         __syncthreads();
+        if (GPU_DISTANCE_TIMING && tid == 0) {
+            atomicAdd(&timing[GPU_TIMING_SORT_CYCLES], gpu_globaltimer() - sort_start);
+        }
+
+        if (debug_mode && query_id == 0 && tid == 0) {
+            printf("[DEBUG] iteration %d\n", iter + 1);
+            printf("  beam state:\n");
+            for (int i = 0; i < INTERNAL_TOPK; ++i) {
+                const INDEX_T raw = TOP_K_INDEX[i];
+                const bool expanded = (raw & 0x80000000u) != 0;
+                printf("    idx=%d, node=%u, dist=%.6f, expanded=%s\n",
+                       i,
+                       raw & 0x7fffffff,
+                       TOP_K_DISTANCE[i],
+                       expanded ? "true" : "false");
+            }
+            printf("  candidate buffer:\n");
+            for (int i = 0; i < CANDIDATE_BUFFER_SIZE; ++i) {
+                printf("    idx=%d, node=%u, dist=%.6f\n",
+                       i,
+                       CANDIDATE_INDEX[i] & 0x7fffffff,
+                       CANDIDATE_DISTANCE[i]);
+            }
+        }
 
         // warp 0 pick the top-N unexpanded nodes and store in shared memory
         // this already marks the expanded nodes MSB to 1, no need to mark again
+        gpu_long_t pick_start = 0;
+        if (GPU_DISTANCE_TIMING && tid == 0) pick_start = gpu_globaltimer();
         if (warp_id == 0) {
             keep_expanding = pick_expanders(SEARCH_WIDTH, PARENT_LIST, INTERNAL_TOPK, TOP_K_INDEX);
         }
         __syncthreads();
+        if (GPU_DISTANCE_TIMING && tid == 0) {
+            atomicAdd(&timing[GPU_TIMING_PICK_CYCLES], gpu_globaltimer() - pick_start);
+        }
+
+        if (debug_mode && query_id == 0 && tid == 0) {
+            const INDEX_T parent_slot = PARENT_LIST[0];
+            const INDEX_T parent_raw =
+                (keep_expanding && parent_slot < INTERNAL_TOPK) ? TOP_K_INDEX[parent_slot] : MAX_INDEX;
+            const DISTANCE_T parent_dist =
+                (keep_expanding && parent_slot < INTERNAL_TOPK) ? TOP_K_DISTANCE[parent_slot] : FLT_MAX;
+            if (keep_expanding) {
+                printf("  expanding node: %u\n", parent_raw & 0x7fffffff);
+                printf("  expanding slot: %u, dist=%.6f\n", parent_slot, parent_dist);
+            } else {
+                printf("  expanding node: none\n");
+            }
+        }
+
         if (!keep_expanding) {
             if (tid == 0) {
                 hops[0] = iter;
@@ -212,8 +271,8 @@ void QuantizedBeamSearch(
             stats[GPU_SEARCH_STAT_ITERATIONS]++;
             stats[GPU_SEARCH_STAT_DIST_CMPS]++;
         }
-        __syncthreads();
-
+        gpu_long_t visited_start = 0;
+        if (GPU_DISTANCE_TIMING && tid == 0) visited_start = gpu_globaltimer();
         for (int i = tid; i < CANDIDATE_BUFFER_SIZE; i += blockDim.x) {
             INDEX_T child_id = (i < max_degree) ? current_neighbors[i] : MAX_INDEX;      // only in-bound threads take from the neighbor list
 
@@ -228,9 +287,14 @@ void QuantizedBeamSearch(
             CANDIDATE_INDEX[i] = child_id;
         }
         __syncthreads();
+        if (GPU_DISTANCE_TIMING && tid == 0) {
+            atomicAdd(&timing[GPU_TIMING_VISITED_CYCLES], gpu_globaltimer() - visited_start);
+        }
 
         // load the packed code and factors for the current row once so the candidate loop can
         // read it from shared memory instead of issuing many global loads
+        gpu_long_t stage_start = 0;
+        if (GPU_DISTANCE_TIMING && tid == 0) stage_start = gpu_globaltimer();
         for (int j = tid; j < max_degree * code_words; j += blockDim.x) {
             STAGED_CODE_BUFFER[j] = current_codes[j];
         }
@@ -238,8 +302,13 @@ void QuantizedBeamSearch(
             STAGED_FACTOR_BUFFER[j] = current_factors[j];
         }
         __syncthreads();
+        if (GPU_DISTANCE_TIMING && tid == 0) {
+            atomicAdd(&timing[GPU_TIMING_STAGE_CYCLES], gpu_globaltimer() - stage_start);
+        }
 
         // all warps work together to compute candidate distance
+        gpu_long_t est_region_start = 0;
+        if (GPU_DISTANCE_TIMING && tid == 0) est_region_start = gpu_globaltimer();
         for (int i = warp_id; i < CANDIDATE_BUFFER_SIZE; i += WARPS_PER_BLOCK) {
             // visited candidates are marked as invalid
             if (CANDIDATE_INDEX[i] == MAX_INDEX) continue;
@@ -276,27 +345,61 @@ void QuantizedBeamSearch(
             }
         }
         __syncthreads();
+        if (GPU_DISTANCE_TIMING && tid == 0) {
+            int active_count = 0;
+            for (int i = 0; i < CANDIDATE_BUFFER_SIZE; ++i) {
+                if (CANDIDATE_INDEX[i] != MAX_INDEX) {
+                    active_count++;
+                }
+            }
+            if (active_count > 0) {
+                atomicAdd(&timing[GPU_TIMING_EST_REGION_CANDIDATES], gpu_long_t(active_count));
+                atomicAdd(&timing[GPU_TIMING_EST_REGION_CYCLES], gpu_globaltimer() - est_region_start);
+            }
+        }
     }
 
     // final sort before writeback
+    gpu_long_t final_sort_start = 0;
+    if (GPU_DISTANCE_TIMING && tid == 0) final_sort_start = gpu_globaltimer();
     topk_by_bitonic_sort<2, INTERNAL_TOPK / WARP_SIZE>(ALL_INDEX, ALL_DISTANCE, RESULT_BUFFER_SIZE,
         CANDIDATE_BUFFER_SIZE, INTERNAL_TOPK, false);
     __syncthreads();
-
-    // return the top K result
-    for (int i = tid; i < K; i += blockDim.x) {
-        d_results[query_id * K + i] = TOP_K_INDEX[i] & ~0x80000000;
+    if (GPU_DISTANCE_TIMING && tid == 0) {
+        atomicAdd(&timing[GPU_TIMING_FINAL_SORT_CYCLES], gpu_globaltimer() - final_sort_start);
     }
+
     if (tid == 0) {
+
+        if (debug_mode && query_id == 0) {
+            printf("[DEBUG] final frontier topk\n");
+            for (int i = 0; i < K; ++i) {
+                printf("  idx=%d, node=%u, dist=%.6f, expanded=%s\n",
+                       i,
+                       TOP_K_INDEX[i] & 0x7fffffff,
+                       TOP_K_DISTANCE[i],
+                       (TOP_K_INDEX[i] & 0x80000000u) ? "true" : "false");
+            }
+        }
+
+        for (int i = 0; i < K; ++i) {
+            d_results[query_id * K + i] = TOP_K_INDEX[i] & 0x7fffffff;
+        }
         if (GPU_SEARCH_STATS) {
             stats[GPU_SEARCH_STAT_DIST_EST] = counter[0];
-            for (int i = 0; i < GPU_SEARCH_STAT_COUNT; i++) {
-                atomicAdd(&d_total_stats[i], gpu_long_t(stats[i]));
+            if (d_block_stats != nullptr) {
+                gpu_long_t* dst = d_block_stats + static_cast<size_t>(query_id) * GPU_SEARCH_STAT_COUNT;
+                for (int i = 0; i < GPU_SEARCH_STAT_COUNT; i++) {
+                    dst[i] = static_cast<gpu_long_t>(stats[i]);
+                }
             }
         }
         if (GPU_DISTANCE_TIMING) {
-            for (int i = 0; i < GPU_TIMING_COUNT; i++) {
-                atomicAdd(&d_total_timing[i], timing[i]);
+            if (d_block_timing != nullptr) {
+                gpu_long_t* dst = d_block_timing + static_cast<size_t>(query_id) * GPU_TIMING_COUNT;
+                for (int i = 0; i < GPU_TIMING_COUNT; i++) {
+                    dst[i] = timing[i];
+                }
             }
         }
     }
