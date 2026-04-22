@@ -168,7 +168,7 @@ __global__ void benchSt(const float* __restrict__ seed,
     }
     __syncthreads();
 
-    topk_by_bitonic_sort<2, INTERNAL_TOPK / WARP_SIZE>(
+    topk_128_by_bitonic_sort<2, INTERNAL_TOPK / WARP_SIZE>(
         idx, dst, RESULT_BUFFER_SIZE,
         CANDIDATE_BUFFER_SIZE, INTERNAL_TOPK, true);
     __syncthreads();
@@ -182,7 +182,7 @@ __global__ void benchSt(const float* __restrict__ seed,
             }
         }
         __syncthreads();
-        topk_by_bitonic_sort<2, INTERNAL_TOPK / WARP_SIZE>(
+        topk_128_by_bitonic_sort<2, INTERNAL_TOPK / WARP_SIZE>(
             idx, dst, RESULT_BUFFER_SIZE,
             CANDIDATE_BUFFER_SIZE, INTERNAL_TOPK, false);
         __syncthreads();

@@ -69,12 +69,12 @@ esac
 if [[ "$RUN_TARGET" == "all" ]]; then
     echo "Cleaning and building cpu ..."
     make clean
-    make cpu EXTRA_NVFLAGS="${EXTRA_NVFLAGS_OVERRIDE:-}"
+    make cpu EXTRA_CXXFLAGS="${EXTRA_CXXFLAGS_OVERRIDE:-}" EXTRA_NVFLAGS="${EXTRA_NVFLAGS_OVERRIDE:-}"
     echo "CPU build done."
 elif [[ "$RUN_TARGET" != "gpu_base" && "$RUN_TARGET" != "gpu_rabitq" ]]; then
     echo "Cleaning and building $MAKE_TARGET ..."
     make clean
-    make "$MAKE_TARGET" EXTRA_NVFLAGS="${EXTRA_NVFLAGS_OVERRIDE:-}"
+    make "$MAKE_TARGET" EXTRA_CXXFLAGS="${EXTRA_CXXFLAGS_OVERRIDE:-}" EXTRA_NVFLAGS="${EXTRA_NVFLAGS_OVERRIDE:-}"
     echo "Build done."
 fi
 
@@ -88,7 +88,7 @@ DEGREE="${DEGREE_OVERRIDE:-32}"
 if [ -n "${BEAM_SIZES_OVERRIDE:-}" ]; then
     IFS=',' read -r -a BEAM_SIZES <<< "$BEAM_SIZES_OVERRIDE"
 else
-    BEAM_SIZES=(128 256)
+    BEAM_SIZES=(128 256 384 512 640 768 896 1024)
 fi
 # PRUNE_RATIOS=(0 0.125 0.25 0.375 0.5 0.625 0.75 0.875)
 PRUNE_RATIOS=(0)
@@ -100,15 +100,15 @@ L2_END_ITER=0
 L2_PERIOD=0
 RERANK_TOP_M=1
 # TRIALS=${TRIALS_OVERRIDE:-1}
-TRIALS=1
-MODE="sequential"               # "fastscan" = enabled, "sequential" = fastscan disabled
+TRIALS=3
+MODE="${MODE_OVERRIDE:-sequential}"               # "fastscan" = enabled, "sequential" = fastscan disabled
 RABITQ_LOAD_MODE="codebook"  # "bins" = -graph + -rabitq + -sign, "codebook" = -qg
 ESTIMATE_STATS="off"          # "on" = write estimate reuse stats, "off" = disable
 STEP_EFFICIENCY="off"         # "on" = write per-step exact-distance reduction stats
 ACC32=""
 
 BIN_DIR="bin"
-RESULT_ROOT="${RESULT_ROOT_OVERRIDE:-result/4.18GpuRabitqDEBUG3WithResultPool}"
+RESULT_ROOT="${RESULT_ROOT_OVERRIDE:-result/4.22GpuRabitqTESTuseSeqCodebook}"
 # RESULT_ROOT="${RESULT_ROOT_OVERRIDE:-result/4.16GPUTensorCore_2}"
 
 # --------------------------------------------
@@ -163,6 +163,8 @@ preprocess_rabitq() {
 run_cpu_base() {
     BINARY="$BIN_DIR/cpu_base"
     BIN_NAME="cpu_base"
+    CSV_FILE="${LOG_ROOT}/${PREFIX}_deg${K}_top${TOPK}_base.csv"
+    rm -f "$CSV_FILE"
 
     for t in "${THREADS[@]}"; do
         export OMP_NUM_THREADS=$t
@@ -171,7 +173,6 @@ run_cpu_base() {
             for pr in "${PRUNE_RATIOS[@]}"; do
                 for ar in "${APPROX_RATIOS[@]}"; do
 
-                    CSV_FILE="${LOG_ROOT}/${PREFIX}_deg${K}_top${TOPK}_base.csv"
                     LOG_FILE="${LOG_ROOT_2}/${BIN_NAME}_beam${beam}_threads${t}_pr${pr}_a${ar}_base.log"
                     > "$LOG_FILE"
 
@@ -300,12 +301,6 @@ run_cpu_rabitq() {
             ;;
     esac
 
-    # CSV_FILE="${LOG_ROOT}/${PREFIX}_deg${K}_top${TOPK}_rabitq.csv"
-    # if [ -f "$CSV_FILE" ]; then
-    #     echo "Existing CSV file found. Removing..."
-    #     rm -f "$CSV_FILE"
-    # fi
-
     for t in "${THREADS[@]}"; do
         export OMP_NUM_THREADS=$t
 
@@ -313,7 +308,10 @@ run_cpu_rabitq() {
             for pr in "${PRUNE_RATIOS[@]}"; do
                 for ar in "${APPROX_RATIOS[@]}"; do
                     for l2_iter in "${L2_START_ITERS[@]}"; do
-                        CSV_FILE="${LOG_ROOT}/${PREFIX}_deg${K}_top${TOPK}_threads${t}_rabitq_${LOAD_MODE_SUFFIX}.csv"
+                        CSV_FILE="${LOG_ROOT}/${PREFIX}_deg${K}_top${TOPK}_threads${t}_rabitq_${LOAD_MODE_SUFFIX}_${MODE}.csv"
+                        if [[ $trial -eq 1 && "$beam" == "${BEAM_SIZES[0]}" && "$pr" == "${PRUNE_RATIOS[0]}" && "$ar" == "${APPROX_RATIOS[0]}" && "$l2_iter" == "${L2_START_ITERS[0]}" ]]; then
+                            rm -f "$CSV_FILE"
+                        fi
                         LOG_FILE="${LOG_ROOT_2}/${BIN_NAME}_${LOAD_MODE_SUFFIX}_beam${beam}_threads${t}_pr${pr}_a${ar}_l2i${l2_iter}_l2e${L2_END_ITER}_l2p${L2_PERIOD}_rtm${RERANK_TOP_M}.log"
                         ESTIMATE_STATS_FILE="${LOG_ROOT_2}/${BIN_NAME}_${LOAD_MODE_SUFFIX}_beam${beam}_threads${t}_pr${pr}_a${ar}_l2i${l2_iter}_l2e${L2_END_ITER}_l2p${L2_PERIOD}_rtm${RERANK_TOP_M}.estimate_stats.txt"
                         STEP_EFFICIENCY_FILE="${LOG_ROOT_2}/${BIN_NAME}_${LOAD_MODE_SUFFIX}_beam${beam}_threads${t}_pr${pr}_a${ar}_l2i${l2_iter}_l2e${L2_END_ITER}_l2p${L2_PERIOD}_rtm${RERANK_TOP_M}.step_efficiency.txt"
@@ -392,6 +390,7 @@ run_gpu_base() {
     BINARY="$BIN_DIR/gpu_search"
     BIN_NAME="gpu_base"
     CSV_FILE="${LOG_ROOT}/${PREFIX}_deg${K}_top${TOPK}_${BIN_NAME}.csv"
+    rm -f "$CSV_FILE"
 
     for beam in "${BEAM_SIZES[@]}"; do
         build_gpu_for_beam "$beam"
@@ -435,7 +434,8 @@ run_gpu_base() {
 run_gpu_rabitq() {
     BINARY="$BIN_DIR/gpu_search"
     BIN_NAME="gpu_rabitq"
-    CSV_FILE="${LOG_ROOT}/${PREFIX}_deg${K}_top${TOPK}_${BIN_NAME}.csv"
+    CSV_FILE="${LOG_ROOT}/${PREFIX}_deg${K}_top${TOPK}_${BIN_NAME}_${MODE}.csv"
+    rm -f "$CSV_FILE"
 
     for beam in "${BEAM_SIZES[@]}"; do
         build_gpu_for_beam "$beam"

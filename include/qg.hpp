@@ -19,11 +19,7 @@
 #include "../include/fastscan_impl.hpp"
 #endif
 
-#ifdef __CUDACC__
-static constexpr bool FASTSCAN_ENABLED = false;
-#else
-static constexpr bool FASTSCAN_ENABLED = true;  // set to true to use fastscan batch estimation
-#endif
+static constexpr bool FASTSCAN_ENABLED = true;
 static constexpr bool HUGE_PAGE_ENABLED = false;
 
 class QuantizationGraph {

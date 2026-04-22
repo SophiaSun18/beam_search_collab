@@ -11,6 +11,11 @@
 #define WARP_SIZE     32
 #define LOG_WARP_SIZE 5
 #define WARPS_PER_BLOCK (BLOCK_SIZE / WARP_SIZE)
+
+#define GPU_HASH_BASE_BITLEN 10
+#define GPU_HASH_BITLEN_FOR_TOPK(topk)                                            \
+  (((topk) * 4 > 3 * (1 << GPU_HASH_BASE_BITLEN)) ? (GPU_HASH_BASE_BITLEN + 1) : GPU_HASH_BASE_BITLEN)
+   
 //#define FLT_MAX 3.40282347e+38
 #ifndef GPU_SEARCH_STATS
 #define GPU_SEARCH_STATS 1
