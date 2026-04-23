@@ -2,6 +2,9 @@
 #include "utils.cuh"
 #include "distance.cuh"
 #include <cuda_runtime.h>
+#if defined(__CUDA_ARCH__) || defined(__CUDACC__)
+#include <cuda_pipeline_primitives.h>
+#endif
 #ifndef INTERNAL_TOPK
 #define INTERNAL_TOPK   128
 #endif
@@ -12,6 +15,33 @@
 #define HASH_TABLE_CONFIG   1
 #define CANDIDATE_BUFFER_SIZE 64
 #define RESULT_BUFFER_SIZE (INTERNAL_TOPK + CANDIDATE_BUFFER_SIZE)
+
+#ifndef GPU_RABITQ_FASTSCAN
+#define GPU_RABITQ_FASTSCAN 1
+#endif
+
+template <typename T>
+static __device__ inline void staged_copy_async_begin_or_sync(
+    T* __restrict__ dst,
+    const T* __restrict__ src,
+    int count) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    for (int i = threadIdx.x; i < count; i += blockDim.x) {
+        __pipeline_memcpy_async(dst + i, src + i, sizeof(T));
+    }
+    __pipeline_commit();
+#else
+    for (int i = threadIdx.x; i < count; i += blockDim.x) {
+        dst[i] = src[i];
+    }
+#endif
+}
+
+static __device__ inline void staged_copy_async_finish_or_sync() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    __pipeline_wait_prior(0);
+#endif
+}
 
 static __host__ inline uint32_t calculate_shared_mem_size(int dim, int topk, int max_deg, 
                                                            int search_width, int bitlen) {
@@ -186,6 +216,9 @@ void QuantizedBeamSearch(
     gpu_long_t query_prep_start = 0;
     if (GPU_DISTANCE_TIMING && tid == 0) query_prep_start = gpu_globaltimer();
     query_prepare_gpu(QUERY_BUFFER, qf, d_qg_signs, dim, padded_dim);
+    if constexpr (GPU_RABITQ_FASTSCAN) {
+        pack_lut_gpu(static_cast<int>(padded_dim), qf.quantized_query, qf.lut);
+    }
     __syncthreads();
     if (GPU_DISTANCE_TIMING && tid == 0) {
         atomicAdd(&timing[GPU_TIMING_QUERY_PREP_CYCLES], gpu_globaltimer() - query_prep_start);
@@ -281,6 +314,18 @@ void QuantizedBeamSearch(
         const uint64_t* current_codes = reinterpret_cast<const uint64_t*>(current_row + code_offset);
         const float* current_factors = current_row + factor_offset;
 
+        gpu_long_t stage_start = 0;
+        if (GPU_DISTANCE_TIMING && tid == 0) stage_start = gpu_globaltimer();
+        // initialize the async copy of packed code and factors as long as the current expander is decided
+        staged_copy_async_begin_or_sync(
+            STAGED_CODE_BUFFER,
+            current_codes,
+            static_cast<int>(max_degree * code_words));
+        staged_copy_async_begin_or_sync(
+            STAGED_FACTOR_BUFFER,
+            current_factors,
+            3 * max_degree);
+
         gpu_long_t l2_start = 0;
         if (GPU_DISTANCE_TIMING && lane_id == 0) l2_start = gpu_globaltimer();
         DISTANCE_T exact_dist = warp_l2_distance(dim, query, current_row);
@@ -323,16 +368,8 @@ void QuantizedBeamSearch(
             atomicAdd(&timing[GPU_TIMING_VISITED_CYCLES], gpu_globaltimer() - visited_start);
         }
 
-        // load the packed code and factors for the current row once so the candidate loop can
-        // read it from shared memory instead of issuing many global loads
-        gpu_long_t stage_start = 0;
-        if (GPU_DISTANCE_TIMING && tid == 0) stage_start = gpu_globaltimer();
-        for (int j = tid; j < max_degree * code_words; j += blockDim.x) {
-            STAGED_CODE_BUFFER[j] = current_codes[j];
-        }
-        for (int j = tid; j < 3 * max_degree; j += blockDim.x) {
-            STAGED_FACTOR_BUFFER[j] = current_factors[j];
-        }
+        // wait for the async copy to finish before move on to computation
+        staged_copy_async_finish_or_sync();
         __syncthreads();
         if (GPU_DISTANCE_TIMING && tid == 0) {
             atomicAdd(&timing[GPU_TIMING_STAGE_CYCLES], gpu_globaltimer() - stage_start);
@@ -341,39 +378,83 @@ void QuantizedBeamSearch(
         // all warps work together to compute candidate distance
         gpu_long_t est_region_start = 0;
         if (GPU_DISTANCE_TIMING && tid == 0) est_region_start = gpu_globaltimer();
-        for (int i = warp_id; i < CANDIDATE_BUFFER_SIZE; i += WARPS_PER_BLOCK) {
-            // visited candidates are marked as invalid
-            if (CANDIDATE_INDEX[i] == MAX_INDEX) continue;
+        if constexpr (GPU_RABITQ_FASTSCAN) {
+            // each warp handle a batch of neighbors
+            const int num_batches = (max_degree + WARP_SIZE - 1) / WARP_SIZE;
 
-            // if current node is new in hash table, compute and store its distance
-            const uint64_t* packed_code = STAGED_CODE_BUFFER + i * code_words;
-            const float* factors = STAGED_FACTOR_BUFFER;
-            float triple_x = 0.0f;
-            float factor_dq = 0.0f;
-            float factor_vq = 0.0f;
-            if (lane_id == 0) {
-                triple_x = factors[i];
-                factor_dq = factors[max_degree + i];
-                factor_vq = factors[2 * max_degree + i];
-            }
-            triple_x = __shfl_sync(FULL_MASK, triple_x, 0);
-            factor_dq = __shfl_sync(FULL_MASK, factor_dq, 0);
-            factor_vq = __shfl_sync(FULL_MASK, factor_vq, 0);
-            
-            gpu_long_t est_start = 0;
-            if (GPU_DISTANCE_TIMING && lane_id == 0) est_start = gpu_globaltimer();
-            DISTANCE_T est_dist = estimated_distance_gpu(
-                qf, packed_code, triple_x, factor_dq, factor_vq, exact_dist, padded_dim);
-            if (lane_id == 0) {
-                atomicAdd(&counter[0], 1);
-                if (GPU_SEARCH_STATS) {
-                    atomicAdd(&stats[GPU_SEARCH_STAT_DIST_EST], 1u);
+            for (int batch = warp_id; batch < num_batches; batch += WARPS_PER_BLOCK) {
+                const int batch_begin = batch * WARP_SIZE;
+                const int active_neighbors = min(WARP_SIZE, max_degree - batch_begin);
+                const uint8_t* packed_codes_block = reinterpret_cast<const uint8_t*>(STAGED_CODE_BUFFER) + batch * static_cast<int>(padded_dim) * 4;
+                const float* triple_x = STAGED_FACTOR_BUFFER + batch_begin;
+                const float* factor_dq = STAGED_FACTOR_BUFFER + max_degree + batch_begin;
+                const float* factor_vq = STAGED_FACTOR_BUFFER + 2 * max_degree + batch_begin;
+
+                gpu_long_t est_start = 0;
+                if (GPU_DISTANCE_TIMING && lane_id == 0) est_start = gpu_globaltimer();
+                scan_all_neighbors_32_gpu(qf, packed_codes_block, triple_x, factor_dq, factor_vq,
+                    exact_dist, static_cast<int>(padded_dim), CANDIDATE_DISTANCE + batch_begin, active_neighbors);
+                if (lane_id < active_neighbors) {
+                    const int candidate_idx = batch_begin + lane_id;
+                    const bool invalid_candidate = (CANDIDATE_INDEX[candidate_idx] == MAX_INDEX);
+                    const bool invalid_factor = (triple_x[lane_id] == FLT_MAX);
+                    const bool invalid_distance = !isfinite(CANDIDATE_DISTANCE[candidate_idx]);
+                    if (invalid_candidate || invalid_factor || invalid_distance) {
+                        CANDIDATE_DISTANCE[candidate_idx] = FLT_MAX;
+                    }
                 }
-                if (GPU_DISTANCE_TIMING) {
-                    atomicAdd(&timing[GPU_TIMING_EST_CALLS], gpu_long_t(1));
+                if (GPU_DISTANCE_TIMING && lane_id == 0) {
+                    atomicAdd(&timing[GPU_TIMING_EST_CALLS], gpu_long_t(active_neighbors));
                     atomicAdd(&timing[GPU_TIMING_EST_CYCLES], gpu_globaltimer() - est_start);
                 }
-                CANDIDATE_DISTANCE[i] = est_dist;
+                if (lane_id == 0) {
+                    uint32_t active_count = 0;
+                    for (int i = 0; i < active_neighbors; ++i) {
+                        if (CANDIDATE_INDEX[batch_begin + i] != MAX_INDEX) {
+                            active_count++;
+                        }
+                    }
+                    atomicAdd(&counter[0], active_count);
+                    if (GPU_SEARCH_STATS) {
+                        atomicAdd(&stats[GPU_SEARCH_STAT_DIST_EST], active_count);
+                    }
+                }
+            }
+        } else {
+            for (int i = warp_id; i < CANDIDATE_BUFFER_SIZE; i += WARPS_PER_BLOCK) {
+                // visited candidates are marked as invalid
+                if (CANDIDATE_INDEX[i] == MAX_INDEX) continue;
+
+                // if current node is new in hash table, compute and store its distance
+                const uint64_t* packed_code = STAGED_CODE_BUFFER + i * code_words;
+                const float* factors = STAGED_FACTOR_BUFFER;
+                float triple_x = 0.0f;
+                float factor_dq = 0.0f;
+                float factor_vq = 0.0f;
+                if (lane_id == 0) {
+                    triple_x = factors[i];
+                    factor_dq = factors[max_degree + i];
+                    factor_vq = factors[2 * max_degree + i];
+                }
+                triple_x = __shfl_sync(FULL_MASK, triple_x, 0);
+                factor_dq = __shfl_sync(FULL_MASK, factor_dq, 0);
+                factor_vq = __shfl_sync(FULL_MASK, factor_vq, 0);
+                
+                gpu_long_t est_start = 0;
+                if (GPU_DISTANCE_TIMING && lane_id == 0) est_start = gpu_globaltimer();
+                DISTANCE_T est_dist = estimated_distance_gpu(
+                    qf, packed_code, triple_x, factor_dq, factor_vq, exact_dist, padded_dim);
+                if (lane_id == 0) {
+                    atomicAdd(&counter[0], 1);
+                    if (GPU_SEARCH_STATS) {
+                        atomicAdd(&stats[GPU_SEARCH_STAT_DIST_EST], 1u);
+                    }
+                    if (GPU_DISTANCE_TIMING) {
+                        atomicAdd(&timing[GPU_TIMING_EST_CALLS], gpu_long_t(1));
+                        atomicAdd(&timing[GPU_TIMING_EST_CYCLES], gpu_globaltimer() - est_start);
+                    }
+                    CANDIDATE_DISTANCE[i] = est_dist;
+                }
             }
         }
         __syncthreads();

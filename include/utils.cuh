@@ -912,3 +912,60 @@ static __device__ inline DISTANCE_T estimated_distance_gpu(const QueryFactors& q
   est_dist += factor_vq * qf.low_val;
   return est_dist;
 }
+
+
+static __device__ __forceinline__ int fastscan_lane_pack_index(int lane_mod16) {
+  return ((lane_mod16 & 7) << 1) | (lane_mod16 >> 3);
+}
+
+static __device__ __forceinline__ uint8_t fastscan_decode_code_gpu(
+    const uint8_t* packed_codes_block, int lane_id, int codebook_idx) {
+  const int pair_idx = codebook_idx >> 1;
+  const int nibble_group = codebook_idx & 1;
+  const int lane_mod16 = lane_id & 15;
+  const int byte_idx = fastscan_lane_pack_index(lane_mod16);
+  const uint8_t packed =
+      packed_codes_block[pair_idx * 32 + nibble_group * 16 + byte_idx];
+  return (lane_id < 16) ? static_cast<uint8_t>(packed & 0x0f)
+                        : static_cast<uint8_t>(packed >> 4);
+}
+
+static __device__ inline void pack_lut_gpu(
+    int dim, const uint8_t* __restrict__ quantized_query, uint8_t* __restrict__ lut) {
+  const int tid = threadIdx.x;
+  const int num_codebook = dim >> 2;
+
+  for (int cb = tid; cb < num_codebook; cb += blockDim.x) {
+    const uint8_t* query_chunk = quantized_query + (cb << 2);
+    uint8_t* lut_chunk = lut + (cb << 4);
+
+    lut_chunk[0] = 0;
+    for (int mask = 1; mask < 16; ++mask) {
+      const int lowbit = mask & -mask;
+      const int pos = (lowbit == 8) ? 0 : ((lowbit == 4) ? 1 : ((lowbit == 2) ? 2 : 3));
+      lut_chunk[mask] = static_cast<uint8_t>(lut_chunk[mask - lowbit] + query_chunk[pos]);
+    }
+  }
+}
+
+static __device__ inline void scan_all_neighbors_32_gpu(
+    const QueryFactors& qf, const uint8_t* packed_codes_block,
+    const float* triple_x, const float* factor_dq, const float* factor_vq,
+    float exact_dist, int padded_dim, float* appro_dist, int active_neighbors = WARP_SIZE) {
+  const int lane_id = threadIdx.x & (WARP_SIZE - 1);
+  if (lane_id >= active_neighbors) return;
+
+  const int num_codebook = padded_dim >> 2;
+  uint32_t raw_sum = 0;
+
+  for (int cb = 0; cb < num_codebook; ++cb) {
+    const uint8_t code = fastscan_decode_code_gpu(packed_codes_block, lane_id, cb);
+    raw_sum += static_cast<uint32_t>(qf.lut[(cb << 4) + code]);
+  }
+
+  const float result_float = static_cast<float>((static_cast<int32_t>(raw_sum) << 1) - qf.sum_q);
+  float est_dist = triple_x[lane_id] + exact_dist;
+  est_dist += factor_dq[lane_id] * qf.width * result_float;
+  est_dist += factor_vq[lane_id] * qf.low_val;
+  appro_dist[lane_id] = est_dist;
+}
