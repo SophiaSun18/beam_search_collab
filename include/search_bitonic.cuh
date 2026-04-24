@@ -7,7 +7,7 @@
 #endif
 #define SEARCH_WIDTH    1     // MAX: 2 nodes * 32 degree = 64 neighbors = CANDIDATE_BUFFER_SIZE
 #define BITLEN          GPU_HASH_BITLEN_FOR_TOPK(INTERNAL_TOPK)
-#define MAX_ITERATIONS  1024
+#define MAX_ITERATIONS  (1 << 15)
 #define TEAM_SIZE       8
 #define USE_SEED        0
 #define PRUNE_CONFIG    0

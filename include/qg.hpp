@@ -146,10 +146,13 @@ public:
 
     #ifndef __CUDACC__
     QueryFactors query_prepare(const float* query_raw, const QueryBuffers& scratch) const {
+        constexpr float kQueryLevelsInv = 1.0f / static_cast<float>((1 << QG_BQUERY) - 1);
         QueryFactors qf;
         qf.rotated_query = scratch.rotated_query;
         qf.quantized_query = scratch.quantized_query;
         qf.lut = scratch.lut;
+        qf.low_val = FLT_MAX;
+        qf.high_val = -FLT_MAX;
 
         assert(qf.rotated_query != nullptr);
         assert(qf.quantized_query != nullptr);
@@ -166,13 +169,15 @@ public:
             qf.low_val = std::min(qf.low_val, tmp);
             qf.high_val = std::max(qf.high_val, tmp);
         }
-        qf.width = (qf.high_val - qf.low_val) / ((1 << QG_BQUERY) - 1);
+        const float query_span = qf.high_val - qf.low_val;
+        qf.width = query_span * kQueryLevelsInv;
 
         // quantize the query 
-        float inv_width = 1.0F / qf.width;
+        const float inv_width = 1.0f / qf.width;
         int32_t sum = 0;
         for (size_t i = 0; i < padded_dim_; ++i) {
-            uint8_t cur = static_cast<uint8_t>(std::lround(((qf.rotated_query[i] - qf.low_val) * inv_width) + 0.5));
+            const float scaled = ((qf.rotated_query[i] - qf.low_val) * inv_width) + 0.5f;
+            const uint8_t cur = static_cast<uint8_t>(lroundf(scaled));
             qf.quantized_query[i] = cur;
             sum += cur;
         }

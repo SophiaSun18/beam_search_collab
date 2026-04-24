@@ -164,7 +164,7 @@ int main(int argc, char** argv) {
 
     double qps = nq / elapsed;
     double latency_ms = elapsed / nq * 1000;
-    float recall = compute_recall(results.data(), groundtruth.data(), nq, K, gt_k);
+    float recall = compute_recall(results.data(), groundtruth.data(), nq, K, gt_k) * 100.0f;
     
     // Output the results
     cout << "\n========================================\n";

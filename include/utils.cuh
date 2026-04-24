@@ -1,5 +1,6 @@
 #pragma once
 #include <cfloat>
+#include <cstdint>
 #include <cassert>
 #include <climits>
 #include <iostream>
@@ -795,6 +796,7 @@ static __device__ inline void rotate_vector_gpu(const float* src, float* dst,
 
 static __device__ void query_prepare_gpu(const float* query_raw, QueryFactors& scratch,
     const float* signs_ptr, int dim, int padded_dim) {
+  constexpr float kQueryLevelsInv = 1.0f / static_cast<float>((1 << QG_BQUERY) - 1);
 
   int tid = threadIdx.x;
   int lane_id = tid % WARP_SIZE;
@@ -839,18 +841,20 @@ static __device__ void query_prepare_gpu(const float* query_raw, QueryFactors& s
     if (lane_id == 0) {
       scratch.low_val = local_min;
       scratch.high_val = local_max;
-      scratch.width = (scratch.high_val - scratch.low_val) / ((1 << QG_BQUERY) - 1);
+      const float query_span = scratch.high_val - scratch.low_val;
+      scratch.width = query_span * kQueryLevelsInv;
     }
   }
   __syncthreads();
 
   // quantize the query 
-  float inv_width = 1.0F / scratch.width;
+  const float inv_width = 1.0f / scratch.width;
 
   __shared__ int32_t warp_sum[WARPS_PER_BLOCK];
   int32_t local_sum = 0;
   for (size_t i = tid; i < padded_dim; i += blockDim.x) {
-      uint8_t cur = static_cast<uint8_t>(lroundf(((scratch.rotated_query[i] - scratch.low_val) * inv_width) + 0.5));
+      const float scaled = ((scratch.rotated_query[i] - scratch.low_val) * inv_width) + 0.5f;
+      uint8_t cur = static_cast<uint8_t>(lroundf(scaled));
       scratch.quantized_query[i] = cur;
       local_sum += cur;
   }
