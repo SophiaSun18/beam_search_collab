@@ -43,12 +43,114 @@ class SharedBitonicTopK {
     __device__ void merge(float (&dist)[REG], uint32_t (&idx)[REG]);
     __device__ unsigned pick(uint32_t (&idx)[N], unsigned n);
     __device__ void flush(float* dist, uint32_t* idx, unsigned n);
+    private: // helpers
+    template <bool asc = true>
+    __device__ static inline void bitonic_sort_local(
+            float (&d)[REG], uint32_t (&i)[REG]);
+    template <bool asc = true>
+    __device__ static inline void bitonic_sort_block(
+            float (&d)[REG], uint32_t (&i)[REG], float* scratch_d, uint32_t* scratch_i);
+    __device__ static inline void butterfly(
+            float (&a_d)[REG], uint32_t (&a_i)[REG], float (&b_d)[REG], uint32_t (&b_i)[REG]);
 };
+
+template <unsigned N, unsigned BX, unsigned REG>
+__device__ void SharedBitonicTopK<N, BX, REG>::merge(float (&dist)[REG], uint32_t (&idx)[REG]) {
+    static_assert(N == BX * REG, "N must equal BX * REG");
+    const unsigned tid = threadIdx.x;
+    const unsigned chunks = topk / N;
+    // [1] dist/idx arrive ascending (the incoming candidates).
+    for (unsigned c = 0; c < chunks; c++) {
+        // [2] Load chunk c into registers
+        float    dist_[REG];
+        uint32_t idx_[REG];
+        #pragma unroll
+        for (unsigned j = 0; j < REG; j++) {
+            unsigned pos = c * N + tid * REG + j;
+            dist_[j] = topk_dist[pos];
+            idx_[j]  = topk_idx[pos];
+        }
+        // [3] Butterfly: dist gets min (lower half), dist_ gets max (upper half)
+        butterfly(dist, idx, dist_, idx_);
+        // [5] If not first chunk, sort upper half descending and flush to previous chunk
+        if (c > 0) {
+            bitonic_sort_block<false>(dist_, idx_, topk_dist, topk_idx);
+            #pragma unroll
+            for (unsigned j = 0; j < REG; j++) {
+                unsigned pos = (c - 1) * N + tid * REG + j;
+                topk_dist[pos] = dist_[j];
+                topk_idx[pos]  = idx_[j];
+            }
+            __syncthreads();
+        }
+        // [6] Sort lower half ascending, ready for next chunk
+        bitonic_sort_block<true>(dist, idx, topk_dist, topk_idx);
+    }
+    // [7] Flush last chunk descending
+    bitonic_sort_block<false>(dist, idx, topk_dist, topk_idx);
+    #pragma unroll
+    for (unsigned j = 0; j < REG; j++) {
+        unsigned pos = (chunks - 1) * N + tid * REG + j;
+        topk_dist[pos] = dist[j];
+        topk_idx[pos]  = idx[j];
+    }
+    __syncthreads();
+}
+
+template <unsigned N, unsigned BX, unsigned REG>
+__device__ unsigned SharedBitonicTopK<N, BX, REG>::pick(uint32_t (&out)[N], unsigned n) {
+    constexpr uint32_t MSB = 0x80000000;
+    const unsigned tid = threadIdx.x;
+    unsigned found = 0;
+
+    // Smallest elements at the tail (descending buffer). Scan backwards.
+    unsigned base = (topk > 32) ? topk - 32 : 0;
+    while (found < n) {
+        uint32_t val = 0;
+        bool unmarked = false;
+        if (tid < 32 && base + tid < topk) {
+            val = topk_idx[base + tid];
+            unmarked = ((val & MSB) == 0) && (val != 0xFFFFFFFF);
+        }
+
+        uint32_t ballot = __ballot_sync(0xffffffff, unmarked);
+        if (ballot == 0) {
+            if (base == 0) break;
+            base = (base > 32) ? base - 32 : 0;
+            continue;
+        }
+
+        unsigned count = __popc(ballot);
+        unsigned lane_prefix = __popc(ballot & ((1u << tid) - 1));
+
+        if (unmarked && found + lane_prefix < n) {
+            out[found + lane_prefix] = base + tid;
+            topk_idx[base + tid] = val | MSB;
+        }
+
+        found += count;
+        if (base == 0) break;
+        base = (base > 32) ? base - 32 : 0;
+    }
+
+    return (found < n) ? found : n;
+}
+
+template <unsigned N, unsigned BX, unsigned REG>
+__device__ void SharedBitonicTopK<N, BX, REG>::flush(float* dist, uint32_t* idx, unsigned n) {
+    const unsigned tid = threadIdx.x;
+    // Copy the n smallest elements (at the tail of the descending buffer).
+    for (unsigned i = tid; i < n; i += BX) {
+        unsigned pos = topk - n + i;
+        dist[i] = topk_dist[pos];
+        idx[i]  = topk_idx[pos] & ~0x80000000u;  // clear MSB mark
+    }
+}
 
 // Pairwise min/max split.
 //   a[j] = min(a[j], b[j]),  b[j] = max(a[j], b[j])
-template <unsigned REG>
-__device__ inline void butterfly(
+template <unsigned N, unsigned BX, unsigned REG>
+__device__ inline void SharedBitonicTopK<N, BX, REG>::butterfly(
     float (&a_d)[REG], uint32_t (&a_i)[REG],
     float (&b_d)[REG], uint32_t (&b_i)[REG])
 {
@@ -62,8 +164,9 @@ __device__ inline void butterfly(
 }
 
 // Bitonic sort REG elements within a single thread.
-template <unsigned REG, bool asc = true>
-__device__ inline void bitonic_sort_local(float (&d)[REG], uint32_t (&i)[REG]) {
+template <unsigned N, unsigned BX, unsigned REG>
+template <bool asc>
+__device__ inline void SharedBitonicTopK<N, BX, REG>::bitonic_sort_local(float (&d)[REG], uint32_t (&i)[REG]) {
     #pragma unroll
     for (unsigned len = 2; len <= REG; len <<= 1) {
         #pragma unroll
@@ -85,14 +188,15 @@ __device__ inline void bitonic_sort_local(float (&d)[REG], uint32_t (&i)[REG]) {
 
 // Bitonic sort across BX threads, each holding REG elements.
 // Total sorted elements = BX * REG.
-template <unsigned BX, unsigned REG, bool asc = true>
-__device__ inline void bitonic_sort_block(
+template <unsigned N, unsigned BX, unsigned REG>
+template <bool asc>
+__device__ inline void SharedBitonicTopK<N, BX, REG>::bitonic_sort_block(
     float (&d)[REG], uint32_t (&i)[REG],
     float* scratch_d, uint32_t* scratch_i)
 {
     const unsigned tid = threadIdx.x;
     constexpr unsigned TOTAL = BX * REG;
-    bitonic_sort_local<REG, asc>(d, i);
+    bitonic_sort_local<asc>(d, i);
     for (unsigned len = 2 * REG; len <= TOTAL; len <<= 1) {
         for (unsigned stride = len >> 1; stride >= 1; stride >>= 1) {
             if (stride >= REG) {
@@ -153,95 +257,3 @@ __device__ inline void bitonic_sort_block(
     }
 }
 
-template <unsigned N, unsigned BX, unsigned REG>
-__device__ void SharedBitonicTopK<N, BX, REG>::merge(float (&dist)[REG], uint32_t (&idx)[REG]) {
-    static_assert(N == BX * REG, "N must equal BX * REG");
-    const unsigned tid = threadIdx.x;
-    const unsigned chunks = topk / N;
-    // [1] dist/idx arrive ascending (the incoming candidates).
-    for (unsigned c = 0; c < chunks; c++) {
-        // [2] Load chunk c into registers
-        float    dist_[REG];
-        uint32_t idx_[REG];
-        #pragma unroll
-        for (unsigned j = 0; j < REG; j++) {
-            unsigned pos = c * N + tid * REG + j;
-            dist_[j] = topk_dist[pos];
-            idx_[j]  = topk_idx[pos];
-        }
-        // [3] Butterfly: dist gets min (lower half), dist_ gets max (upper half)
-        butterfly<REG>(dist, idx, dist_, idx_);
-        // [5] If not first chunk, sort upper half descending and flush to previous chunk
-        if (c > 0) {
-            bitonic_sort_block<BX, REG, false>(dist_, idx_, topk_dist, topk_idx);
-            #pragma unroll
-            for (unsigned j = 0; j < REG; j++) {
-                unsigned pos = (c - 1) * N + tid * REG + j;
-                topk_dist[pos] = dist_[j];
-                topk_idx[pos]  = idx_[j];
-            }
-            __syncthreads();
-        }
-        // [6] Sort lower half ascending, ready for next chunk
-        bitonic_sort_block<BX, REG, true>(dist, idx, topk_dist, topk_idx);
-    }
-    // [7] Flush last chunk descending
-    bitonic_sort_block<BX, REG, false>(dist, idx, topk_dist, topk_idx);
-    #pragma unroll
-    for (unsigned j = 0; j < REG; j++) {
-        unsigned pos = (chunks - 1) * N + tid * REG + j;
-        topk_dist[pos] = dist[j];
-        topk_idx[pos]  = idx[j];
-    }
-    __syncthreads();
-}
-
-template <unsigned N, unsigned BX, unsigned REG>
-__device__ unsigned SharedBitonicTopK<N, BX, REG>::pick(uint32_t (&out)[N], unsigned n) {
-    constexpr uint32_t MSB = 0x80000000;
-    const unsigned tid = threadIdx.x;
-    unsigned found = 0;
-
-    // Smallest elements at the tail (descending buffer). Scan backwards.
-    unsigned base = (topk > 32) ? topk - 32 : 0;
-    while (found < n) {
-        uint32_t val = 0;
-        bool unmarked = false;
-        if (tid < 32 && base + tid < topk) {
-            val = topk_idx[base + tid];
-            unmarked = ((val & MSB) == 0) && (val != 0xFFFFFFFF);
-        }
-
-        uint32_t ballot = __ballot_sync(0xffffffff, unmarked);
-        if (ballot == 0) {
-            if (base == 0) break;
-            base = (base > 32) ? base - 32 : 0;
-            continue;
-        }
-
-        unsigned count = __popc(ballot);
-        unsigned lane_prefix = __popc(ballot & ((1u << tid) - 1));
-
-        if (unmarked && found + lane_prefix < n) {
-            out[found + lane_prefix] = base + tid;
-            topk_idx[base + tid] = val | MSB;
-        }
-
-        found += count;
-        if (base == 0) break;
-        base = (base > 32) ? base - 32 : 0;
-    }
-
-    return (found < n) ? found : n;
-}
-
-template <unsigned N, unsigned BX, unsigned REG>
-__device__ void SharedBitonicTopK<N, BX, REG>::flush(float* dist, uint32_t* idx, unsigned n) {
-    const unsigned tid = threadIdx.x;
-    // Copy the n smallest elements (at the tail of the descending buffer).
-    for (unsigned i = tid; i < n; i += BX) {
-        unsigned pos = topk - n + i;
-        dist[i] = topk_dist[pos];
-        idx[i]  = topk_idx[pos] & ~0x80000000u;  // clear MSB mark
-    }
-}
