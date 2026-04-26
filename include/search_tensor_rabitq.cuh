@@ -1,6 +1,7 @@
 #pragma once
 #include "utils.cuh"
 #include "hash_filter.cuh"
+#include "topk.cuh"
 #include <cstdint>
 #include <mma.h>
 #include <cuda_runtime.h>
@@ -11,7 +12,7 @@
 #define HASH_TABLE_CONFIG   1
 #define INTERNAL_TOPK   128
 #define CANDIDATE_BUFFER_SIZE 64
-#define RESULT_BUFFER_SIZE INTERNAL_TOPK + CANDIDATE_BUFFER_SIZE
+#define TOPK_BUFFER_SIZE  BLOCK_SIZE
 
 static constexpr int TENSOR_RABITQ_BATCH = 16;
 static constexpr int TENSOR_RABITQ_TILE = 16;
@@ -70,15 +71,17 @@ static __device__ inline void estimate_distance_tensor_tile_gpu(
 }
 
 static __host__ inline uint32_t calculate_shared_mem_size_tensor(int dim, int topk, int max_deg, int search_width, int bitlen) {
-    
+
     auto align_up = [](size_t value, size_t alignment) { return (value + alignment - 1) & ~(alignment - 1);};
-    
+
     size_t padded_dim = 1ULL << static_cast<size_t>(ceilf(log2f(dim)));
     size_t code_words = padded_dim / 64;
-    size_t size = 0;    
+    size_t size = 0;
+    size += TOPK_BUFFER_SIZE * sizeof(INDEX_T);             // top k index
+    size += TOPK_BUFFER_SIZE * sizeof(DISTANCE_T);          // top k distance
+    size += CANDIDATE_BUFFER_SIZE * sizeof(INDEX_T);        // candidate index
+    size += CANDIDATE_BUFFER_SIZE * sizeof(DISTANCE_T);     // candidate distance
     size += HashFilter::shared_mem_bytes(BITLEN);            // hash table
-    size += RESULT_BUFFER_SIZE * sizeof(INDEX_T);           // top k and candidate index
-    size += RESULT_BUFFER_SIZE * sizeof(DISTANCE_T);        // top k and candidate distance
     size += SEARCH_WIDTH * sizeof(INDEX_T);                 // next expanders / parent buffer
     size += dim * 4;                                        // query buffer size
     size += padded_dim * sizeof(float);                     // rotated query
@@ -126,21 +129,17 @@ void TensorCoreQuantizedBeamSearch(
     const int tid = threadIdx.x;
     const int warp_id = tid / WARP_SIZE;
     const int lane_id = tid % WARP_SIZE;
-    
+
     size_t padded_dim = 1ULL << static_cast<size_t>(ceilf(log2f(dim)));
     size_t code_words = padded_dim / 64;
 
     // initialize the shared memory
     extern __shared__ char shared_memory[];
-    INDEX_T* ALL_INDEX = (INDEX_T*)shared_memory;
-    INDEX_T* TOP_K_INDEX      = ALL_INDEX;
-    INDEX_T* CANDIDATE_INDEX  = ALL_INDEX + INTERNAL_TOPK;
-
-    DISTANCE_T* ALL_DISTANCE = (DISTANCE_T*)(ALL_INDEX + RESULT_BUFFER_SIZE);
-    DISTANCE_T* TOP_K_DISTANCE      = ALL_DISTANCE;
-    DISTANCE_T* CANDIDATE_DISTANCE  = ALL_DISTANCE + INTERNAL_TOPK;
-
-    INDEX_T* HASH_TABLE = (INDEX_T*)(ALL_DISTANCE + RESULT_BUFFER_SIZE);
+    INDEX_T* TOP_K_INDEX = (INDEX_T*)shared_memory;
+    DISTANCE_T* TOP_K_DISTANCE = (DISTANCE_T*)(TOP_K_INDEX + TOPK_BUFFER_SIZE);
+    INDEX_T* CANDIDATE_INDEX = (INDEX_T*)(TOP_K_DISTANCE + TOPK_BUFFER_SIZE);
+    DISTANCE_T* CANDIDATE_DISTANCE = (DISTANCE_T*)(CANDIDATE_INDEX + CANDIDATE_BUFFER_SIZE);
+    INDEX_T* HASH_TABLE = (INDEX_T*)(CANDIDATE_DISTANCE + CANDIDATE_BUFFER_SIZE);
     HashFilter hf(HASH_TABLE, BITLEN);
     INDEX_T* PARENT_LIST = (INDEX_T*)(HASH_TABLE + HashFilter::shared_mem_bytes(BITLEN) / sizeof(INDEX_T));
     DATA_T* QUERY_BUFFER = (DATA_T*)(PARENT_LIST + SEARCH_WIDTH);
@@ -164,7 +163,7 @@ void TensorCoreQuantizedBeamSearch(
     mma_output_base = reinterpret_cast<char*>((reinterpret_cast<uintptr_t>(mma_output_base) + alignof(int) - 1) &
                                               ~(static_cast<uintptr_t>(alignof(int)) - 1));
     int* MMA_OUTPUT_TILE = reinterpret_cast<int*>(mma_output_base);
-    
+
     uint32_t* counter = reinterpret_cast<uint32_t*>(MMA_OUTPUT_TILE + TENSOR_RABITQ_BATCH * TENSOR_RABITQ_TILE);
     uint32_t* hops = counter + 1;
     uint32_t* stats = hops + 1;
@@ -172,6 +171,8 @@ void TensorCoreQuantizedBeamSearch(
     timing_base = reinterpret_cast<char*>((reinterpret_cast<uintptr_t>(timing_base) + alignof(gpu_long_t) - 1) &
                                           ~(static_cast<uintptr_t>(alignof(gpu_long_t)) - 1));
     gpu_long_t* timing = reinterpret_cast<gpu_long_t*>(timing_base);
+
+    SharedBitonicTopK<BLOCK_SIZE, 1> topk(TOPK_BUFFER_SIZE, TOP_K_DISTANCE, TOP_K_INDEX);
 
     __shared__ QueryFactors qf;
 
@@ -209,11 +210,15 @@ void TensorCoreQuantizedBeamSearch(
     for (int i = tid; i < dim; i += blockDim.x) {
         if (i < dim) QUERY_BUFFER[i] = query[i];
     }
-    
+
     // load the top k list and candidate list with dummy initial values
-    for (int i = tid; i < RESULT_BUFFER_SIZE; i += blockDim.x) {
-        ALL_INDEX[i] = MAX_INDEX;
-        ALL_DISTANCE[i] = FLT_MAX;
+    for (int i = tid; i < TOPK_BUFFER_SIZE; i += blockDim.x) {
+        TOP_K_INDEX[i] = MAX_INDEX;
+        TOP_K_DISTANCE[i] = FLT_MAX;
+    }
+    for (int i = tid; i < CANDIDATE_BUFFER_SIZE; i += blockDim.x) {
+        CANDIDATE_INDEX[i] = MAX_INDEX;
+        CANDIDATE_DISTANCE[i] = FLT_MAX;
     }
 
     // only the first slot in candidate list is actually initialized with valid entry point
@@ -226,7 +231,7 @@ void TensorCoreQuantizedBeamSearch(
             atomicAdd(&timing[GPU_TIMING_L2_CALLS], gpu_long_t(1));
             atomicAdd(&timing[GPU_TIMING_L2_CYCLES], gpu_globaltimer() - l2_start);
         }
-        hf.insert(entry_point);
+        if (lane_id == 0) hf.insert(entry_point);
     }
     __syncthreads();
 
@@ -234,7 +239,7 @@ void TensorCoreQuantizedBeamSearch(
     query_prepare_gpu(QUERY_BUFFER, qf, d_qg_signs, dim, padded_dim);
     prepare_tensor_query_matrix_gpu(qf, static_cast<int>(padded_dim), QUERY_MATRIX_TILE);
     __syncthreads();
-    
+
     // loop end condition: either entire topK expanded, or reach max iteration limit
     for (int iter = 0; iter < MAX_ITERATIONS; iter++) {
 
@@ -246,15 +251,23 @@ void TensorCoreQuantizedBeamSearch(
             __syncthreads();
         }
 
-        // use warp level sort to find the actual closest top K elements and update the topK list
-        topk_by_bitonic_sort<2, INTERNAL_TOPK / WARP_SIZE>(ALL_INDEX, ALL_DISTANCE, RESULT_BUFFER_SIZE,
-            CANDIDATE_BUFFER_SIZE, INTERNAL_TOPK, (iter == 0));
-        __syncthreads();
+        // merge candidates into topk buffer
+        {
+            float    dist[1];
+            uint32_t idx[1];
+            dist[0] = (tid < CANDIDATE_BUFFER_SIZE) ? CANDIDATE_DISTANCE[tid] : FLT_MAX;
+            idx[0]  = (tid < CANDIDATE_BUFFER_SIZE) ? CANDIDATE_INDEX[tid]    : MAX_INDEX;
+            topk.merge(dist, idx);
+        }
 
-        // warp 0 pick the top-N unexpanded nodes and store in shared memory
-        // this already marks the expanded nodes MSB to 1, no need to mark again
-        if (warp_id == 0) {
-            keep_expanding = pick_expanders(SEARCH_WIDTH, PARENT_LIST, INTERNAL_TOPK, TOP_K_INDEX);
+        // pick the top-N unexpanded nodes
+        {
+            uint32_t parent_buf[BLOCK_SIZE];
+            unsigned found = topk.pick(parent_buf, SEARCH_WIDTH);
+            if (warp_id == 0 && lane_id == 0) {
+                keep_expanding = found;
+                if (found > 0) PARENT_LIST[0] = parent_buf[0];
+            }
         }
         __syncthreads();
         if (!keep_expanding) {
@@ -376,14 +389,18 @@ void TensorCoreQuantizedBeamSearch(
         __syncthreads();
     }
 
-    // final sort before writeback
-    topk_by_bitonic_sort<2, INTERNAL_TOPK / WARP_SIZE>(ALL_INDEX, ALL_DISTANCE, RESULT_BUFFER_SIZE,
-        CANDIDATE_BUFFER_SIZE, INTERNAL_TOPK, false);
-    __syncthreads();
+    // final merge before writeback
+    {
+        float    dist[1];
+        uint32_t idx[1];
+        dist[0] = (tid < CANDIDATE_BUFFER_SIZE) ? CANDIDATE_DISTANCE[tid] : FLT_MAX;
+        idx[0]  = (tid < CANDIDATE_BUFFER_SIZE) ? CANDIDATE_INDEX[tid]    : MAX_INDEX;
+        topk.merge(dist, idx);
+    }
 
-    // return the top K result
+    // return the top K result (smallest K at tail of descending buffer)
     for (int i = tid; i < K; i += blockDim.x) {
-        d_results[query_id * K + i] = TOP_K_INDEX[i] & ~0x80000000;
+        d_results[query_id * K + i] = TOP_K_INDEX[TOPK_BUFFER_SIZE - K + i] & ~0x80000000u;
     }
     if (tid == 0) {
         if (GPU_SEARCH_STATS) {

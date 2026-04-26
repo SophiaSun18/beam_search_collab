@@ -1,6 +1,7 @@
 #pragma once
 #include "utils.cuh"
 #include "hash_filter.cuh"
+#include "topk.cuh"
 #include <cuda_runtime.h>
 #ifndef INTERNAL_TOPK
 #define INTERNAL_TOPK   128
@@ -14,14 +15,16 @@
 #define THRESHOLD_CONFIG    0
 #define HASH_TABLE_CONFIG   1
 #define CANDIDATE_BUFFER_SIZE 64
-#define RESULT_BUFFER_SIZE (INTERNAL_TOPK + CANDIDATE_BUFFER_SIZE)
+#define TOPK_BUFFER_SIZE  BLOCK_SIZE  // must be >= BLOCK_SIZE * REG for SharedBitonicTopK
 
-static __host__ inline uint32_t calculate_shared_mem_size(int dim, int topk, int max_deg, 
+static __host__ inline uint32_t calculate_shared_mem_size(int dim, int topk, int max_deg,
                                                            int search_width, int bitlen) {
-    size_t size = 0;    
+    size_t size = 0;
+    size += TOPK_BUFFER_SIZE * sizeof(INDEX_T);             // top k index
+    size += TOPK_BUFFER_SIZE * sizeof(DISTANCE_T);          // top k distance
+    size += CANDIDATE_BUFFER_SIZE * sizeof(INDEX_T);        // candidate index
+    size += CANDIDATE_BUFFER_SIZE * sizeof(DISTANCE_T);     // candidate distance
     size += HashFilter::shared_mem_bytes(BITLEN);            // hash table
-    size += RESULT_BUFFER_SIZE * sizeof(INDEX_T);           // top k and candidate index
-    size += RESULT_BUFFER_SIZE * sizeof(DISTANCE_T);        // top k and candidate distance
     size += SEARCH_WIDTH * sizeof(INDEX_T);                 // next expanders / parent buffer
     size += dim * 4;                                        // query buffer size
     size += 2 * 4;                                          // terminate flag and counter
@@ -70,15 +73,11 @@ void BeamSearch(
 
     // initialize the shared memory
     extern __shared__ char shared_memory[];
-    INDEX_T* ALL_INDEX = (INDEX_T*)shared_memory;
-    INDEX_T* TOP_K_INDEX      = ALL_INDEX;
-    INDEX_T* CANDIDATE_INDEX  = ALL_INDEX + INTERNAL_TOPK;
-
-    DISTANCE_T* ALL_DISTANCE = (DISTANCE_T*)(ALL_INDEX + RESULT_BUFFER_SIZE);
-    DISTANCE_T* TOP_K_DISTANCE      = ALL_DISTANCE;
-    DISTANCE_T* CANDIDATE_DISTANCE  = ALL_DISTANCE + INTERNAL_TOPK;
-
-    INDEX_T* HASH_TABLE = (INDEX_T*)(ALL_DISTANCE + RESULT_BUFFER_SIZE);
+    INDEX_T* TOP_K_INDEX = (INDEX_T*)shared_memory;
+    DISTANCE_T* TOP_K_DISTANCE = (DISTANCE_T*)(TOP_K_INDEX + TOPK_BUFFER_SIZE);
+    INDEX_T* CANDIDATE_INDEX = (INDEX_T*)(TOP_K_DISTANCE + TOPK_BUFFER_SIZE);
+    DISTANCE_T* CANDIDATE_DISTANCE = (DISTANCE_T*)(CANDIDATE_INDEX + CANDIDATE_BUFFER_SIZE);
+    INDEX_T* HASH_TABLE = (INDEX_T*)(CANDIDATE_DISTANCE + CANDIDATE_BUFFER_SIZE);
     HashFilter hf(HASH_TABLE, BITLEN);
     INDEX_T* PARENT_LIST = (INDEX_T*)(HASH_TABLE + HashFilter::shared_mem_bytes(BITLEN) / sizeof(INDEX_T));
     DATA_T* QUERY_BUFFER = (DATA_T*)(PARENT_LIST + SEARCH_WIDTH);
@@ -86,6 +85,8 @@ void BeamSearch(
     uint32_t* hops = (uint32_t*)(counter + 1);
     uint32_t* stats = hops + 1;
     gpu_long_t* timing = reinterpret_cast<gpu_long_t*>(stats + (GPU_SEARCH_STATS ? GPU_SEARCH_STAT_COUNT : 0));
+
+    SharedBitonicTopK<BLOCK_SIZE, 1> topk(TOPK_BUFFER_SIZE, TOP_K_DISTANCE, TOP_K_INDEX);
 
     // initialize the block-wise total distance computation count
     __shared__ uint32_t keep_expanding;
@@ -109,9 +110,9 @@ void BeamSearch(
     for (int i = tid; i < dim; i += blockDim.x) {
         if (i < dim) QUERY_BUFFER[i] = query[i];
     }
-    
+
     // load the top k list with dummy initial values
-    for (int i = tid; i < INTERNAL_TOPK; i += blockDim.x) {
+    for (int i = tid; i < TOPK_BUFFER_SIZE; i += blockDim.x) {
         TOP_K_INDEX[i] = MAX_INDEX;
         TOP_K_DISTANCE[i] = FLT_MAX;
     }
@@ -138,7 +139,7 @@ void BeamSearch(
         }
     }
     __syncthreads();
-    
+
     // loop end condition: either entire topK expanded, or reach max iteration limit
     for (int iter = 0; iter < MAX_ITERATIONS; iter++) {
 
@@ -149,17 +150,22 @@ void BeamSearch(
             }
             __syncthreads();
         }
-      
-        // use warp level sort to find the actual closest top K elements and update the topK list
-        topk_by_sort_candidates_and_merge<2, INTERNAL_TOPK / WARP_SIZE>(ALL_INDEX, ALL_DISTANCE, RESULT_BUFFER_SIZE,
-            CANDIDATE_BUFFER_SIZE, INTERNAL_TOPK, (iter == 0));
-        __syncthreads();
+
+        // merge candidates into topk buffer
+        {
+            float    dist[1];
+            uint32_t idx[1];
+            dist[0] = (tid < CANDIDATE_BUFFER_SIZE) ? CANDIDATE_DISTANCE[tid] : FLT_MAX;
+            idx[0]  = (tid < CANDIDATE_BUFFER_SIZE) ? CANDIDATE_INDEX[tid]    : MAX_INDEX;
+            topk.merge(dist, idx);
+        }
 
         if (debug_mode && query_id == 0 && tid == 0) {
             printf("[DEBUG] iteration %d\n", iter + 1);
             printf("  beam state:\n");
-            for (int i = 0; i < INTERNAL_TOPK; ++i) {
+            for (int i = 0; i < TOPK_BUFFER_SIZE; ++i) {
                 const INDEX_T raw = TOP_K_INDEX[i];
+                if (raw == MAX_INDEX) continue;
                 const bool expanded = (raw & 0x80000000u) != 0;
                 printf("    idx=%d, node=%u, dist=%.6f, expanded=%s\n",
                        i,
@@ -176,18 +182,23 @@ void BeamSearch(
             }
         }
 
-        // warp 0 pick the top-N unexpanded nodes and store in shared memory
-        // this already marks the expanded nodes MSB to 1, no need to mark again
-        if (warp_id == 0) {
-            keep_expanding = pick_expanders(SEARCH_WIDTH, PARENT_LIST, INTERNAL_TOPK, TOP_K_INDEX);
+        // pick the top-N unexpanded nodes
+        {
+            uint32_t parent_buf[BLOCK_SIZE];
+            unsigned found = topk.pick(parent_buf, SEARCH_WIDTH);
+            if (warp_id == 0 && lane_id == 0) {
+                keep_expanding = found;
+                if (found > 0) PARENT_LIST[0] = parent_buf[0];
+            }
         }
         __syncthreads();
+
         if (debug_mode && query_id == 0 && tid == 0) {
             const INDEX_T parent_slot = PARENT_LIST[0];
             const INDEX_T parent_raw =
-                (keep_expanding && parent_slot < INTERNAL_TOPK) ? TOP_K_INDEX[parent_slot] : MAX_INDEX;
+                (keep_expanding && parent_slot < TOPK_BUFFER_SIZE) ? TOP_K_INDEX[parent_slot] : MAX_INDEX;
             const DISTANCE_T parent_dist =
-                (keep_expanding && parent_slot < INTERNAL_TOPK) ? TOP_K_DISTANCE[parent_slot] : FLT_MAX;
+                (keep_expanding && parent_slot < TOPK_BUFFER_SIZE) ? TOP_K_DISTANCE[parent_slot] : FLT_MAX;
             if (keep_expanding) {
                 printf("  expanding node: %u\n", parent_raw & 0x7fffffff);
                 printf("  expanding slot: %u, dist=%.6f\n", parent_slot, parent_dist);
@@ -254,15 +265,20 @@ void BeamSearch(
         __syncthreads();
     }
 
-    // final sort before writeback
-    topk_by_sort_candidates_and_merge<2, INTERNAL_TOPK / WARP_SIZE>(ALL_INDEX, ALL_DISTANCE, RESULT_BUFFER_SIZE,
-        CANDIDATE_BUFFER_SIZE, INTERNAL_TOPK, false);
-    __syncthreads();
-
-    // return the top K result
-    for (int i = tid; i < K; i += blockDim.x) {
-        d_results[query_id * K + i] = TOP_K_INDEX[i] & ~0x80000000;
+    // final merge before writeback
+    {
+        float    dist[1];
+        uint32_t idx[1];
+        dist[0] = (tid < CANDIDATE_BUFFER_SIZE) ? CANDIDATE_DISTANCE[tid] : FLT_MAX;
+        idx[0]  = (tid < CANDIDATE_BUFFER_SIZE) ? CANDIDATE_INDEX[tid]    : MAX_INDEX;
+        topk.merge(dist, idx);
     }
+
+    // return the top K result (smallest K at tail of descending buffer)
+    for (int i = tid; i < K; i += blockDim.x) {
+        d_results[query_id * K + i] = TOP_K_INDEX[TOPK_BUFFER_SIZE - K + i] & ~0x80000000u;
+    }
+
     if (tid == 0) {
         if (GPU_SEARCH_STATS) {
             stats[GPU_SEARCH_STAT_DIST_CMPS] = counter[0];

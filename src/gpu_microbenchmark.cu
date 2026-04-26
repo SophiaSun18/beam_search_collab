@@ -150,42 +150,48 @@ __global__ void benchTc(const uint64_t* __restrict__ codes,
     }
 }
 
-/// @brief benchmark topk_by_bitonic_sort under full GPU load
+/// @brief benchmark SharedBitonicTopK merge under full GPU load
 /// @param seed random distances for candidate reinit [CANDIDATE_BUFFER_SIZE]
 /// @param out per-block output: out[blockIdx.x] = total ns
 __global__ void benchSt(const float* __restrict__ seed,
                         gpu_long_t* out) {
     int tid = threadIdx.x;
-    int wid = tid / WARP_SIZE;
-    int lid = tid % WARP_SIZE;
 
-    __shared__ INDEX_T idx[RESULT_BUFFER_SIZE];
-    __shared__ DISTANCE_T dst[RESULT_BUFFER_SIZE];
+    __shared__ INDEX_T s_idx[TOPK_BUFFER_SIZE];
+    __shared__ DISTANCE_T s_dst[TOPK_BUFFER_SIZE];
+    __shared__ INDEX_T c_idx[CANDIDATE_BUFFER_SIZE];
+    __shared__ DISTANCE_T c_dst[CANDIDATE_BUFFER_SIZE];
 
-    for (int i = tid; i < RESULT_BUFFER_SIZE; i += blockDim.x) {
-        idx[i] = i;
-        dst[i] = seed[i % CANDIDATE_BUFFER_SIZE];
+    for (int i = tid; i < TOPK_BUFFER_SIZE; i += blockDim.x) {
+        s_idx[i] = MAX_INDEX;
+        s_dst[i] = FLT_MAX;
+    }
+    for (int i = tid; i < CANDIDATE_BUFFER_SIZE; i += blockDim.x) {
+        c_idx[i] = i;
+        c_dst[i] = seed[i];
     }
     __syncthreads();
 
-    topk_128_by_bitonic_sort<2, INTERNAL_TOPK / WARP_SIZE>(
-        idx, dst, RESULT_BUFFER_SIZE,
-        CANDIDATE_BUFFER_SIZE, INTERNAL_TOPK, true);
-    __syncthreads();
+    SharedBitonicTopK<BLOCK_SIZE, 1> topk(TOPK_BUFFER_SIZE, s_dst, s_idx);
+
+    {
+        float d[1]; uint32_t x[1];
+        d[0] = (tid < CANDIDATE_BUFFER_SIZE) ? c_dst[tid] : FLT_MAX;
+        x[0] = (tid < CANDIDATE_BUFFER_SIZE) ? c_idx[tid] : MAX_INDEX;
+        topk.merge(d, x);
+    }
 
     gpu_long_t t0 = gpu_globaltimer();
     for (int i = 0; i < NREP; i++) {
-        if (wid == 0) {
-            for (int j = lid; j < CANDIDATE_BUFFER_SIZE; j += WARP_SIZE) {
-                idx[INTERNAL_TOPK + j] = INTERNAL_TOPK + j + i;
-                dst[INTERNAL_TOPK + j] = seed[(j + i) % CANDIDATE_BUFFER_SIZE];
-            }
+        for (int j = tid; j < CANDIDATE_BUFFER_SIZE; j += blockDim.x) {
+            c_idx[j] = TOPK_BUFFER_SIZE + j + i;
+            c_dst[j] = seed[(j + i) % CANDIDATE_BUFFER_SIZE];
         }
         __syncthreads();
-        topk_128_by_bitonic_sort<2, INTERNAL_TOPK / WARP_SIZE>(
-            idx, dst, RESULT_BUFFER_SIZE,
-            CANDIDATE_BUFFER_SIZE, INTERNAL_TOPK, false);
-        __syncthreads();
+        float d[1]; uint32_t x[1];
+        d[0] = (tid < CANDIDATE_BUFFER_SIZE) ? c_dst[tid] : FLT_MAX;
+        x[0] = (tid < CANDIDATE_BUFFER_SIZE) ? c_idx[tid] : MAX_INDEX;
+        topk.merge(d, x);
     }
     gpu_long_t t1 = gpu_globaltimer();
 
@@ -234,41 +240,45 @@ __global__ void benchHt(gpu_long_t* out) {
     }
 }
 
-/// @brief benchmark pick_expanders under full GPU load
+/// @brief benchmark SharedBitonicTopK::pick under full GPU load
 /// @param out per-block output: out[blockIdx.x] = total ns
 __global__ void benchPe(gpu_long_t* out) {
     int tid = threadIdx.x;
-    int wid = tid / WARP_SIZE;
 
-    __shared__ INDEX_T topk[INTERNAL_TOPK];
-    __shared__ INDEX_T plist[SEARCH_WIDTH];
+    __shared__ INDEX_T s_idx[TOPK_BUFFER_SIZE];
+    __shared__ DISTANCE_T s_dst[TOPK_BUFFER_SIZE];
 
-    for (int i = tid; i < INTERNAL_TOPK; i += blockDim.x)
-        topk[i] = i;
-    __syncthreads();
-
-    if (wid == 0) {
-        for (int i = 0; i < 100; i++) {
-            pick_expanders(SEARCH_WIDTH, plist, INTERNAL_TOPK, topk);
-            for (int j = tid; j < INTERNAL_TOPK; j += WARP_SIZE)
-                topk[j] &= 0x7fffffff;
-        }
+    for (int i = tid; i < TOPK_BUFFER_SIZE; i += blockDim.x) {
+        s_idx[i] = (i < INTERNAL_TOPK) ? i : MAX_INDEX;
+        s_dst[i] = (i < INTERNAL_TOPK) ? static_cast<float>(INTERNAL_TOPK - 1 - i) : FLT_MAX;
     }
     __syncthreads();
 
-    for (int i = tid; i < INTERNAL_TOPK; i += blockDim.x)
-        topk[i] = i;
+    SharedBitonicTopK<BLOCK_SIZE, 1> topk(TOPK_BUFFER_SIZE, s_dst, s_idx);
+
+    // warmup
+    for (int i = 0; i < 100; i++) {
+        uint32_t pbuf[BLOCK_SIZE];
+        topk.pick(pbuf, SEARCH_WIDTH);
+        // clear MSB for re-pick
+        for (int j = tid; j < TOPK_BUFFER_SIZE; j += blockDim.x)
+            s_idx[j] &= 0x7fffffff;
+        __syncthreads();
+    }
+
+    for (int i = tid; i < TOPK_BUFFER_SIZE; i += blockDim.x) {
+        s_idx[i] = (i < INTERNAL_TOPK) ? i : MAX_INDEX;
+    }
     __syncthreads();
 
     gpu_long_t t0 = gpu_globaltimer();
-    if (wid == 0) {
-        for (int i = 0; i < NREP; i++) {
-            pick_expanders(SEARCH_WIDTH, plist, INTERNAL_TOPK, topk);
-            for (int j = tid; j < INTERNAL_TOPK; j += WARP_SIZE)
-                topk[j] &= 0x7fffffff;
-        }
+    for (int i = 0; i < NREP; i++) {
+        uint32_t pbuf[BLOCK_SIZE];
+        topk.pick(pbuf, SEARCH_WIDTH);
+        for (int j = tid; j < TOPK_BUFFER_SIZE; j += blockDim.x)
+            s_idx[j] &= 0x7fffffff;
+        __syncthreads();
     }
-    __syncthreads();
     gpu_long_t t1 = gpu_globaltimer();
 
     if (tid == 0) {
