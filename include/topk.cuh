@@ -16,7 +16,7 @@ concept TopKBuffer = requires(
     uint32_t        (&idx)[REG],
     unsigned       	n
 ) {
-    // Merge per-thread REG sorted candidates into internal storage.
+    // Merge per-thread REG candidates (unsorted) into internal storage.
     { buf.merge(dist, idx) } -> std::same_as<void>;
 
     // Find up to `n` unexpanded nodes (MSB==0), mark them expanded,
@@ -56,11 +56,10 @@ class SharedBitonicTopK {
     /**
      * @brief Merge candidates into the descending internal buffer.
      *
-     * Assumes the global sequence across all BX threads is sorted ascending,
-     * with each thread holding its REG-element slice. The internal buffer
-     * must be sorted descending and its size must be a multiple of N.
+     * Input may be unsorted — the buffer sorts it internally. The internal
+     * buffer must be sorted descending and its size must be a multiple of N.
      *
-     * @param dist  Per-thread REG distances, ascending across threads.
+     * @param dist  Per-thread REG distances (unsorted).
      * @param idx   Per-thread REG indices, corresponding to dist.
      */
     __device__ void merge(float (&dist)[REG], uint32_t (&idx)[REG]);
@@ -106,7 +105,8 @@ __device__ void SharedBitonicTopK<BX, REG>::merge(float (&dist)[REG], uint32_t (
     __shared__ uint32_t scratch_i[N];
     const unsigned tid = threadIdx.x;
     const unsigned chunks = topk / N;
-    // [1] dist/idx arrive ascending (the incoming candidates).
+    // [1] Sort incoming candidates ascending.
+    bitonic_sort_block<true>(dist, idx, scratch_d, scratch_i);
     for (unsigned c = 0; c < chunks; c++) {
         // [2] Load chunk c into registers
         float    dist_[REG];

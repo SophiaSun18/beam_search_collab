@@ -65,34 +65,17 @@ bool run_no_dup_test(unsigned topk, unsigned n_total, unsigned seed) {
         std::swap(all_ids[i], all_ids[j]);
     }
 
-    // Buffer: first topk, sorted descending
-    std::vector<std::pair<float,uint32_t>> buf_pairs(topk);
-    for (unsigned i = 0; i < topk; i++)
-        buf_pairs[i] = {all_vals[i], all_ids[i]};
-    std::sort(buf_pairs.begin(), buf_pairs.end(),
-        [](auto& a, auto& b){ return a.first > b.first; });
+    // Buffer starts as FLT_MAX / 0xFFFFFFFF (empty)
+    std::vector<float> h_buf_dist(topk, FLT_MAX);
+    std::vector<uint32_t> h_buf_idx(topk, 0xFFFFFFFF);
 
-    std::vector<float> h_buf_dist(topk);
-    std::vector<uint32_t> h_buf_idx(topk);
-    for (unsigned i = 0; i < topk; i++) {
-        h_buf_dist[i] = buf_pairs[i].first;
-        h_buf_idx[i]  = buf_pairs[i].second;
-    }
-
-    unsigned n_inputs = (n_total / N) * N;
+    // All values go into input batches (unsorted within each batch)
+    unsigned n_inputs = (total / N) * N;
     std::vector<float> h_in_dist(n_inputs);
     std::vector<uint32_t> h_in_idx(n_inputs);
-    for (unsigned b = 0; b < n_inputs / N; b++) {
-        std::vector<std::pair<float,uint32_t>> batch(N);
-        for (unsigned i = 0; i < N; i++) {
-            unsigned src = topk + b * N + i;
-            batch[i] = {all_vals[src], all_ids[src]};
-        }
-        std::sort(batch.begin(), batch.end());
-        for (unsigned i = 0; i < N; i++) {
-            h_in_dist[b * N + i] = batch[i].first;
-            h_in_idx[b * N + i]  = batch[i].second;
-        }
+    for (unsigned i = 0; i < n_inputs; i++) {
+        h_in_dist[i] = all_vals[i];
+        h_in_idx[i]  = all_ids[i];
     }
 
     float *d_buf_dist, *d_in_dist, *d_out_dist;
