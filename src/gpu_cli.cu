@@ -10,6 +10,7 @@
 #include "include/gpu_graph.cuh"
 #include "include/gpu_base_search.cuh"
 #include "include/gpu_warp_search.cuh"
+#include "include/gpu_rabitq_search.cuh"
 
 using json = nlohmann::json;
 
@@ -136,6 +137,22 @@ __global__ void kernel_warp_search(
     searcher.search(d_queries + qid * dim, d_results + qid * K, K);
 }
 
+__global__ void kernel_rabitq_search(
+    GPUGraphView graph, GPURabitqView rabitq, GPURabitqSearchCfg cfg,
+    int nq, int dim,
+    const float* __restrict__ d_queries,
+    vid_t* __restrict__ d_results, int K)
+{
+    int qid = blockIdx.x;
+    if (qid >= nq) return;
+
+    extern __shared__ char smem[];
+    char* ptr = smem;
+    GPURabitqSearch<CLI_BLOCK_SIZE> searcher(ptr, cfg, graph, rabitq);
+    __syncthreads();
+    searcher.search(d_queries + qid * dim, d_results + qid * K, K);
+}
+
 // ── run functions ───────────────────────────────────────────────────────────
 
 static void run_base(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
@@ -176,6 +193,31 @@ static void run_warp(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
               << "  qps: " << nq / elapsed << std::endl;
 }
 
+static void run_rabitq(const GPUGraph& gpu_graph, const GPURabitq& gpu_rabitq,
+                       const GPURabitqSearchCfg& cfg,
+                       int nq, int dim, int K,
+                       const float* d_queries, vid_t* d_results)
+{
+    size_t smem = GPURabitqSearch<CLI_BLOCK_SIZE>::shared_mem_bytes(
+        cfg, dim, gpu_graph.degree());
+    int num_blocks = nq;
+
+    cudaFuncSetAttribute(kernel_rabitq_search,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         static_cast<int>(smem));
+
+    auto start = std::chrono::high_resolution_clock::now();
+    kernel_rabitq_search<<<num_blocks, CLI_BLOCK_SIZE, smem>>>(
+        gpu_graph.view(), gpu_rabitq.view(), cfg, nq, dim,
+        d_queries, d_results, K);
+    cudaDeviceSynchronize();
+    auto end = std::chrono::high_resolution_clock::now();
+
+    double elapsed = std::chrono::duration<double>(end - start).count();
+    std::cout << "  time: " << elapsed * 1000.0 << " ms"
+              << "  qps: " << nq / elapsed << std::endl;
+}
+
 // ── main ────────────────────────────────────────────────────────────────────
 
 int main() {
@@ -194,10 +236,11 @@ int main() {
         return 1;
     }
     auto& jd = j["data"];
-    std::string graph_file = jd.at("graph");
-    std::string base_file  = jd.at("base");
-    std::string query_file = jd.at("query");
-    std::string gt_file    = jd.at("gt");
+    std::string graph_file    = jd.at("graph");
+    std::string base_file     = jd.at("base");
+    std::string query_file    = jd.at("query");
+    std::string gt_file       = jd.at("gt");
+    std::string codebook_file = jd.value("codebook", "");
 
     // load CPU data
     CPUGraph cpu_graph;
@@ -239,13 +282,6 @@ int main() {
     int max_iterations = js.value("max_iterations", 1024);
     int reset_interval = js.value("reset_interval", 16);
 
-    GPUBaseSearchCfg cfg;
-    cfg.topk_size      = topk_size;
-    cfg.bitlen         = bitlen;
-    cfg.entry_point    = entry_point;
-    cfg.max_iterations = max_iterations;
-    cfg.reset_interval = reset_interval;
-
     // allocate results
     vid_t* d_results;
     cudaMalloc(&d_results, nq * K * sizeof(vid_t));
@@ -255,15 +291,44 @@ int main() {
               << " topk=" << topk_size << " bitlen=" << bitlen << std::endl;
 
     // ── dispatch ────────────────────────────────────────────────────────
-    if (mode == "base") {
-        run_base(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
-    } else if (mode == "warp4") {
-        run_warp<4>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
-    } else if (mode == "warp8") {
-        run_warp<8>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
+    if (mode == "rabitq") {
+        if (codebook_file.empty()) {
+            std::cerr << "rabitq mode requires \"codebook\" in data config" << std::endl;
+            return 1;
+        }
+        CPURabitqData cpu_rq = load_rabitq_codebook(
+            codebook_file, npoints, dim, cpu_graph.degree);
+        GPURabitq gpu_rq(cpu_rq);
+
+        vid_t rq_entry = (cpu_rq.entry_point != UINT32_MAX)
+                       ? cpu_rq.entry_point : entry_point;
+
+        GPURabitqSearchCfg rq_cfg;
+        rq_cfg.topk_size      = topk_size;
+        rq_cfg.bitlen         = bitlen;
+        rq_cfg.entry_point    = rq_entry;
+        rq_cfg.max_iterations = max_iterations;
+        rq_cfg.reset_interval = reset_interval;
+
+        run_rabitq(gpu_graph, gpu_rq, rq_cfg, nq, dim, K, d_queries, d_results);
     } else {
-        std::cerr << "Unknown mode: " << mode << std::endl;
-        return 1;
+        GPUBaseSearchCfg cfg;
+        cfg.topk_size      = topk_size;
+        cfg.bitlen         = bitlen;
+        cfg.entry_point    = entry_point;
+        cfg.max_iterations = max_iterations;
+        cfg.reset_interval = reset_interval;
+
+        if (mode == "base") {
+            run_base(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
+        } else if (mode == "warp4") {
+            run_warp<4>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
+        } else if (mode == "warp8") {
+            run_warp<8>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
+        } else {
+            std::cerr << "Unknown mode: " << mode << std::endl;
+            return 1;
+        }
     }
 
     // ── results ─────────────────────────────────────────────────────────

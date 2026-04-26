@@ -54,15 +54,26 @@ EOF
 
 | Mode | Description |
 |------|-------------|
-| `base` | Block-level search. 256 threads per query. All warps compute L2 in parallel. |
-| `warp4` | Warp-level search. 4 queries per block. Each warp runs independently with async prefetch. |
-| `warp8` | Warp-level search. 8 queries per block. |
+| `base` | Block-level L2 search. 256 threads per query. All warps compute L2 in parallel. |
+| `warp4` | Warp-level L2 search. 4 queries per block. Each warp runs independently with async prefetch. |
+| `warp8` | Warp-level L2 search. 8 queries per block. |
+| `rabitq` | Block-level RAbitQ search. Uses quantized distance estimation with fastscan. Requires `codebook` in data config. |
+
+### Data config fields
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `graph` | yes | Path to graph `.bin` file |
+| `base` | yes | Path to base vectors `.fvecs` file |
+| `query` | yes | Path to query vectors `.fvecs` file |
+| `gt` | yes | Path to groundtruth `.ivecs` file |
+| `codebook` | rabitq only | Path to SymQG codebook file (contains packed codes, factors, signs) |
 
 ### Search config fields
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `mode` | `"base"` | Search mode: `base`, `warp4`, `warp8` |
+| `mode` | `"base"` | Search mode: `base`, `warp4`, `warp8`, `rabitq` |
 | `K` | `100` | Number of nearest neighbors to return |
 | `topk_size` | `256` | Beam buffer size (must be >= block size for base, >= 32*REG for warp) |
 | `bitlen` | `10` | Hash filter size = 2^bitlen entries |
@@ -106,6 +117,9 @@ cd build && ctest
 | `include/cpu_graph.hpp` | `CPUGraph` — host-side graph with file I/O |
 | `include/gpu_base_search.cuh` | `GPUBaseSearch` — block-level L2 beam search |
 | `include/gpu_warp_search.cuh` | `GPUWarpSearch` — warp-level L2 beam search with async prefetch |
+| `include/rabitq.hpp` | `CPURabitqData` — host-side RAbitQ codebook loader |
+| `include/rabitq.cuh` | `GPURabitq` (owning) + `GPURabitqView` (kernel-safe) + `RabitqQuery` (prepared query) |
+| `include/gpu_rabitq_search.cuh` | `GPURabitqSearch` — block-level RAbitQ beam search with fastscan |
 | `src/gpu_cli.cu` | Unified CLI binary |
 | `3rd/nlohmann/json.hpp` | Vendored JSON parser (v3.11.3) |
 
@@ -114,7 +128,7 @@ cd build && ctest
 | File | Description |
 |------|-------------|
 | `include/search_bitonic.cuh` | Old block-level L2 kernel (replaced by `GPUBaseSearch`) |
-| `include/search_rabitq.cuh` | RAbitQ beam search kernel — not yet migrated to new architecture |
+| `include/search_rabitq.cuh` | RAbitQ beam search kernel — replaced by `GPURabitqSearch` |
 | `include/search_tensor_rabitq.cuh` | Tensor-core RAbitQ kernel — not yet migrated |
 | `include/utils.cuh` | Legacy utilities — rabitq distance estimation, query preparation, etc. |
 | `include/utils.h` | Host-side utilities — file I/O, recall, distance functions |
@@ -128,5 +142,5 @@ cd build && ctest
 ### Not yet integrated
 
 - **Graph building** — Vamana graph construction currently requires [ScaleANN](https://github.com/scalable-anns/ScaleANN). Integrating the builder would improve reproducibility.
-- **RAbitQ search** — The quantized search kernels (`search_rabitq.cuh`, `search_tensor_rabitq.cuh`) work but haven't been refactored into the new `GPUBaseSearch`/`GPUWarpSearch` architecture.
+- **RAbitQ search** — The scalar RAbitQ kernel has been migrated (`GPURabitqSearch`). The tensor-core variant (`search_tensor_rabitq.cuh`) has not.
 - **Microbenchmarks** — `gpu_microbenchmark.cu` is functional but not included in the default build.
