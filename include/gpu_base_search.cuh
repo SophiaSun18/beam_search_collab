@@ -37,7 +37,7 @@ class GPUBaseSearch {
     DISTANCE_T*              cand_dist_;    // CANDIDATE_BUFFER_SIZE elements
     float*                   staged_[2];    // double buffer, dim floats each
 
-    const GPUGraph&          graph_;
+    GPUGraphView          graph_;
     GPUBaseSearchCfg         cfg_;
     unsigned                 dim_;
     unsigned                 max_degree_;
@@ -57,7 +57,7 @@ public:
      * @param graph  Device-resident graph (vectors + edges). Stored by reference.
      */
     __device__ GPUBaseSearch(char*& smem, const GPUBaseSearchCfg& cfg,
-                             const GPUGraph& graph);
+                             GPUGraphView graph);
 
     /**
      * @brief Run beam search for one query.
@@ -98,7 +98,7 @@ __device__ void GPUBaseSearch<BX>::prefetch_wait() {
 
 template <unsigned BX>
 __device__ GPUBaseSearch<BX>::GPUBaseSearch(
-    char*& smem, const GPUBaseSearchCfg& cfg, const GPUGraph& graph)
+    char*& smem, const GPUBaseSearchCfg& cfg, GPUGraphView graph)
     : topk_(smem, cfg.topk_size),
       hf_(smem, cfg.bitlen),
       query_buf_  (reinterpret_cast<float*>(smem)),
@@ -200,9 +200,12 @@ __device__ void GPUBaseSearch<BX>::search(
 
         // ── pick next node to expand ────────────────────────────────────
         {
-            unsigned found = topk_.pick(parent_buf_, 1);
-            if (warp_id == 0 && lane_id == 0)
+            uint32_t pbuf[BX];
+            unsigned found = topk_.pick(pbuf, 1);
+            if (warp_id == 0 && lane_id == 0) {
                 keep_expanding = found;
+                if (found > 0) parent_buf_[0] = pbuf[0];
+            }
         }
         __syncthreads();
 
@@ -210,7 +213,7 @@ __device__ void GPUBaseSearch<BX>::search(
 
         // ── expand ──────────────────────────────────────────────────────
         vid_t current_node = parent_buf_[0];
-        Span<vid_t> nbrs = graph_.nbrs(current_node);
+        Span<const vid_t> nbrs = graph_.nbrs(current_node);
 
         // filter neighbors through hash, init candidate buffer
         for (unsigned i = tid; i < CAND; i += BX) {

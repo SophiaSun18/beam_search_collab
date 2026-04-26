@@ -1,22 +1,14 @@
-//#include <cuda_profiler_api.h>
-//#define USE_RADIX // Use bitonic if not defined
-
 #include "include/index.hpp"
-#ifdef USE_RADIX
-#include "include/search_radix.cuh"
-#else
-#include "include/search_bitonic.cuh"
-#include "include/search_tensor_bitonic.cuh"
-#endif
+#include "include/gpu_base_search.cuh"
+#include "include/cpu_graph.hpp"
+#include "include/gpu_graph.cuh"
 
 #include <chrono>
 #include <array>
 #include <cfloat>
 #include <vector>
 
-#ifndef USE_TENSOR_BITONIC
-#define USE_TENSOR_BITONIC 0
-#endif
+static constexpr unsigned BASE_BLOCK_SIZE = BLOCK_SIZE;  // from utils.cuh (256)
 
 static vid_t compute_gpu_base_entry_point(const float* data, size_t npoints, size_t dim) {
   std::vector<float> centroid(dim, 0.0f);
@@ -45,166 +37,112 @@ static vid_t compute_gpu_base_entry_point(const float* data, size_t npoints, siz
   return best;
 }
 
+// ── kernel ──────────────────────────────────────────────────────────────────
+
+__global__ void gpu_base_search_kernel(
+    GPUGraphView graph,
+    GPUBaseSearchCfg cfg,
+    int nq, int dim,
+    const float* __restrict__ d_queries,
+    vid_t* __restrict__ d_results,
+    int K)
+{
+    const int query_id = blockIdx.x;
+    if (query_id >= nq) return;
+
+    extern __shared__ char smem[];
+    char* smem_ptr = smem;
+
+    GPUBaseSearch<BASE_BLOCK_SIZE> searcher(smem_ptr, cfg, graph);
+    __syncthreads();
+
+    searcher.search(d_queries + query_id * dim, d_results + query_id * K, K);
+}
+
+// ── host entry point ────────────────────────────────────────────────────────
+
 template <typename T>
-void IndexGraph<T>::search(int nq, const T* queries, int K, T *result_vec, vid_t *result_idx, int beam_sz, double& elapsed,
+void IndexGraph<T>::search(int nq, const T* queries, int K, T* result_vec,
+                           vid_t* result_idx, int beam_sz, double& elapsed,
                            GpuRunStats* gpu_stats, bool debug_mode) {
   auto dim = this->d;
   auto npoints = this->ntotal;
   auto max_degree = this->maxDeg;
-  auto beam_size = beam_sz;
-  printf("Beam search on GPU%s: K=%d, nq=%d, dim=%d, npoints=%ld, beam_size=%d, internal_topk=%d\n",
-         USE_TENSOR_BITONIC ? " (tensor bitonic)" : "", K, nq, dim, npoints, beam_size, INTERNAL_TOPK);
+  printf("GPUBaseSearch: K=%d, nq=%d, dim=%d, npoints=%ld, beam_size=%d\n",
+         K, nq, dim, npoints, beam_sz);
 
-  size_t num_threads = BLOCK_SIZE;
-  size_t num_blocks = GPU_DISTANCE_TIMING ? 1 : nq;
-  std::cout << "num_blocks = " << num_blocks << " num_threads = " << num_threads << "\n";
+  // build CPUGraph → GPUGraph
+  CPUGraph cpu_graph(npoints, dim, max_degree,
+                     std::vector<float>(this->data),
+                     std::vector<vid_t>(this->edges));
+  GPUGraph gpu_graph(cpu_graph);
+
+  // entry point
+  const vid_t entry_point = compute_gpu_base_entry_point(
+      this->get_data_ptr(), npoints, dim);
+  printf("GPU base entry point: %u\n", entry_point);
+
+  // search config
+  GPUBaseSearchCfg cfg;
+  cfg.topk_size      = BASE_BLOCK_SIZE;  // must be >= BX * REG
+  cfg.bitlen         = 10;
+  cfg.entry_point    = entry_point;
+  cfg.max_iterations = 1024;
+  cfg.reset_interval = 16;
+
+  // shared memory size
+  size_t shm_size = GPUBaseSearch<BASE_BLOCK_SIZE>::shared_mem_bytes(cfg, dim);
+  printf("shared memory size: %ld\n", shm_size);
+
+  // device memory for queries and results
+  float* d_queries;
+  vid_t* d_results;
+  CUDA_SAFE_CALL(cudaMalloc(&d_queries, nq * dim * sizeof(float)));
+  CUDA_SAFE_CALL(cudaMemcpy(d_queries, queries, nq * dim * sizeof(float), cudaMemcpyHostToDevice));
+  CUDA_SAFE_CALL(cudaMalloc(&d_results, nq * K * sizeof(vid_t)));
+
+  // occupancy
   cudaDeviceProp prop;
   int dev;
   cudaGetDevice(&dev);
   cudaGetDeviceProperties(&prop, dev);
   printf("Device: %s, SMs: %d\n", prop.name, prop.multiProcessorCount);
   int numBlocksPerSM = 0;
-  int blockSize = 256;   // threads per block
-
-  // allocate device memory
-  T* d_queries, *d_data, *h_data = this->get_data_ptr();
-  CUDA_SAFE_CALL(cudaMalloc((void **)&d_queries, nq * dim * sizeof(T)));
-  CUDA_SAFE_CALL(cudaMemcpy(d_queries, queries, nq * dim * sizeof(T), cudaMemcpyHostToDevice));
-  CUDA_SAFE_CALL(cudaMalloc((void **)&d_data, npoints * dim * sizeof(T)));
-  CUDA_SAFE_CALL(cudaMemcpy(d_data, h_data, npoints * dim * sizeof(T), cudaMemcpyHostToDevice));
-
-  vid_t *h_results = &result_idx[0];
-  vid_t *d_results;
-  CUDA_SAFE_CALL(cudaMalloc((void **)&d_results, nq * K * sizeof(vid_t)));
-
-  // counters
-  gpu_long_t *d_total_stats = nullptr;
-  std::array<gpu_long_t, GPU_SEARCH_STAT_COUNT> total_stats{};
-  if (GPU_SEARCH_STATS) {
-    CUDA_SAFE_CALL(cudaMalloc((void **)&d_total_stats, GPU_SEARCH_STAT_COUNT * sizeof(gpu_long_t)));
-    CUDA_SAFE_CALL(cudaMemcpy(d_total_stats, total_stats.data(), GPU_SEARCH_STAT_COUNT * sizeof(gpu_long_t), cudaMemcpyHostToDevice));
-  }
-  gpu_long_t *d_total_timing;
-  std::array<gpu_long_t, GPU_TIMING_COUNT> total_timing{};
-  CUDA_SAFE_CALL(cudaMalloc((void **)&d_total_timing, GPU_TIMING_COUNT * sizeof(gpu_long_t)));
-  CUDA_SAFE_CALL(cudaMemcpy(d_total_timing, total_timing.data(), GPU_TIMING_COUNT * sizeof(gpu_long_t), cudaMemcpyHostToDevice));
-  CUDA_SAFE_CALL(cudaDeviceSynchronize());
-
-  GraphGPU<vid_t> gg(npoints, max_degree, this->edges.data()); // GPU graph 
-
-  vid_t *starting_points = new vid_t[beam_size];
-  vid_t *d_starting_points;
-  const vid_t entry_point = compute_gpu_base_entry_point(h_data, npoints, dim);
-  printf("GPU base entry point: %u\n", entry_point);
-  for (int i = 0; i < beam_size; i++) {
-    starting_points[i] = (i == 0) ? entry_point : MAX_INDEX;
-  }
-  CUDA_SAFE_CALL(cudaMalloc((void **)&d_starting_points, beam_size * sizeof(vid_t)));
-  CUDA_SAFE_CALL(cudaMemcpy(d_starting_points, starting_points, beam_size * sizeof(vid_t), cudaMemcpyHostToDevice));
-
-#ifdef USE_RADIX
-  //vid_t *d_filters = nullptr;
-  //printf("filter size = %d bytes\n", num_blocks * HASH_FILTER_SIZE * sizeof(vid_t));
-  //CUDA_SAFE_CALL(cudaMalloc((void **)&d_filters, num_blocks * HASH_FILTER_SIZE * sizeof(vid_t)));
-  BeamSearch<T><<<num_blocks, num_threads>>>(K, nq, dim, npoints, d_queries, d_data,
-                                             d_results, d_total_stats, d_total_timing, d_starting_points, d_total_hops, gg);
-#else
-  uint32_t shm_size = USE_TENSOR_BITONIC
-      ? calculate_shared_mem_size_tensor_bitonic(dim, INTERNAL_TOPK, max_degree, SEARCH_WIDTH, BITLEN)
-      : calculate_shared_mem_size(dim, INTERNAL_TOPK, max_degree, SEARCH_WIDTH, BITLEN);
-  vid_t *d_seed_map = nullptr;
-  if (USE_SEED) {
-    size_t ghost_scale_factor = 100;
-    size_t ghost_num = npoints / ghost_scale_factor;
-    CUDA_SAFE_CALL(cudaMalloc((void **)&d_seed_map, ghost_num * sizeof(vid_t)));
-    init_identity_map<<<(ghost_num-1)/num_threads+1, num_threads>>>(ghost_num, d_seed_map);
-  }
-  uint32_t *d_sign_bit = nullptr;
-  if (PRUNE_CONFIG) {
-    auto sign_bit = load_sign_bit("sign_bit.bin");
-    size_t sign_bit_size = sign_bit.size();
-    uint32_t *h_sign_bit = sign_bit.data();
-    CUDA_SAFE_CALL(cudaMalloc((void **)&d_sign_bit, sign_bit_size * sizeof(uint32_t)));
-    CUDA_SAFE_CALL(cudaMemcpy(d_sign_bit, h_sign_bit, sign_bit_size * sizeof(uint32_t), cudaMemcpyHostToDevice));
-  }
-
-  cudaError_t err = cudaSuccess;
-  if (USE_TENSOR_BITONIC) {
-    CUDA_SAFE_CALL(cudaFuncSetAttribute(
-        BeamSearchTensor<T>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        static_cast<int>(shm_size)));
-    err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &numBlocksPerSM, BeamSearchTensor<T>, blockSize, shm_size);
-  } else {
-    err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &numBlocksPerSM, BeamSearch<T>, blockSize, shm_size);
-  }
-  if (err != cudaSuccess) {
-    printf("Error: %s\n", cudaGetErrorString(err));
-    exit(-1);
-  }
+  cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      &numBlocksPerSM, gpu_base_search_kernel, BASE_BLOCK_SIZE, shm_size);
   printf("Max active blocks per SM = %d\n", numBlocksPerSM);
 
-  // Execute the search
-  printf("\nStarting GPU %sbeam search...\n", USE_TENSOR_BITONIC ? "tensor " : "");
+  // launch
+  size_t num_blocks = nq;
+  printf("\nStarting GPU base beam search...\n");
   auto start = std::chrono::high_resolution_clock::now();
-  if (USE_TENSOR_BITONIC) {
-    BeamSearchTensor<T><<<num_blocks, num_threads, shm_size>>>(
-        K, nq, dim, npoints, d_queries, d_data, d_results,
-        d_total_stats, d_total_timing, d_starting_points, d_seed_map, d_sign_bit, gg, debug_mode);
-  } else {
-    BeamSearch<T><<<num_blocks, num_threads, shm_size>>>(K, nq, dim, npoints, d_queries, d_data, d_results, 
-                                                         d_total_stats, d_total_timing, d_starting_points, d_seed_map, d_sign_bit, gg, debug_mode);
-  }
+  gpu_base_search_kernel<<<num_blocks, BASE_BLOCK_SIZE, shm_size>>>(
+      gpu_graph.view(), cfg, nq, dim, d_queries, d_results, K);
   CUDA_SAFE_CALL(cudaGetLastError());
   cudaDeviceSynchronize();
   auto end = std::chrono::high_resolution_clock::now();
   elapsed = std::chrono::duration<double>(end - start).count();
 
-#endif
-
-  CUDA_SAFE_CALL(cudaDeviceSynchronize());
-  CUDA_SAFE_CALL(cudaMemcpy(h_results, d_results, nq * K * sizeof(int), cudaMemcpyDeviceToHost));
-  if (GPU_SEARCH_STATS) {
-    CUDA_SAFE_CALL(cudaMemcpy(total_stats.data(), d_total_stats, GPU_SEARCH_STAT_COUNT * sizeof(gpu_long_t), cudaMemcpyDeviceToHost));
-  }
-  CUDA_SAFE_CALL(cudaMemcpy(total_timing.data(), d_total_timing, GPU_TIMING_COUNT * sizeof(gpu_long_t), cudaMemcpyDeviceToHost));
+  // copy results back
+  CUDA_SAFE_CALL(cudaMemcpy(result_idx, d_results, nq * K * sizeof(vid_t), cudaMemcpyDeviceToHost));
   CUDA_SAFE_CALL(cudaFree(d_queries));
-  CUDA_SAFE_CALL(cudaFree(d_data));
   CUDA_SAFE_CALL(cudaFree(d_results));
-  if (GPU_SEARCH_STATS) {
-    CUDA_SAFE_CALL(cudaFree(d_total_stats));
-  }
-  CUDA_SAFE_CALL(cudaFree(d_total_timing));
-  if (GPU_SEARCH_STATS) {
-    std::cout << "total # exact distance computations: " << total_stats[GPU_SEARCH_STAT_DIST_CMPS] << "\n";
-    std::cout << "average # exact distance computations: " << static_cast<double>(total_stats[GPU_SEARCH_STAT_DIST_CMPS]) / nq << "\n";
-    std::cout << "total # distance estimations: " << total_stats[GPU_SEARCH_STAT_DIST_EST] << "\n";
-    std::cout << "average # distance estimations: " << static_cast<double>(total_stats[GPU_SEARCH_STAT_DIST_EST]) / nq << "\n";
-    std::cout << "total # expansion steps: " << total_stats[GPU_SEARCH_STAT_ITERATIONS] << "\n";
-    std::cout << "average # expansion steps: " << static_cast<double>(total_stats[GPU_SEARCH_STAT_ITERATIONS]) / nq << "\n";
-  }
-  if (GPU_DISTANCE_TIMING) {
-    const double avg_l2_cycles =
-        total_timing[GPU_TIMING_L2_CALLS] ? static_cast<double>(total_timing[GPU_TIMING_L2_CYCLES]) / total_timing[GPU_TIMING_L2_CALLS] : 0.0;
-    std::cout << "total # l2 timing calls: " << total_timing[GPU_TIMING_L2_CALLS] << "\n";
-    std::cout << "average cycles per warp_l2_distance: " << avg_l2_cycles << "\n";
-  }
 
   if (gpu_stats != nullptr) {
-    gpu_stats->common.total_dc = static_cast<int64_t>(total_stats[GPU_SEARCH_STAT_DIST_CMPS]);
-    gpu_stats->common.total_ds = static_cast<int64_t>(total_stats[GPU_SEARCH_STAT_DIST_EST]);
-    gpu_stats->common.total_extra_dc = 0;
-    gpu_stats->common.total_full_dc = static_cast<int64_t>(total_stats[GPU_SEARCH_STAT_DIST_CMPS]);
-    gpu_stats->common.total_iter = static_cast<int64_t>(total_stats[GPU_SEARCH_STAT_ITERATIONS]);
-    gpu_stats->common.total_pruned = 0;
     gpu_stats->common.time_search_total = elapsed;
-    gpu_stats->gpu_l2_calls = static_cast<int64_t>(total_timing[GPU_TIMING_L2_CALLS]);
-    gpu_stats->gpu_l2_cycles = static_cast<int64_t>(total_timing[GPU_TIMING_L2_CYCLES]);
-    gpu_stats->gpu_est_calls = static_cast<int64_t>(total_timing[GPU_TIMING_EST_CALLS]);
-    gpu_stats->gpu_est_cycles = static_cast<int64_t>(total_timing[GPU_TIMING_EST_CYCLES]);
+    gpu_stats->common.total_dc = 0;
+    gpu_stats->common.total_ds = 0;
+    gpu_stats->common.total_extra_dc = 0;
+    gpu_stats->common.total_full_dc = 0;
+    gpu_stats->common.total_iter = 0;
+    gpu_stats->common.total_pruned = 0;
+    gpu_stats->gpu_l2_calls = 0;
+    gpu_stats->gpu_l2_cycles = 0;
+    gpu_stats->gpu_est_calls = 0;
+    gpu_stats->gpu_est_cycles = 0;
   }
+  (void)result_vec;
+  (void)beam_sz;
   (void)debug_mode;
 }
 

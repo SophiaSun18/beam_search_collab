@@ -34,6 +34,44 @@ struct Span {
 };
 
 /**
+ *  @struct GPUGraphView
+ *  @brief  Non-owning, immutable, trivially-copyable view of a device-resident graph.
+ *
+ *  All pointers are const — no mutation of graph data through a view.
+ *  Safe to pass by value to CUDA kernels.
+ */
+class GPUGraphView {
+    const float*  d_vects_;
+    const vid_t*  d_edges_;
+    int           dim_;
+    int           degree_;
+public:
+    __device__ __host__ GPUGraphView(const float* vects, const vid_t* edges,
+                                     int dim, int degree);
+    __device__ __host__ Span<const vid_t>  nbrs(vid_t node) const;
+    __device__ __host__ Span<const float>  vect(vid_t node) const;
+    __device__ __host__ int dim()    const;
+    __device__ __host__ int degree() const;
+};
+
+__device__ __host__ inline GPUGraphView::GPUGraphView(
+    const float* vects, const vid_t* edges, int dim, int degree)
+    : d_vects_(vects), d_edges_(edges), dim_(dim), degree_(degree) {}
+
+__device__ __host__ inline Span<const vid_t> GPUGraphView::nbrs(vid_t node) const {
+    return {d_edges_ + static_cast<size_t>(node) * degree_,
+            static_cast<size_t>(degree_)};
+}
+
+__device__ __host__ inline Span<const float> GPUGraphView::vect(vid_t node) const {
+    return {d_vects_ + static_cast<size_t>(node) * dim_,
+            static_cast<size_t>(dim_)};
+}
+
+__device__ __host__ inline int GPUGraphView::dim()    const { return dim_; }
+__device__ __host__ inline int GPUGraphView::degree() const { return degree_; }
+
+/**
  *  @class GPUGraph
  *  @brief Device-resident graph. Owns CUDA allocations for vectors and edges.
  *
@@ -68,6 +106,9 @@ public:
 
     __host__ __device__ int dim()    const { return dim_; }
     __host__ __device__ int degree() const { return degree_; }
+
+    /** @brief Return an immutable view suitable for passing to kernels. */
+    GPUGraphView view() const { return {d_vects_, d_edges_, dim_, degree_}; }
 
     GPUGraph(const GPUGraph&) = delete;
     GPUGraph& operator=(const GPUGraph&) = delete;

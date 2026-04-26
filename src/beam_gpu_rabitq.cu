@@ -118,7 +118,7 @@ void QuantizationGraph::gpu_search(int nq, const float* queries, int K, float* r
   printf("GPU rabitq entry point: %u\n", entry_point);
 
   uint32_t shm_size = USE_TENSOR_RABITQ
-      ? calculate_shared_mem_size_tensor(static_cast<int>(dim), INTERNAL_TOPK, max_degree, SEARCH_WIDTH, BITLEN, K)
+      ? calculate_shared_mem_size_tensor(static_cast<int>(dim), INTERNAL_TOPK, max_degree, SEARCH_WIDTH, BITLEN)
       : calculate_shared_mem_size(static_cast<int>(dim), INTERNAL_TOPK, max_degree, SEARCH_WIDTH, BITLEN);
   if (USE_TENSOR_RABITQ) {
     CUDA_SAFE_CALL(cudaFuncSetAttribute(
@@ -149,7 +149,7 @@ void QuantizationGraph::gpu_search(int nq, const float* queries, int K, float* r
     TensorCoreQuantizedBeamSearch<<<num_blocks, num_threads, shm_size>>>(
         K, active_nq, static_cast<int>(dim), max_degree, npoints, d_queries, d_qg_data, d_qg_signs, d_results,
         d_total_stats, d_total_timing, entry_point, this->get_row_offset(), this->get_neighbor_offset(),
-        this->get_code_offset(), this->get_factor_offset(), debug_mode);
+        this->get_code_offset(), this->get_factor_offset());
   } else {
     QuantizedBeamSearch<<<num_blocks, num_threads, shm_size>>>(
         K, active_nq, static_cast<int>(dim), max_degree, npoints, d_queries, d_qg_data, d_qg_signs, d_results,
