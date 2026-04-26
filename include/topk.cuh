@@ -39,6 +39,11 @@ class SharedBitonicTopK {
     unsigned  topk;       // the number of elements in this buffer
     float*    topk_dist;  // points into shared memory, stored descending
     uint32_t* topk_idx;   // points into shared memory, stored descending
+
+    /// Correct sync for the number of participating threads.
+    /// Single-warp (BX <= 32): __syncwarp. Multi-warp: __syncthreads.
+    __device__ static void sync();
+
     public:
     /**
      * @brief Construct a top-k buffer backed by shared memory.
@@ -111,6 +116,11 @@ class SharedBitonicTopK {
 };
 
 template <unsigned BX, unsigned REG>
+__device__ void SharedBitonicTopK<BX, REG>::sync() {
+    if constexpr (BX <= 32) __syncwarp(); else __syncthreads();
+}
+
+template <unsigned BX, unsigned REG>
 __device__ SharedBitonicTopK<BX, REG>::SharedBitonicTopK(
     unsigned topk, float* topk_dist, uint32_t* topk_idx)
     : topk(topk), topk_dist(topk_dist), topk_idx(topk_idx)
@@ -165,7 +175,7 @@ __device__ void SharedBitonicTopK<BX, REG>::merge(float (&dist)[REG], uint32_t (
                 topk_dist[pos] = dist_[j];
                 topk_idx[pos]  = idx_[j];
             }
-            __syncthreads();
+            sync();
         }
         // [6] Sort lower half ascending, ready for next chunk
         bitonic_sort_block<true>(dist, idx, scratch_d, scratch_i);
@@ -178,7 +188,7 @@ __device__ void SharedBitonicTopK<BX, REG>::merge(float (&dist)[REG], uint32_t (
         topk_dist[pos] = dist[j];
         topk_idx[pos]  = idx[j];
     }
-    __syncthreads();
+    sync();
 }
 
 template <unsigned BX, unsigned REG>
