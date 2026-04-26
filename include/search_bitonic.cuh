@@ -1,11 +1,12 @@
 #pragma once
 #include "utils.cuh"
+#include "hash_filter.cuh"
 #include <cuda_runtime.h>
 #ifndef INTERNAL_TOPK
 #define INTERNAL_TOPK   128
 #endif
 #define SEARCH_WIDTH    1     // MAX: 2 nodes * 32 degree = 64 neighbors = CANDIDATE_BUFFER_SIZE
-#define BITLEN          GPU_HASH_BITLEN_FOR_TOPK(INTERNAL_TOPK)
+#define BITLEN          10
 #define MAX_ITERATIONS  1024
 #define TEAM_SIZE       8
 #define USE_SEED        0
@@ -18,7 +19,7 @@
 static __host__ inline uint32_t calculate_shared_mem_size(int dim, int topk, int max_deg, 
                                                            int search_width, int bitlen) {
     size_t size = 0;    
-    size += hashtable_getsize(BITLEN) * sizeof(INDEX_T);    // hash table
+    size += HashFilter::shared_mem_bytes(BITLEN);            // hash table
     size += RESULT_BUFFER_SIZE * sizeof(INDEX_T);           // top k and candidate index
     size += RESULT_BUFFER_SIZE * sizeof(DISTANCE_T);        // top k and candidate distance
     size += SEARCH_WIDTH * sizeof(INDEX_T);                 // next expanders / parent buffer
@@ -78,7 +79,8 @@ void BeamSearch(
     DISTANCE_T* CANDIDATE_DISTANCE  = ALL_DISTANCE + INTERNAL_TOPK;
 
     INDEX_T* HASH_TABLE = (INDEX_T*)(ALL_DISTANCE + RESULT_BUFFER_SIZE);
-    INDEX_T* PARENT_LIST = (INDEX_T*)(HASH_TABLE + hashtable_getsize(BITLEN));
+    HashFilter hf(HASH_TABLE, BITLEN);
+    INDEX_T* PARENT_LIST = (INDEX_T*)(HASH_TABLE + HashFilter::shared_mem_bytes(BITLEN) / sizeof(INDEX_T));
     DATA_T* QUERY_BUFFER = (DATA_T*)(PARENT_LIST + SEARCH_WIDTH);
     uint32_t* counter = (uint32_t*)(QUERY_BUFFER + dim);
     uint32_t* hops = (uint32_t*)(counter + 1);
@@ -101,7 +103,7 @@ void BeamSearch(
     }
 
     // initialize the hash table to record visited (computed) nodes
-    if (HASH_TABLE_CONFIG) hashtable_init(HASH_TABLE, BITLEN);
+    if (HASH_TABLE_CONFIG) hf.init();
 
     // load query into shared memory
     for (int i = tid; i < dim; i += blockDim.x) {
@@ -126,7 +128,7 @@ void BeamSearch(
         if (lane_id == 0) {     // warp computes, only lane 0 writes
             if (CANDIDATE_INDEX[i] != MAX_INDEX) {
                 atomicAdd(&counter[0], 1);
-                hashtable_insert(HASH_TABLE, BITLEN, CANDIDATE_INDEX[i]);
+                hf.insert(CANDIDATE_INDEX[i]);
                 if (GPU_DISTANCE_TIMING) {
                     atomicAdd(&timing[GPU_TIMING_L2_CALLS], gpu_long_t(1));
                     atomicAdd(&timing[GPU_TIMING_L2_CYCLES], gpu_globaltimer() - l2_start);
@@ -143,9 +145,7 @@ void BeamSearch(
         // forgettable hash table management according to the CARGA paper
         if (HASH_TABLE_CONFIG) {
             if ((iter + 1) % SMALL_HASH_RESET_INTERVAL == 0) {
-                hashtable_init(HASH_TABLE, BITLEN);
-                __syncthreads();
-                hashtable_restore(HASH_TABLE, BITLEN, TOP_K_INDEX, INTERNAL_TOPK);
+                hf.init();
             }
             __syncthreads();
         }
@@ -222,7 +222,7 @@ void BeamSearch(
             INDEX_T child_id = (i < maxDegree) ? neighbors[i] : MAX_INDEX;      // only in-bound threads take from the neighbor list
 
             if (child_id != MAX_INDEX) {    // check if visited already
-                if (hashtable_insert(HASH_TABLE, BITLEN, child_id) == 0) {
+                if (hf.insert(child_id) == 0) {
                     child_id = MAX_INDEX;
                     CANDIDATE_DISTANCE[i] = FLT_MAX;
                 } else {

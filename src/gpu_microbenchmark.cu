@@ -202,28 +202,29 @@ __global__ void benchHt(gpu_long_t* out) {
     extern __shared__ char smem[];
     INDEX_T* ht = reinterpret_cast<INDEX_T*>(smem);
 
-    hashtable_init(ht, BITLEN);
+    HashFilter hf(ht, BITLEN);
+    hf.init();
     __syncthreads();
 
     for (int i = 0; i < 100; i++) {
         if (i % SMALL_HASH_RESET_INTERVAL == 0) {
-            hashtable_init(ht, BITLEN);
+            hf.init();
             __syncthreads();
         }
-        hashtable_insert(ht, BITLEN, tid + i * blockDim.x);
+        hf.insert(tid + i * blockDim.x);
         __syncthreads();
     }
 
-    hashtable_init(ht, BITLEN);
+    hf.init();
     __syncthreads();
 
     gpu_long_t t0 = gpu_globaltimer();
     for (int i = 0; i < NREP; i++) {
         if (i % SMALL_HASH_RESET_INTERVAL == 0) {
-            hashtable_init(ht, BITLEN);
+            hf.init();
             __syncthreads();
         }
-        hashtable_insert(ht, BITLEN, tid + i * blockDim.x);
+        hf.insert(tid + i * blockDim.x);
         __syncthreads();
     }
     gpu_long_t t1 = gpu_globaltimer();
@@ -356,7 +357,7 @@ int main(int argc, char** argv) {
     CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
     std::vector<gpu_long_t> hout(nblk);
-    uint32_t htsz = hashtable_getsize(BITLEN) * sizeof(INDEX_T);
+    uint32_t htsz = HashFilter::shared_mem_bytes(BITLEN);
 
     printf("%-32s %8s %8s %8s %8s\n",
            "Function", "min", "avg", "max", "blocks");

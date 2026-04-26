@@ -12,9 +12,6 @@
 #define LOG_WARP_SIZE 5
 #define WARPS_PER_BLOCK (BLOCK_SIZE / WARP_SIZE)
 
-#define GPU_HASH_BASE_BITLEN 10
-#define GPU_HASH_BITLEN_FOR_TOPK(topk)                                            \
-  (((topk) * 4 > 3 * (1 << GPU_HASH_BASE_BITLEN)) ? (GPU_HASH_BASE_BITLEN + 1) : GPU_HASH_BASE_BITLEN)
    
 //#define FLT_MAX 3.40282347e+38
 #ifndef GPU_SEARCH_STATS
@@ -578,86 +575,6 @@ __device__ void topk_by_sort_candidates_and_merge(
 }
 
 #define SMALL_HASH_RESET_INTERVAL 16
-
-__host__ __device__ inline uint32_t hashtable_getsize(const uint32_t bitlen) {
-  return 1 << bitlen;
-}
-
-__device__ inline void hashtable_init(INDEX_T* const table, const unsigned bitlen, unsigned FIRST_TID = 0) {
-  if (threadIdx.x < FIRST_TID) return;
-  for (uint32_t i = threadIdx.x - FIRST_TID; i < hashtable_getsize(bitlen); i += blockDim.x - FIRST_TID) {
-    table[i] = MAX_INDEX;
-  }
-}
-
-__device__ inline uint32_t hashtable_insert(INDEX_T* const table, const unsigned bitlen, const INDEX_T key) {
-    // Open addressing is used for collision resolution
-    const uint32_t size     = hashtable_getsize(bitlen);
-    const uint32_t bit_mask = size - 1;
-
-    // Linear probing
-    INDEX_T index             = (key ^ (key >> bitlen)) & bit_mask;
-    constexpr uint32_t stride = 1;
-
-    for (unsigned i = 0; i < size; i++) {
-        const INDEX_T old = atomicCAS(&table[index], ~static_cast<INDEX_T>(0), key);
-        if (old == ~static_cast<INDEX_T>(0)) {
-            return 1;
-        } else if (old == key) {
-            return 0;
-        }
-        index = (index + stride) & bit_mask;
-    }
-  return 0;
-}
-
-__device__ inline uint32_t hashtable_contains(INDEX_T* const table, const unsigned bitlen, const INDEX_T key) {
-    const uint32_t size     = hashtable_getsize(bitlen);
-    const uint32_t bit_mask = size - 1;
-
-    INDEX_T index             = (key ^ (key >> bitlen)) & bit_mask;
-    constexpr uint32_t stride = 1;
-
-    // only check if the slot is filled, no actual insertion
-    for (unsigned i = 0; i < size; i++) {
-        const INDEX_T old = table[index];
-        if (old == key) return 1;
-        if (old == ~static_cast<INDEX_T>(0)) return 0;
-        index = (index + stride) & bit_mask;
-    }
-    return 0;
-}
-
-__device__ inline void hashtable_restore(   
-    INDEX_T* const table, 
-    const unsigned BITLEN,
-    const INDEX_T* itopk_indices,
-    const uint32_t itopk_size,
-    const uint32_t first_tid = 0) {
-  constexpr INDEX_T index_msb_1_mask = 0x80000000;
-  if (threadIdx.x < first_tid) return;
-  for (unsigned i = threadIdx.x - first_tid; i < itopk_size; i += blockDim.x - first_tid) {
-    auto key = itopk_indices[i] & ~index_msb_1_mask;  // clear most significant bit
-    hashtable_insert(table, BITLEN, key);
-  }
-}
-
-__device__ inline void hashtable_restore_expand_only(
-    INDEX_T* const table,
-    const unsigned BITLEN,
-    const INDEX_T* itopk_indices,
-    const uint32_t itopk_size,
-    const uint32_t first_tid = 0) {
-  constexpr INDEX_T index_msb_1_mask = 0x80000000;
-  if (threadIdx.x < first_tid) return;
-  for (unsigned i = threadIdx.x - first_tid; i < itopk_size; i += blockDim.x - first_tid) {
-    const INDEX_T raw = itopk_indices[i];
-    // only restore nodes that are expanded already (MSB is 0)
-    if ((raw & index_msb_1_mask) == 0 || raw == MAX_INDEX) continue;
-    const INDEX_T key = raw & ~index_msb_1_mask;
-    hashtable_insert(table, BITLEN, key);
-  }
-}
 
 // select top-N un-expanded nodes in the priority queue of size M
 static __device__ uint32_t pick_expanders(int N, INDEX_T* output_list, int M, INDEX_T* pri_queue) {

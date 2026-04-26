@@ -1,5 +1,6 @@
 #pragma once
 #include "utils.cuh"
+#include "hash_filter.cuh"
 #include <cuda_runtime.h>
 #if defined(__CUDA_ARCH__) || defined(__CUDACC__)
 #include <cuda_pipeline_primitives.h>
@@ -8,7 +9,7 @@
 #define INTERNAL_TOPK   128
 #endif
 #define SEARCH_WIDTH    1     // MAX: 2 nodes * 32 degree = 64 neighbors = CANDIDATE_BUFFER_SIZE
-#define BITLEN          GPU_HASH_BITLEN_FOR_TOPK(INTERNAL_TOPK)
+#define BITLEN          10
 #define MAX_ITERATIONS  1024
 #define TEAM_SIZE       8
 #define HASH_TABLE_CONFIG   1
@@ -50,7 +51,7 @@ static __host__ inline uint32_t calculate_shared_mem_size(int dim, int topk, int
     size_t padded_dim = 1ULL << static_cast<size_t>(ceilf(log2f(dim)));
     size_t code_words = padded_dim / 64;
     size_t size = 0;    
-    size += hashtable_getsize(BITLEN) * sizeof(INDEX_T);    // hash table
+    size += HashFilter::shared_mem_bytes(BITLEN);            // hash table
     size += RESULT_BUFFER_SIZE * sizeof(INDEX_T);           // top k and candidate index
     size += RESULT_BUFFER_SIZE * sizeof(DISTANCE_T);        // top k and candidate distance
     size += SEARCH_WIDTH * sizeof(INDEX_T);                 // next expanders / parent buffer
@@ -118,7 +119,8 @@ void QuantizedBeamSearch(
     DISTANCE_T* CANDIDATE_DISTANCE  = ALL_DISTANCE + INTERNAL_TOPK;
 
     INDEX_T* HASH_TABLE = (INDEX_T*)(ALL_DISTANCE + RESULT_BUFFER_SIZE);
-    INDEX_T* PARENT_LIST = (INDEX_T*)(HASH_TABLE + hashtable_getsize(BITLEN));
+    HashFilter hf(HASH_TABLE, BITLEN);
+    INDEX_T* PARENT_LIST = (INDEX_T*)(HASH_TABLE + HashFilter::shared_mem_bytes(BITLEN) / sizeof(INDEX_T));
     DATA_T* QUERY_BUFFER = (DATA_T*)(PARENT_LIST + SEARCH_WIDTH);
 
     float* ROTATED_QUERY_BUFFER = reinterpret_cast<float*>(QUERY_BUFFER + dim);
@@ -181,7 +183,7 @@ void QuantizedBeamSearch(
     }
 
     // initialize the hash table to record expanded nodes
-    if (HASH_TABLE_CONFIG) hashtable_init(HASH_TABLE, BITLEN);
+    if (HASH_TABLE_CONFIG) hf.init();
 
     // load query into shared memory
     for (int i = tid; i < dim; i += blockDim.x) {
@@ -229,9 +231,7 @@ void QuantizedBeamSearch(
         // forgettable hash table management according to the CARGA paper
         if (HASH_TABLE_CONFIG) {
             if ((iter + 1) % SMALL_HASH_RESET_INTERVAL == 0) {
-                hashtable_init(HASH_TABLE, BITLEN);
-                __syncthreads();
-                hashtable_restore_expand_only(HASH_TABLE, BITLEN, TOP_K_INDEX, INTERNAL_TOPK);
+                hf.init();
             }
             __syncthreads();
         }
@@ -294,7 +294,7 @@ void QuantizedBeamSearch(
         INDEX_T current_node = TOP_K_INDEX[PARENT_LIST[0]] & 0x7fffffff;
 
         if (tid == 0) {
-            current_expanded = hashtable_insert(HASH_TABLE, BITLEN, current_node);
+            current_expanded = hf.insert(current_node);
         }
         __syncthreads();
         if (!current_expanded) {
@@ -356,7 +356,7 @@ void QuantizedBeamSearch(
         if (GPU_DISTANCE_TIMING && tid == 0) visited_start = gpu_globaltimer();
         for (int i = tid; i < CANDIDATE_BUFFER_SIZE; i += blockDim.x) {
             INDEX_T child_id = (i < max_degree) ? current_neighbors[i] : MAX_INDEX;
-            if (child_id != MAX_INDEX && hashtable_contains(HASH_TABLE, BITLEN, child_id)) {
+            if (child_id != MAX_INDEX && hf.contains(child_id)) {
                 child_id = MAX_INDEX;
             }
             CANDIDATE_INDEX[i] = child_id;

@@ -1,5 +1,6 @@
 #pragma once
 #include "utils.cuh"
+#include "hash_filter.cuh"
 #include <cstdint>
 #include <mma.h>
 #include <cuda_runtime.h>
@@ -75,7 +76,7 @@ static __host__ inline uint32_t calculate_shared_mem_size_tensor(int dim, int to
     size_t padded_dim = 1ULL << static_cast<size_t>(ceilf(log2f(dim)));
     size_t code_words = padded_dim / 64;
     size_t size = 0;    
-    size += hashtable_getsize(BITLEN) * sizeof(INDEX_T);    // hash table
+    size += HashFilter::shared_mem_bytes(BITLEN);            // hash table
     size += RESULT_BUFFER_SIZE * sizeof(INDEX_T);           // top k and candidate index
     size += RESULT_BUFFER_SIZE * sizeof(DISTANCE_T);        // top k and candidate distance
     size += SEARCH_WIDTH * sizeof(INDEX_T);                 // next expanders / parent buffer
@@ -140,7 +141,8 @@ void TensorCoreQuantizedBeamSearch(
     DISTANCE_T* CANDIDATE_DISTANCE  = ALL_DISTANCE + INTERNAL_TOPK;
 
     INDEX_T* HASH_TABLE = (INDEX_T*)(ALL_DISTANCE + RESULT_BUFFER_SIZE);
-    INDEX_T* PARENT_LIST = (INDEX_T*)(HASH_TABLE + hashtable_getsize(BITLEN));
+    HashFilter hf(HASH_TABLE, BITLEN);
+    INDEX_T* PARENT_LIST = (INDEX_T*)(HASH_TABLE + HashFilter::shared_mem_bytes(BITLEN) / sizeof(INDEX_T));
     DATA_T* QUERY_BUFFER = (DATA_T*)(PARENT_LIST + SEARCH_WIDTH);
 
     float* ROTATED_QUERY_BUFFER = reinterpret_cast<float*>(QUERY_BUFFER + dim);
@@ -201,7 +203,7 @@ void TensorCoreQuantizedBeamSearch(
     }
 
     // initialize the hash table to record visited (computed) nodes
-    if (HASH_TABLE_CONFIG) hashtable_init(HASH_TABLE, BITLEN);
+    if (HASH_TABLE_CONFIG) hf.init();
 
     // load query into shared memory
     for (int i = tid; i < dim; i += blockDim.x) {
@@ -224,7 +226,7 @@ void TensorCoreQuantizedBeamSearch(
             atomicAdd(&timing[GPU_TIMING_L2_CALLS], gpu_long_t(1));
             atomicAdd(&timing[GPU_TIMING_L2_CYCLES], gpu_globaltimer() - l2_start);
         }
-        hashtable_insert(HASH_TABLE, BITLEN, entry_point);
+        hf.insert(entry_point);
     }
     __syncthreads();
 
@@ -239,9 +241,7 @@ void TensorCoreQuantizedBeamSearch(
         // forgettable hash table management according to the CARGA paper
         if (HASH_TABLE_CONFIG) {
             if ((iter + 1) % SMALL_HASH_RESET_INTERVAL == 0) {
-                hashtable_init(HASH_TABLE, BITLEN);
-                __syncthreads();
-                hashtable_restore(HASH_TABLE, BITLEN, TOP_K_INDEX, INTERNAL_TOPK);
+                hf.init();
             }
             __syncthreads();
         }
@@ -289,7 +289,7 @@ void TensorCoreQuantizedBeamSearch(
             INDEX_T child_id = (i < max_degree) ? current_neighbors[i] : MAX_INDEX;      // only in-bound threads take from the neighbor list
 
             if (child_id != MAX_INDEX) {    // check if visited already
-                if (hashtable_insert(HASH_TABLE, BITLEN, child_id) == 0) {
+                if (hf.insert(child_id) == 0) {
                     child_id = MAX_INDEX;
                     CANDIDATE_DISTANCE[i] = FLT_MAX;
                 } else {
