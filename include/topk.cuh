@@ -40,10 +40,52 @@ class SharedBitonicTopK {
     float*    topk_dist;  // points into shared memory, stored descending
     uint32_t* topk_idx;   // points into shared memory, stored descending
     public:
+    /**
+     * @brief Construct a top-k buffer backed by shared memory.
+     *
+     * The caller is responsible for allocating shared memory arrays of at
+     * least `topk` elements each. The buffer must be pre-filled in
+     * descending order by distance before the first merge call.
+     *
+     * @param topk       Number of elements the buffer holds.
+     * @param topk_dist  Shared memory array of distances, size >= topk.
+     * @param topk_idx   Shared memory array of indices, size >= topk.
+     */
     __device__ SharedBitonicTopK(unsigned topk, float* topk_dist, uint32_t* topk_idx)
         : topk(topk), topk_dist(topk_dist), topk_idx(topk_idx) {}
+    /**
+     * @brief Merge candidates into the descending internal buffer.
+     *
+     * Assumes the global sequence across all BX threads is sorted ascending,
+     * with each thread holding its REG-element slice. The internal buffer
+     * must be sorted descending and its size must be a multiple of N.
+     *
+     * @param dist  Per-thread REG distances, ascending across threads.
+     * @param idx   Per-thread REG indices, corresponding to dist.
+     */
     __device__ void merge(float (&dist)[REG], uint32_t (&idx)[REG]);
+    /**
+     * @brief Pick up to n unmarked nodes with the smallest distances.
+     *
+     * Scans the buffer from the tail (smallest distances). Unmarked means
+     * MSB of the index is 0 and the index is not 0xFFFFFFFF. Found nodes
+     * are marked (MSB set to 1). Only warp 0 (threads 0..31) participates.
+     *
+     * @param idx   Output array receiving the buffer positions of picked nodes.
+     * @param n     Maximum number of nodes to pick.
+     * @return      Actual number of nodes picked (<= n).
+     */
     __device__ unsigned pick(uint32_t (&idx)[N], unsigned n);
+    /**
+     * @brief Flush the n smallest elements to global memory.
+     *
+     * Reads from the tail of the descending buffer. Clears the MSB mark
+     * on output indices. All BX threads participate with strided access.
+     *
+     * @param dist  Output distance array in global memory, size >= n.
+     * @param idx   Output index array in global memory, size >= n.
+     * @param n     Number of elements to write, must be <= topk.
+     */
     __device__ void flush(float* dist, uint32_t* idx, unsigned n);
     // -- helpers
     template <bool asc = true>
@@ -151,8 +193,14 @@ __device__ void SharedBitonicTopK<N, BX, REG>::flush(float* dist, uint32_t* idx,
     }
 }
 
-// Pairwise min/max split.
-//   a[j] = min(a[j], b[j]),  b[j] = max(a[j], b[j])
+/**
+ * @brief Pairwise min/max split on REG register pairs.
+ *
+ * After the call, a[j] holds min(a[j], b[j]) and b[j] holds max(a[j], b[j])
+ * for every j in [0, REG). When both inputs are sorted halves of a bitonic
+ * sequence, the result is two bitonic subsequences where every element in a
+ * is <= every element in b.
+ */
 template <unsigned N, unsigned BX, unsigned REG>
 __device__ inline void SharedBitonicTopK<N, BX, REG>::butterfly(
     float (&a_d)[REG], uint32_t (&a_i)[REG],
@@ -167,7 +215,14 @@ __device__ inline void SharedBitonicTopK<N, BX, REG>::butterfly(
     }
 }
 
-// Bitonic sort REG elements within a single thread.
+/**
+ * @brief Bitonic sort of REG key-value pairs within a single thread.
+ *
+ * Applies the full bitonic sorting network over the REG elements held in
+ * registers by one thread. No cross-thread communication.
+ *
+ * @tparam asc  true for ascending output, false for descending.
+ */
 template <unsigned N, unsigned BX, unsigned REG>
 template <bool asc>
 __device__ inline void SharedBitonicTopK<N, BX, REG>::bitonic_sort_local(float (&d)[REG], uint32_t (&i)[REG]) {
@@ -190,8 +245,17 @@ __device__ inline void SharedBitonicTopK<N, BX, REG>::bitonic_sort_local(float (
     }
 }
 
-// Bitonic sort across BX threads, each holding REG elements.
-// Total sorted elements = BX * REG.
+/**
+ * @brief Bitonic sort of BX*REG key-value pairs distributed across BX threads.
+ *
+ * Each thread holds REG elements. The sort first calls bitonic_sort_local,
+ * then performs cross-thread merge steps: intra-warp steps use __shfl_xor_sync,
+ * cross-warp steps go through the shared-memory scratch buffers.
+ *
+ * @tparam asc        true for ascending output, false for descending.
+ * @param scratch_d   Shared memory scratch for floats, size >= N.
+ * @param scratch_i   Shared memory scratch for uint32_ts, size >= N.
+ */
 template <unsigned N, unsigned BX, unsigned REG>
 template <bool asc>
 __device__ inline void SharedBitonicTopK<N, BX, REG>::bitonic_sort_block(
