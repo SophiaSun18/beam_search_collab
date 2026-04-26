@@ -29,8 +29,25 @@ concept TopKBuffer = requires(
 
 /**
  *  @class SharedBitonicTopK shared memory topk buffer for bitonic sorting
- *  @tparam BX number of threads in the blocks
- *  @tparam REG rough register pressure parameter per thread
+ *
+ *  @tparam BX  Number of threads participating in one instance.
+ *  @tparam REG Registers per thread (candidates per thread per merge).
+ *
+ *  ## Supported thread layouts
+ *
+ *  | BX       | BY (instances/block) | Block shape      | Scratch | Use case                  |
+ *  |----------|----------------------|------------------|---------|---------------------------|
+ *  | 32       | >= 1                 | dim3(32, BY)     | No      | Warp-level, independent   |
+ *  | > 32     | 1                    | dim3(BX)         | Yes     | Block-level, single query |
+ *
+ *  BX > 32 with BY > 1 is NOT supported. The __syncthreads used for
+ *  cross-warp sort steps would synchronize across independent queries,
+ *  causing deadlocks when queries converge at different iterations.
+ *
+ *  When BX <= 32 (single warp): all sort steps use __shfl_xor_sync,
+ *  scratch buffers are unused (nullptr), and sync() uses __syncwarp.
+ *  When BX > 32 (multi-warp): cross-warp sort steps use scratch buffers
+ *  in shared memory, and sync() uses __syncthreads.
  */
 template <unsigned BX, unsigned REG>
 class SharedBitonicTopK {
@@ -40,33 +57,54 @@ class SharedBitonicTopK {
     float*    topk_dist;  // points into shared memory, stored descending
     uint32_t* topk_idx;   // points into shared memory, stored descending
 
+    // Cross-warp scratch for bitonic sort. Only used when BX > 32.
+    // When BX <= 32, these are nullptr — all sort steps use shfl.
+    float*    scratch_d_;
+    uint32_t* scratch_i_;
+
     /// Correct sync for the number of participating threads.
-    /// Single-warp (BX <= 32): __syncwarp. Multi-warp: __syncthreads.
+    /// BX <= 32 (single warp): __syncwarp.
+    /// BX > 32 (multi-warp, BY must be 1): __syncthreads.
     __device__ static void sync();
 
     public:
     /**
-     * @brief Construct a top-k buffer backed by shared memory.
+     * @brief Construct a top-k buffer backed by caller-provided shared memory.
      *
-     * The caller is responsible for allocating shared memory arrays of at
-     * least `topk` elements each. The buffer must be pre-filled in
-     * descending order by distance before the first merge call.
+     * Initializes all slots to FLT_MAX / 0xFFFFFFFF. All BX threads must call.
+     * When BX > 32, scratch_d and scratch_i must point to shared memory arrays
+     * of at least N elements each for cross-warp sort steps.
+     * When BX <= 32, scratch pointers are ignored (all sorts use shfl).
      *
      * @param topk       Number of elements the buffer holds.
      * @param topk_dist  Shared memory array of distances, size >= topk.
      * @param topk_idx   Shared memory array of indices, size >= topk.
+     * @param scratch_d  Scratch for cross-warp sort (nullptr ok when BX <= 32).
+     * @param scratch_i  Scratch for cross-warp sort (nullptr ok when BX <= 32).
      */
-    __device__ SharedBitonicTopK(unsigned topk, float* topk_dist, uint32_t* topk_idx);
+    __device__ SharedBitonicTopK(unsigned topk, float* topk_dist, uint32_t* topk_idx,
+                                  float* scratch_d = nullptr, uint32_t* scratch_i = nullptr);
 
     /**
-     * @brief Self-allocating constructor. Carves dist/idx arrays from smem,
-     *        advances the pointer, and fills the buffer with FLT_MAX / 0xFFFFFFFF.
-     *        All threads must participate (block-wide init).
+     * @brief Self-allocating constructor. Carves all storage from smem.
+     *
+     * Allocates topk dist/idx arrays, and scratch buffers (if BX > 32).
+     * Initializes all slots to FLT_MAX / 0xFFFFFFFF. All BX threads must call.
+     * Advances smem past all allocations.
      */
     __device__ SharedBitonicTopK(char*& smem, unsigned topk);
 
+    /**
+     * @brief Total shared memory bytes needed by the self-allocating constructor.
+     *
+     * Includes topk dist/idx arrays and scratch (if BX > 32).
+     */
     __host__ __device__ static size_t shared_mem_bytes(unsigned topk) {
-        return topk * (sizeof(float) + sizeof(uint32_t));
+        size_t size = topk * (sizeof(float) + sizeof(uint32_t));
+        // Scratch for cross-warp sort, only when BX > 32
+        if constexpr (BX > 32)
+            size += N * (sizeof(float) + sizeof(uint32_t));
+        return size;
     }
 
     /**
@@ -115,17 +153,25 @@ class SharedBitonicTopK {
             float (&a_d)[REG], uint32_t (&a_i)[REG], float (&b_d)[REG], uint32_t (&b_i)[REG]);
 };
 
+// ── sync ────────────────────────────────────────────────────────────────────
+
 template <unsigned BX, unsigned REG>
 __device__ void SharedBitonicTopK<BX, REG>::sync() {
+    // BX <= 32: single warp, independent of other warps in the block.
+    // BX > 32: multi-warp, requires block-wide barrier (BY must be 1).
     if constexpr (BX <= 32) __syncwarp(); else __syncthreads();
 }
 
+// ── constructors ────────────────────────────────────────────────────────────
+
 template <unsigned BX, unsigned REG>
 __device__ SharedBitonicTopK<BX, REG>::SharedBitonicTopK(
-    unsigned topk, float* topk_dist, uint32_t* topk_idx)
-    : topk(topk), topk_dist(topk_dist), topk_idx(topk_idx)
+    unsigned topk, float* topk_dist, uint32_t* topk_idx,
+    float* scratch_d, uint32_t* scratch_i)
+    : topk(topk), topk_dist(topk_dist), topk_idx(topk_idx),
+      scratch_d_(scratch_d), scratch_i_(scratch_i)
 {
-    for (unsigned i = threadIdx.x; i < topk; i += blockDim.x) {
+    for (unsigned i = threadIdx.x; i < topk; i += BX) {
         topk_dist[i] = FLT_MAX;
         topk_idx[i]  = 0xFFFFFFFF;
     }
@@ -135,25 +181,33 @@ template <unsigned BX, unsigned REG>
 __device__ SharedBitonicTopK<BX, REG>::SharedBitonicTopK(char*& smem, unsigned topk)
     : topk(topk),
       topk_dist(reinterpret_cast<float*>(smem)),
-      topk_idx(reinterpret_cast<uint32_t*>(smem + topk * sizeof(float)))
+      topk_idx(reinterpret_cast<uint32_t*>(smem + topk * sizeof(float))),
+      scratch_d_(nullptr), scratch_i_(nullptr)
 {
     smem += topk * (sizeof(float) + sizeof(uint32_t));
-    for (unsigned i = threadIdx.x; i < topk; i += blockDim.x) {
+
+    // Allocate scratch only when BX > 32 (cross-warp sort steps need it).
+    // When BX <= 32, all sort steps use __shfl_xor_sync — no scratch needed.
+    if constexpr (BX > 32) {
+        scratch_d_ = reinterpret_cast<float*>(smem);
+        scratch_i_ = reinterpret_cast<uint32_t*>(smem + N * sizeof(float));
+        smem += N * (sizeof(float) + sizeof(uint32_t));
+    }
+
+    for (unsigned i = threadIdx.x; i < topk; i += BX) {
         topk_dist[i] = FLT_MAX;
         topk_idx[i]  = 0xFFFFFFFF;
     }
 }
 
+// ── merge ───────────────────────────────────────────────────────────────────
+
 template <unsigned BX, unsigned REG>
 __device__ void SharedBitonicTopK<BX, REG>::merge(float (&dist)[REG], uint32_t (&idx)[REG]) {
-    // Scratch for cross-warp bitonic sort steps. When BX <= 32 (single warp),
-    // the cross-warp path is dead code and the compiler eliminates these.
-    __shared__ float    scratch_d[N];
-    __shared__ uint32_t scratch_i[N];
     const unsigned tid = threadIdx.x;
     const unsigned chunks = topk / N;
     // [1] Sort incoming candidates ascending (from arbitrary order).
-    bitonic_sort_full(dist, idx, scratch_d, scratch_i);
+    bitonic_sort_full(dist, idx, scratch_d_, scratch_i_);
     for (unsigned c = 0; c < chunks; c++) {
         // [2] Load chunk c into registers
         float    dist_[REG];
@@ -168,7 +222,7 @@ __device__ void SharedBitonicTopK<BX, REG>::merge(float (&dist)[REG], uint32_t (
         butterfly(dist, idx, dist_, idx_);
         // [5] If not first chunk, sort upper half descending and flush to previous chunk
         if (c > 0) {
-            bitonic_sort_block<false>(dist_, idx_, scratch_d, scratch_i);
+            bitonic_sort_block<false>(dist_, idx_, scratch_d_, scratch_i_);
             #pragma unroll
             for (unsigned j = 0; j < REG; j++) {
                 unsigned pos = (c - 1) * N + tid * REG + j;
@@ -178,10 +232,10 @@ __device__ void SharedBitonicTopK<BX, REG>::merge(float (&dist)[REG], uint32_t (
             sync();
         }
         // [6] Sort lower half ascending, ready for next chunk
-        bitonic_sort_block<true>(dist, idx, scratch_d, scratch_i);
+        bitonic_sort_block<true>(dist, idx, scratch_d_, scratch_i_);
     }
     // [7] Flush last chunk descending
-    bitonic_sort_block<false>(dist, idx, scratch_d, scratch_i);
+    bitonic_sort_block<false>(dist, idx, scratch_d_, scratch_i_);
     #pragma unroll
     for (unsigned j = 0; j < REG; j++) {
         unsigned pos = (chunks - 1) * N + tid * REG + j;
@@ -190,6 +244,8 @@ __device__ void SharedBitonicTopK<BX, REG>::merge(float (&dist)[REG], uint32_t (
     }
     sync();
 }
+
+// ── pick ────────────────────────────────────────────────────────────────────
 
 template <unsigned BX, unsigned REG>
 __device__ unsigned SharedBitonicTopK<BX, REG>::pick(uint32_t (&out)[N], unsigned n) {
@@ -230,6 +286,8 @@ __device__ unsigned SharedBitonicTopK<BX, REG>::pick(uint32_t (&out)[N], unsigne
     return (found < n) ? found : n;
 }
 
+// ── flush ───────────────────────────────────────────────────────────────────
+
 template <unsigned BX, unsigned REG>
 __device__ void SharedBitonicTopK<BX, REG>::flush(float* dist, uint32_t* idx, unsigned n) {
     const unsigned tid = threadIdx.x;
@@ -241,17 +299,14 @@ __device__ void SharedBitonicTopK<BX, REG>::flush(float* dist, uint32_t* idx, un
     }
 }
 
+// ── bitonic_sort_full ───────────────────────────────────────────────────────
+
 /**
  * @brief Full bitonic sort of BX*REG key-value pairs from arbitrary order.
  *        Always produces ascending output.
  *
- * Unlike bitonic_sort_block (which assumes bitonic input), this runs
- * the complete bitonic sorting network from unsorted data.
- * Direction: ((global_pos & len) == 0) — naturally ascending at top level
- * since global_pos < TOTAL = len at the final pass.
- *
- * @param scratch_d   Shared memory scratch for floats, size >= N.
- * @param scratch_i   Shared memory scratch for uint32_ts, size >= N.
+ * @param scratch_d   Shared memory scratch for floats (nullptr when BX <= 32).
+ * @param scratch_i   Shared memory scratch for uint32_ts (nullptr when BX <= 32).
  */
 template <unsigned BX, unsigned REG>
 __device__ inline void SharedBitonicTopK<BX, REG>::bitonic_sort_full(
@@ -266,6 +321,7 @@ __device__ inline void SharedBitonicTopK<BX, REG>::bitonic_sort_full(
             if (stride >= REG) {
                 unsigned thread_stride = stride / REG;
                 if (thread_stride < 32) {
+                    // Intra-warp: use shfl (works for any BX)
                     unsigned partner = tid ^ thread_stride;
                     #pragma unroll
                     for (unsigned j = 0; j < REG; j++) {
@@ -281,6 +337,7 @@ __device__ inline void SharedBitonicTopK<BX, REG>::bitonic_sort_full(
                         }
                     }
                 } else {
+                    // Cross-warp: use scratch (only reached when BX > 32)
                     #pragma unroll
                     for (unsigned j = 0; j < REG; j++) {
                         scratch_d[tid * REG + j] = d[j];
@@ -321,13 +378,10 @@ __device__ inline void SharedBitonicTopK<BX, REG>::bitonic_sort_full(
     }
 }
 
+// ── butterfly ───────────────────────────────────────────────────────────────
+
 /**
  * @brief Pairwise min/max split on REG register pairs.
- *
- * After the call, a[j] holds min(a[j], b[j]) and b[j] holds max(a[j], b[j])
- * for every j in [0, REG). When both inputs are sorted halves of a bitonic
- * sequence, the result is two bitonic subsequences where every element in a
- * is <= every element in b.
  */
 template <unsigned BX, unsigned REG>
 __device__ inline void SharedBitonicTopK<BX, REG>::butterfly(
@@ -343,13 +397,11 @@ __device__ inline void SharedBitonicTopK<BX, REG>::butterfly(
     }
 }
 
+// ── bitonic_sort_local ──────────────────────────────────────────────────────
+
 /**
  * @brief Bitonic sort of REG key-value pairs within a single thread.
- *
- * Applies the full bitonic sorting network over the REG elements held in
- * registers by one thread. No cross-thread communication.
- *
- * @tparam asc  true for ascending output, false for descending.
+ *        No cross-thread communication.
  */
 template <unsigned BX, unsigned REG>
 template <bool asc>
@@ -373,16 +425,16 @@ __device__ inline void SharedBitonicTopK<BX, REG>::bitonic_sort_local(float (&d)
     }
 }
 
+// ── bitonic_sort_block ──────────────────────────────────────────────────────
+
 /**
  * @brief Bitonic sort of BX*REG key-value pairs distributed across BX threads.
  *
- * Each thread holds REG elements. The sort first calls bitonic_sort_local,
- * then performs cross-thread merge steps: intra-warp steps use __shfl_xor_sync,
- * cross-warp steps go through the shared-memory scratch buffers.
+ * Intra-warp steps use __shfl_xor_sync. Cross-warp steps (only when BX > 32)
+ * go through the shared-memory scratch buffers.
  *
- * @tparam asc        true for ascending output, false for descending.
- * @param scratch_d   Shared memory scratch for floats, size >= N.
- * @param scratch_i   Shared memory scratch for uint32_ts, size >= N.
+ * @param scratch_d   Shared memory scratch for floats (nullptr when BX <= 32).
+ * @param scratch_i   Shared memory scratch for uint32_ts (nullptr when BX <= 32).
  */
 template <unsigned BX, unsigned REG>
 template <bool asc>
@@ -398,6 +450,7 @@ __device__ inline void SharedBitonicTopK<BX, REG>::bitonic_sort_block(
             if (stride >= REG) {
                 unsigned thread_stride = stride / REG;
                 if (thread_stride < 32) {
+                    // Intra-warp: use shfl
                     unsigned partner = tid ^ thread_stride;
                     #pragma unroll
                     for (unsigned j = 0; j < REG; j++) {
@@ -413,6 +466,7 @@ __device__ inline void SharedBitonicTopK<BX, REG>::bitonic_sort_block(
                         }
                     }
                 } else {
+                    // Cross-warp: use scratch (only reached when BX > 32)
                     #pragma unroll
                     for (unsigned j = 0; j < REG; j++) {
                         scratch_d[tid * REG + j] = d[j];
@@ -452,4 +506,3 @@ __device__ inline void SharedBitonicTopK<BX, REG>::bitonic_sort_block(
         }
     }
 }
-

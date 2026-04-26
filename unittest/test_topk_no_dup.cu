@@ -19,12 +19,11 @@ __global__ void kernel_test_no_dup(
 {
     constexpr unsigned N = BX * REG;
     extern __shared__ char smem[];
-    float*    s_dist = (float*)smem;
-    uint32_t* s_idx  = (uint32_t*)(s_dist + topk);
+    char* ptr = smem;
 
     const unsigned tid = threadIdx.x;
 
-    SharedBitonicTopK<BX, REG> buf(topk, s_dist, s_idx);
+    SharedBitonicTopK<BX, REG> buf(ptr, topk);
     __syncthreads();
 
     unsigned batches = n_inputs / N;
@@ -93,7 +92,7 @@ bool run_no_dup_test(unsigned topk, unsigned n_total, unsigned seed) {
     cudaMemset(d_picked, 0, max_picks * sizeof(uint32_t));
     cudaMemset(d_picked_count, 0, sizeof(unsigned));
 
-    size_t smem_size = topk * (sizeof(float) + sizeof(uint32_t));
+    size_t smem_size = SharedBitonicTopK<BX, REG>::shared_mem_bytes(topk);
     kernel_test_no_dup<BX, REG><<<1, BX, smem_size>>>(
         d_dist, d_idx, n_inputs, topk,
         d_picked, d_picked_count);

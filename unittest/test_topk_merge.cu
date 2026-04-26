@@ -18,12 +18,11 @@ __global__ void kernel_test_merge(
 {
     constexpr unsigned N = BX * REG;
     extern __shared__ char smem[];
-    float*    s_dist = (float*)smem;
-    uint32_t* s_idx  = (uint32_t*)(s_dist + topk);
+    char* ptr = smem;
 
     const unsigned tid = threadIdx.x;
 
-    SharedBitonicTopK<BX, REG> buf(topk, s_dist, s_idx);
+    SharedBitonicTopK<BX, REG> buf(ptr, topk);
     __syncthreads();
 
     // Merge batches of N elements
@@ -93,7 +92,7 @@ bool run_merge_test(unsigned topk, unsigned n_total, unsigned seed) {
     cudaMemcpy(d_in_dist,  h_in_dist.data(),  n_inputs * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_in_idx,   h_in_idx.data(),   n_inputs * sizeof(uint32_t), cudaMemcpyHostToDevice);
 
-    size_t smem_size = topk * (sizeof(float) + sizeof(uint32_t));
+    size_t smem_size = SharedBitonicTopK<BX, REG>::shared_mem_bytes(topk);
     kernel_test_merge<BX, REG><<<1, BX, smem_size>>>(
         d_buf_dist, d_buf_idx, topk,
         d_in_dist, d_in_idx, n_inputs,
