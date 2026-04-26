@@ -39,6 +39,22 @@ target_compile_options(gpu_search PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3 --ptxas
 add_executable(gpu_microbenchmark src/gpu_microbenchmark.cu)
 target_compile_options(gpu_microbenchmark PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3 --ptxas-options=-v>)
 
+# ── Tests ────────────────────────────────────────────────────────────────────
+
+enable_testing()
+
+add_executable(test_topk_merge unittest/test_topk_merge.cu)
+target_compile_options(test_topk_merge PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
+add_test(NAME test_topk_merge COMMAND test_topk_merge)
+
+add_executable(test_bitonic_sort unittest/test_bitonic_sort.cu)
+target_compile_options(test_bitonic_sort PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
+add_test(NAME test_bitonic_sort COMMAND test_bitonic_sort)
+
+add_executable(test_topk_no_dup unittest/test_topk_no_dup.cu)
+target_compile_options(test_topk_no_dup PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
+add_test(NAME test_topk_no_dup COMMAND test_topk_no_dup)
+
 # ── Output directory ─────────────────────────────────────────────────────────
 
 set_target_properties(

@@ -14,7 +14,7 @@ concept TopKBuffer = requires(
     B              	buf,
     float           (&dist)[REG],
     uint32_t        (&idx)[REG],
-    unsigned       	n,
+    unsigned       	n
 ) {
     // Merge per-thread REG sorted candidates into internal storage.
     { buf.merge(dist, idx) } -> std::same_as<void>;
@@ -40,10 +40,12 @@ class SharedBitonicTopK {
     float*    topk_dist;  // points into shared memory, stored descending
     uint32_t* topk_idx;   // points into shared memory, stored descending
     public:
+    __device__ SharedBitonicTopK(unsigned topk, float* topk_dist, uint32_t* topk_idx)
+        : topk(topk), topk_dist(topk_dist), topk_idx(topk_idx) {}
     __device__ void merge(float (&dist)[REG], uint32_t (&idx)[REG]);
     __device__ unsigned pick(uint32_t (&idx)[N], unsigned n);
     __device__ void flush(float* dist, uint32_t* idx, unsigned n);
-    private: // helpers
+    // -- helpers
     template <bool asc = true>
     __device__ static inline void bitonic_sort_local(
             float (&d)[REG], uint32_t (&i)[REG]);
@@ -57,6 +59,8 @@ class SharedBitonicTopK {
 template <unsigned N, unsigned BX, unsigned REG>
 __device__ void SharedBitonicTopK<N, BX, REG>::merge(float (&dist)[REG], uint32_t (&idx)[REG]) {
     static_assert(N == BX * REG, "N must equal BX * REG");
+    __shared__ float    scratch_d[N];
+    __shared__ uint32_t scratch_i[N];
     const unsigned tid = threadIdx.x;
     const unsigned chunks = topk / N;
     // [1] dist/idx arrive ascending (the incoming candidates).
@@ -74,7 +78,7 @@ __device__ void SharedBitonicTopK<N, BX, REG>::merge(float (&dist)[REG], uint32_
         butterfly(dist, idx, dist_, idx_);
         // [5] If not first chunk, sort upper half descending and flush to previous chunk
         if (c > 0) {
-            bitonic_sort_block<false>(dist_, idx_, topk_dist, topk_idx);
+            bitonic_sort_block<false>(dist_, idx_, scratch_d, scratch_i);
             #pragma unroll
             for (unsigned j = 0; j < REG; j++) {
                 unsigned pos = (c - 1) * N + tid * REG + j;
@@ -84,10 +88,10 @@ __device__ void SharedBitonicTopK<N, BX, REG>::merge(float (&dist)[REG], uint32_
             __syncthreads();
         }
         // [6] Sort lower half ascending, ready for next chunk
-        bitonic_sort_block<true>(dist, idx, topk_dist, topk_idx);
+        bitonic_sort_block<true>(dist, idx, scratch_d, scratch_i);
     }
     // [7] Flush last chunk descending
-    bitonic_sort_block<false>(dist, idx, topk_dist, topk_idx);
+    bitonic_sort_block<false>(dist, idx, scratch_d, scratch_i);
     #pragma unroll
     for (unsigned j = 0; j < REG; j++) {
         unsigned pos = (chunks - 1) * N + tid * REG + j;
