@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <fstream>
 #include <iostream>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -73,20 +74,20 @@ public:
     void load(const std::string& graph_bin, const std::string& data_fvecs);
 
     /**
-     * @brief Return a pointer to the neighbor list of a node.
+     * @brief Return the neighbor list of a node as a span.
      *
      * @param node  Node index, must be < num_nodes.
-     * @return Pointer to degree contiguous vid_t entries.
+     * @return Span of degree contiguous vid_t entries.
      */
-    const vid_t* neighbors(vid_t node) const;
+    std::span<const vid_t> nbrs(vid_t node) const;
 
     /**
-     * @brief Return a pointer to the feature vector of a node.
+     * @brief Return the feature vector of a node as a span.
      *
      * @param node  Node index, must be < num_nodes.
-     * @return Pointer to dim contiguous floats.
+     * @return Span of dim contiguous floats.
      */
-    const float* vector(vid_t node) const;
+    std::span<const float> vect(vid_t node) const;
 };
 
 // ── out-of-line implementations ─────────────────────────────────────────────
@@ -171,10 +172,12 @@ inline void CPUGraph::load(const std::string& graph_bin,
     }
 }
 
-inline const vid_t* CPUGraph::neighbors(vid_t node) const {
-    return edges.data() + static_cast<size_t>(node) * degree;
+inline std::span<const vid_t> CPUGraph::nbrs(vid_t node) const {
+    return {edges.data() + static_cast<size_t>(node) * degree,
+            static_cast<size_t>(degree)};
 }
 
-inline const float* CPUGraph::vector(vid_t node) const {
-    return vectors.data() + static_cast<size_t>(node) * dim;
+inline std::span<const float> CPUGraph::vect(vid_t node) const {
+    return {vectors.data() + static_cast<size_t>(node) * dim,
+            static_cast<size_t>(dim)};
 }
