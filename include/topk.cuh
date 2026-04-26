@@ -52,7 +52,35 @@ class SharedBitonicTopK {
      * @param topk_idx   Shared memory array of indices, size >= topk.
      */
     __device__ SharedBitonicTopK(unsigned topk, float* topk_dist, uint32_t* topk_idx)
-        : topk(topk), topk_dist(topk_dist), topk_idx(topk_idx) {}
+        : topk(topk), topk_dist(topk_dist), topk_idx(topk_idx)
+    {
+        for (unsigned i = threadIdx.x; i < topk; i += blockDim.x) {
+            topk_dist[i] = FLT_MAX;
+            topk_idx[i]  = 0xFFFFFFFF;
+        }
+    }
+
+    /**
+     * @brief Self-allocating constructor. Carves dist/idx arrays from smem,
+     *        advances the pointer, and fills the buffer with FLT_MAX / 0xFFFFFFFF.
+     *        All threads must participate (block-wide init).
+     */
+    __device__ SharedBitonicTopK(char*& smem, unsigned topk)
+        : topk(topk),
+          topk_dist(reinterpret_cast<float*>(smem)),
+          topk_idx(reinterpret_cast<uint32_t*>(smem + topk * sizeof(float)))
+    {
+        smem += topk * (sizeof(float) + sizeof(uint32_t));
+        for (unsigned i = threadIdx.x; i < topk; i += blockDim.x) {
+            topk_dist[i] = FLT_MAX;
+            topk_idx[i]  = 0xFFFFFFFF;
+        }
+    }
+
+    __host__ __device__ static size_t shared_mem_bytes(unsigned topk) {
+        return topk * (sizeof(float) + sizeof(uint32_t));
+    }
+
     /**
      * @brief Merge candidates into the descending internal buffer.
      *
@@ -70,7 +98,7 @@ class SharedBitonicTopK {
      * MSB of the index is 0 and the index is not 0xFFFFFFFF. Found nodes
      * are marked (MSB set to 1). Only warp 0 (threads 0..31) participates.
      *
-     * @param idx   Output array receiving the buffer positions of picked nodes.
+     * @param idx   Output array receiving the node IDs of picked nodes (MSB clear).
      * @param n     Maximum number of nodes to pick.
      * @return      Actual number of nodes picked (<= n).
      */
@@ -173,7 +201,7 @@ __device__ unsigned SharedBitonicTopK<BX, REG>::pick(uint32_t (&out)[N], unsigne
         unsigned lane_prefix = __popc(ballot & ((1u << tid) - 1));
 
         if (unmarked && found + lane_prefix < n) {
-            out[found + lane_prefix] = base + tid;
+            out[found + lane_prefix] = val;  // node ID (MSB clear)
             topk_idx[base + tid] = val | MSB;
         }
 

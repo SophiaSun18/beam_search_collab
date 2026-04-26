@@ -191,11 +191,7 @@ void QuantizedBeamSearch(
         if (i < dim) QUERY_BUFFER[i] = query[i];
     }
 
-    // load the top k list and candidate list with dummy initial values
-    for (int i = tid; i < TOPK_BUFFER_SIZE; i += blockDim.x) {
-        TOP_K_INDEX[i] = MAX_INDEX;
-        TOP_K_DISTANCE[i] = FLT_MAX;
-    }
+    // init candidate list and result pool with dummy values
     for (int i = tid; i < CANDIDATE_BUFFER_SIZE; i += blockDim.x) {
         CANDIDATE_INDEX[i] = MAX_INDEX;
         CANDIDATE_DISTANCE[i] = FLT_MAX;
@@ -305,7 +301,7 @@ void QuantizedBeamSearch(
 
         // collect the neighbors of the expanding node and add into candidate list if not visited before
         // make sure to mark the invalid neighbor using dummy large values
-        INDEX_T current_node = TOP_K_INDEX[PARENT_LIST[0]] & 0x7fffffff;
+        INDEX_T current_node = PARENT_LIST[0];
 
         if (tid == 0) {
             current_expanded = hf.insert(current_node);
@@ -316,11 +312,7 @@ void QuantizedBeamSearch(
         }
 
         if (debug_mode && query_id == 0 && tid == 0) {
-            const INDEX_T parent_slot = PARENT_LIST[0];
-            const DISTANCE_T parent_dist =
-                (parent_slot < TOPK_BUFFER_SIZE) ? TOP_K_DISTANCE[parent_slot] : FLT_MAX;
             printf("  expanding node: %u\n", current_node);
-            printf("  expanding slot: %u, dist=%.6f\n", parent_slot, parent_dist);
         }
         const float* current_row = d_qg_data + static_cast<size_t>(current_node) * row_offset;
         const vidType* current_neighbors = reinterpret_cast<const vidType*>(current_row + neighbor_offset);

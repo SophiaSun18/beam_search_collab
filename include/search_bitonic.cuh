@@ -111,12 +111,6 @@ void BeamSearch(
         if (i < dim) QUERY_BUFFER[i] = query[i];
     }
 
-    // load the top k list with dummy initial values
-    for (int i = tid; i < TOPK_BUFFER_SIZE; i += blockDim.x) {
-        TOP_K_INDEX[i] = MAX_INDEX;
-        TOP_K_DISTANCE[i] = FLT_MAX;
-    }
-
     // load the candidate buffer with starting points
     for (int i = warp_id; i < CANDIDATE_BUFFER_SIZE; i += WARPS_PER_BLOCK) {
         CANDIDATE_INDEX[i] = d_starting_points[i];
@@ -194,14 +188,8 @@ void BeamSearch(
         __syncthreads();
 
         if (debug_mode && query_id == 0 && tid == 0) {
-            const INDEX_T parent_slot = PARENT_LIST[0];
-            const INDEX_T parent_raw =
-                (keep_expanding && parent_slot < TOPK_BUFFER_SIZE) ? TOP_K_INDEX[parent_slot] : MAX_INDEX;
-            const DISTANCE_T parent_dist =
-                (keep_expanding && parent_slot < TOPK_BUFFER_SIZE) ? TOP_K_DISTANCE[parent_slot] : FLT_MAX;
             if (keep_expanding) {
-                printf("  expanding node: %u\n", parent_raw & 0x7fffffff);
-                printf("  expanding slot: %u, dist=%.6f\n", parent_slot, parent_dist);
+                printf("  expanding node: %u\n", PARENT_LIST[0]);
             } else {
                 printf("  expanding node: none\n");
             }
@@ -218,7 +206,7 @@ void BeamSearch(
 
         // collect the neighbors of the expanding node and add into candidate list if not visited before
         // make sure to mark the invalid neighbor using dummy large values
-        INDEX_T current_node = TOP_K_INDEX[PARENT_LIST[0]] & 0x7fffffff;
+        INDEX_T current_node = PARENT_LIST[0];
         vid_t* neighbors = gg.N(current_node);
         gpu_long_t l2_start = 0;
         if (GPU_DISTANCE_TIMING && lane_id == 0) l2_start = gpu_globaltimer();

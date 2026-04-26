@@ -23,14 +23,8 @@ __global__ void kernel_test_merge(
 
     const unsigned tid = threadIdx.x;
 
-    // Init shared memory buffer
-    for (unsigned i = tid; i < topk; i += BX) {
-        s_dist[i] = g_buf_dist[i];
-        s_idx[i]  = g_buf_idx[i];
-    }
-    __syncthreads();
-
     SharedBitonicTopK<BX, REG> buf(topk, s_dist, s_idx);
+    __syncthreads();
 
     // Merge batches of N elements
     unsigned batches = n_inputs / N;

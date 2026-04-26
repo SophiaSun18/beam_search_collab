@@ -25,6 +25,14 @@ public:
           size_(1u << bitlen), mask_((1u << bitlen) - 1) {}
 
     /**
+     * @brief Self-allocating constructor. Carves table from smem and advances the pointer.
+     */
+    __device__ HashFilter(char*& smem, unsigned bitlen)
+        : table_(reinterpret_cast<uint32_t*>(smem)), bitlen_(bitlen),
+          size_(1u << bitlen), mask_((1u << bitlen) - 1)
+    { smem += size_ * sizeof(uint32_t); }
+
+    /**
      * @brief Shared memory footprint in bytes for a given bitlen.
      */
     __host__ __device__ static uint32_t shared_mem_bytes(unsigned bitlen) {

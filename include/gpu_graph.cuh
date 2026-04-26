@@ -66,6 +66,9 @@ public:
      */
     __device__ __host__ Span<const float> vect(vid_t node) const;
 
+    __host__ __device__ int dim()    const { return dim_; }
+    __host__ __device__ int degree() const { return degree_; }
+
     GPUGraph(const GPUGraph&) = delete;
     GPUGraph& operator=(const GPUGraph&) = delete;
 

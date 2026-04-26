@@ -162,10 +162,6 @@ __global__ void benchSt(const float* __restrict__ seed,
     __shared__ INDEX_T c_idx[CANDIDATE_BUFFER_SIZE];
     __shared__ DISTANCE_T c_dst[CANDIDATE_BUFFER_SIZE];
 
-    for (int i = tid; i < TOPK_BUFFER_SIZE; i += blockDim.x) {
-        s_idx[i] = MAX_INDEX;
-        s_dst[i] = FLT_MAX;
-    }
     for (int i = tid; i < CANDIDATE_BUFFER_SIZE; i += blockDim.x) {
         c_idx[i] = i;
         c_dst[i] = seed[i];
@@ -248,36 +244,40 @@ __global__ void benchPe(gpu_long_t* out) {
     __shared__ INDEX_T s_idx[TOPK_BUFFER_SIZE];
     __shared__ DISTANCE_T s_dst[TOPK_BUFFER_SIZE];
 
-    for (int i = tid; i < TOPK_BUFFER_SIZE; i += blockDim.x) {
-        s_idx[i] = (i < INTERNAL_TOPK) ? i : MAX_INDEX;
-        s_dst[i] = (i < INTERNAL_TOPK) ? static_cast<float>(INTERNAL_TOPK - 1 - i) : FLT_MAX;
-    }
+    SharedBitonicTopK<BLOCK_SIZE, 1> topk(TOPK_BUFFER_SIZE, s_dst, s_idx);
     __syncthreads();
 
-    SharedBitonicTopK<BLOCK_SIZE, 1> topk(TOPK_BUFFER_SIZE, s_dst, s_idx);
+    // seed topk buffer with test data via merge
+    {
+        float d[1]; uint32_t x[1];
+        d[0] = (tid < INTERNAL_TOPK) ? static_cast<float>(tid) : FLT_MAX;
+        x[0] = (tid < INTERNAL_TOPK) ? tid : MAX_INDEX;
+        topk.merge(d, x);
+    }
 
-    // warmup
+    // warmup: interleaved pick + re-merge
     for (int i = 0; i < 100; i++) {
         uint32_t pbuf[BLOCK_SIZE];
         topk.pick(pbuf, SEARCH_WIDTH);
-        // clear MSB for re-pick
-        for (int j = tid; j < TOPK_BUFFER_SIZE; j += blockDim.x)
-            s_idx[j] &= 0x7fffffff;
-        __syncthreads();
+        // re-merge the picked node so the buffer stays full
+        float d[1] = {FLT_MAX}; uint32_t x[1] = {MAX_INDEX};
+        topk.merge(d, x);
     }
 
-    for (int i = tid; i < TOPK_BUFFER_SIZE; i += blockDim.x) {
-        s_idx[i] = (i < INTERNAL_TOPK) ? i : MAX_INDEX;
+    // re-seed for timed run
+    {
+        float d[1]; uint32_t x[1];
+        d[0] = (tid < INTERNAL_TOPK) ? static_cast<float>(tid) : FLT_MAX;
+        x[0] = (tid < INTERNAL_TOPK) ? tid : MAX_INDEX;
+        topk.merge(d, x);
     }
-    __syncthreads();
 
     gpu_long_t t0 = gpu_globaltimer();
     for (int i = 0; i < NREP; i++) {
         uint32_t pbuf[BLOCK_SIZE];
         topk.pick(pbuf, SEARCH_WIDTH);
-        for (int j = tid; j < TOPK_BUFFER_SIZE; j += blockDim.x)
-            s_idx[j] &= 0x7fffffff;
-        __syncthreads();
+        float d[1] = {FLT_MAX}; uint32_t x[1] = {MAX_INDEX};
+        topk.merge(d, x);
     }
     gpu_long_t t1 = gpu_globaltimer();
 

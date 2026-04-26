@@ -6,15 +6,16 @@
 #include <set>
 #include "include/topk.cuh"
 
-// Test: after multiple merges, no element id should appear twice in the buffer.
-// We generate values 0..total-1 with distinct ids, merge them in,
-// then check the output has no duplicate ids.
+// Test: interleaved pick/merge must never yield duplicate node IDs.
+// A shuffled list of (dist, id) pairs is merged in batches of N.
+// Between each merge, pick(1) yields one node, recorded in global memory.
+// Host verifies no duplicates across all yielded nodes.
 
 template <unsigned BX, unsigned REG>
 __global__ void kernel_test_no_dup(
-    float* g_buf_dist, uint32_t* g_buf_idx, unsigned topk,
     float* g_input_dist, uint32_t* g_input_idx, unsigned n_inputs,
-    float* g_out_dist, uint32_t* g_out_idx)
+    unsigned topk,
+    uint32_t* g_picked, unsigned* g_picked_count)
 {
     constexpr unsigned N = BX * REG;
     extern __shared__ char smem[];
@@ -23,16 +24,14 @@ __global__ void kernel_test_no_dup(
 
     const unsigned tid = threadIdx.x;
 
-    for (unsigned i = tid; i < topk; i += BX) {
-        s_dist[i] = g_buf_dist[i];
-        s_idx[i]  = g_buf_idx[i];
-    }
+    SharedBitonicTopK<BX, REG> buf(topk, s_dist, s_idx);
     __syncthreads();
 
-    SharedBitonicTopK<BX, REG> buf(topk, s_dist, s_idx);
-
     unsigned batches = n_inputs / N;
+    unsigned picked_count = 0;
+
     for (unsigned b = 0; b < batches; b++) {
+        // merge next batch
         float    dist[REG];
         uint32_t idx[REG];
         #pragma unroll
@@ -42,9 +41,20 @@ __global__ void kernel_test_no_dup(
             idx[j]  = g_input_idx[pos];
         }
         buf.merge(dist, idx);
+
+        // pick 1 node
+        uint32_t pbuf[N];
+        unsigned found = buf.pick(pbuf, 1);
+        if (tid == 0 && found > 0) {
+            g_picked[picked_count] = pbuf[0];
+            picked_count++;
+        }
+        __syncthreads();
     }
 
-    buf.flush(g_out_dist, g_out_idx, topk);
+    if (tid == 0) {
+        *g_picked_count = picked_count;
+    }
 }
 
 template <unsigned BX, unsigned REG>
@@ -52,81 +62,67 @@ bool run_no_dup_test(unsigned topk, unsigned n_total, unsigned seed) {
     constexpr unsigned N = BX * REG;
     std::mt19937 rng(seed);
 
-    unsigned total = topk + n_total;
-    std::vector<float> all_vals(total);
-    std::vector<uint32_t> all_ids(total);
-    for (unsigned i = 0; i < total; i++) {
-        all_vals[i] = (float)i;
-        all_ids[i]  = i;  // distinct ids
-    }
-    for (unsigned i = total - 1; i > 0; i--) {
-        unsigned j = rng() % (i + 1);
-        std::swap(all_vals[i], all_vals[j]);
-        std::swap(all_ids[i], all_ids[j]);
-    }
-
-    // Buffer starts as FLT_MAX / 0xFFFFFFFF (empty)
-    std::vector<float> h_buf_dist(topk, FLT_MAX);
-    std::vector<uint32_t> h_buf_idx(topk, 0xFFFFFFFF);
-
-    // All values go into input batches (unsorted within each batch)
-    unsigned n_inputs = (total / N) * N;
-    std::vector<float> h_in_dist(n_inputs);
-    std::vector<uint32_t> h_in_idx(n_inputs);
+    // generate shuffled (dist, id) pairs
+    unsigned n_inputs = (n_total / N) * N;  // round down to multiple of N
+    std::vector<float> h_dist(n_inputs);
+    std::vector<uint32_t> h_idx(n_inputs);
     for (unsigned i = 0; i < n_inputs; i++) {
-        h_in_dist[i] = all_vals[i];
-        h_in_idx[i]  = all_ids[i];
+        h_dist[i] = (float)i;
+        h_idx[i]  = i;
+    }
+    // shuffle
+    for (unsigned i = n_inputs - 1; i > 0; i--) {
+        unsigned j = rng() % (i + 1);
+        std::swap(h_dist[i], h_dist[j]);
+        std::swap(h_idx[i], h_idx[j]);
     }
 
-    float *d_buf_dist, *d_in_dist, *d_out_dist;
-    uint32_t *d_buf_idx, *d_in_idx, *d_out_idx;
-    cudaMalloc(&d_buf_dist, topk * sizeof(float));
-    cudaMalloc(&d_buf_idx,  topk * sizeof(uint32_t));
-    cudaMalloc(&d_in_dist,  n_inputs * sizeof(float));
-    cudaMalloc(&d_in_idx,   n_inputs * sizeof(uint32_t));
-    cudaMalloc(&d_out_dist, topk * sizeof(float));
-    cudaMalloc(&d_out_idx,  topk * sizeof(uint32_t));
+    unsigned max_picks = n_inputs / N;  // one pick per batch
 
-    cudaMemcpy(d_buf_dist, h_buf_dist.data(), topk * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_buf_idx,  h_buf_idx.data(),  topk * sizeof(uint32_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_in_dist,  h_in_dist.data(),  n_inputs * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_in_idx,   h_in_idx.data(),   n_inputs * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    // allocate device memory
+    float *d_dist;
+    uint32_t *d_idx, *d_picked;
+    unsigned *d_picked_count;
+    cudaMalloc(&d_dist, n_inputs * sizeof(float));
+    cudaMalloc(&d_idx,  n_inputs * sizeof(uint32_t));
+    cudaMalloc(&d_picked, max_picks * sizeof(uint32_t));
+    cudaMalloc(&d_picked_count, sizeof(unsigned));
+
+    cudaMemcpy(d_dist, h_dist.data(), n_inputs * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_idx,  h_idx.data(),  n_inputs * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    cudaMemset(d_picked, 0, max_picks * sizeof(uint32_t));
+    cudaMemset(d_picked_count, 0, sizeof(unsigned));
 
     size_t smem_size = topk * (sizeof(float) + sizeof(uint32_t));
     kernel_test_no_dup<BX, REG><<<1, BX, smem_size>>>(
-        d_buf_dist, d_buf_idx, topk,
-        d_in_dist, d_in_idx, n_inputs,
-        d_out_dist, d_out_idx);
+        d_dist, d_idx, n_inputs, topk,
+        d_picked, d_picked_count);
     cudaDeviceSynchronize();
 
-    std::vector<float> h_out_dist(topk);
-    std::vector<uint32_t> h_out_idx(topk);
-    cudaMemcpy(h_out_dist.data(), d_out_dist, topk * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_out_idx.data(),  d_out_idx,  topk * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+    // read back results
+    unsigned h_picked_count = 0;
+    std::vector<uint32_t> h_picked(max_picks);
+    cudaMemcpy(&h_picked_count, d_picked_count, sizeof(unsigned), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_picked.data(), d_picked, max_picks * sizeof(uint32_t), cudaMemcpyDeviceToHost);
 
-    cudaFree(d_buf_dist); cudaFree(d_buf_idx);
-    cudaFree(d_in_dist);  cudaFree(d_in_idx);
-    cudaFree(d_out_dist); cudaFree(d_out_idx);
+    cudaFree(d_dist); cudaFree(d_idx);
+    cudaFree(d_picked); cudaFree(d_picked_count);
 
-    // Check no duplicate ids
+    // verify no duplicates
     std::set<uint32_t> seen;
     bool pass = true;
-    for (unsigned i = 0; i < topk; i++) {
-        if (seen.count(h_out_idx[i])) {
-            printf("  FAIL: duplicate id %u at position %u\n", h_out_idx[i], i);
+    for (unsigned i = 0; i < h_picked_count; i++) {
+        if (seen.count(h_picked[i])) {
+            printf("  FAIL: duplicate node ID %u at pick %u\n", h_picked[i], i);
             pass = false;
             break;
         }
-        seen.insert(h_out_idx[i]);
+        seen.insert(h_picked[i]);
     }
 
-    // Also verify ids match their distances
-    for (unsigned i = 0; i < topk && pass; i++) {
-        if (h_out_dist[i] != (float)h_out_idx[i]) {
-            printf("  FAIL: dist/idx mismatch at %u: dist=%f idx=%u\n",
-                   i, h_out_dist[i], h_out_idx[i]);
-            pass = false;
-        }
+    if (pass && h_picked_count == 0) {
+        printf("  FAIL: no nodes were picked\n");
+        pass = false;
     }
 
     return pass;
