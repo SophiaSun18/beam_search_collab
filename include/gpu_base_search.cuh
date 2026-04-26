@@ -1,9 +1,18 @@
 #pragma once
-#include "utils.cuh"
+#include "l2.cuh"
 #include "topk.cuh"
 #include "hash_filter.cuh"
 #include "gpu_graph.cuh"
 #include <cuda_runtime.h>
+#include <climits>
+
+#ifndef WARP_SIZE
+#define WARP_SIZE 32
+#endif
+
+typedef uint32_t INDEX_T;
+typedef float    DISTANCE_T;
+#define MAX_INDEX UINT_MAX
 
 #define GPU_BASE_SEARCH_CANDIDATE_BUFFER_SIZE 64
 
@@ -128,7 +137,7 @@ __device__ void GPUBaseSearch<BX>::search(
 
     // ── seed entry point ────────────────────────────────────────────────
     if (warp_id == 0) {
-        DISTANCE_T d = warp_l2_distance(dim, query_buf_,
+        DISTANCE_T d = l2_warp_distance(dim, query_buf_,
                                          graph_.vect(cfg_.entry_point).data());
         if (lane_id == 0) {
             cand_idx_[0]  = cfg_.entry_point;
@@ -188,7 +197,7 @@ __device__ void GPUBaseSearch<BX>::search(
         // all warps compute L2 distances in parallel
         for (unsigned i = warp_id; i < CAND; i += BX / WARP_SIZE) {
             if (cand_idx_[i] == MAX_INDEX) continue;
-            DISTANCE_T d = warp_l2_distance(dim, query_buf_,
+            DISTANCE_T d = l2_warp_distance(dim, query_buf_,
                                              graph_.vect(cand_idx_[i]).data());
             if (lane_id == 0)
                 cand_dist_[i] = d;

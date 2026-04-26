@@ -1,0 +1,282 @@
+#include <iostream>
+#include <string>
+#include <vector>
+#include <chrono>
+#include <cfloat>
+#include <cstdint>
+
+#include <nlohmann/json.hpp>
+#include "include/cpu_graph.hpp"
+#include "include/gpu_graph.cuh"
+#include "include/gpu_base_search.cuh"
+#include "include/gpu_warp_search.cuh"
+
+using json = nlohmann::json;
+
+// ── file I/O ────────────────────────────────────────────────────────────────
+
+static float* read_fvecs(const char* filename, size_t& n, size_t& d) {
+    std::ifstream in(filename, std::ios::binary);
+    if (!in) throw std::runtime_error(std::string("Cannot open ") + filename);
+    int dim;
+    in.read(reinterpret_cast<char*>(&dim), sizeof(int));
+    in.seekg(0, std::ios::end);
+    size_t file_size = in.tellg();
+    in.seekg(0, std::ios::beg);
+    n = file_size / (dim * sizeof(float) + sizeof(int));
+    d = dim;
+    float* data = new float[n * d];
+    for (size_t i = 0; i < n; i++) {
+        int dd;
+        in.read(reinterpret_cast<char*>(&dd), sizeof(int));
+        in.read(reinterpret_cast<char*>(data + i * d), d * sizeof(float));
+    }
+    return data;
+}
+
+static int* read_ivecs(const char* filename, size_t& n, size_t& d) {
+    std::ifstream in(filename, std::ios::binary);
+    if (!in) throw std::runtime_error(std::string("Cannot open ") + filename);
+    int dim;
+    in.read(reinterpret_cast<char*>(&dim), sizeof(int));
+    in.seekg(0, std::ios::end);
+    size_t file_size = in.tellg();
+    in.seekg(0, std::ios::beg);
+    n = file_size / ((dim + 1) * sizeof(int));
+    d = dim;
+    int* data = new int[n * d];
+    for (size_t i = 0; i < n; i++) {
+        int dd;
+        in.read(reinterpret_cast<char*>(&dd), sizeof(int));
+        in.read(reinterpret_cast<char*>(data + i * d), d * sizeof(int));
+    }
+    return data;
+}
+
+static float compute_recall(const vid_t* predicted, const int* groundtruth,
+                             size_t nq, int topk, int gt_k) {
+    size_t correct = 0;
+    for (size_t i = 0; i < nq; i++) {
+        for (int j = 0; j < topk; j++) {
+            int pred = static_cast<int>(predicted[i * topk + j]);
+            for (int k = 0; k < gt_k; k++) {
+                if (pred == groundtruth[i * gt_k + k]) { correct++; break; }
+            }
+        }
+    }
+    return static_cast<float>(correct) / (nq * topk);
+}
+
+// ── entry point computation ─────────────────────────────────────────────────
+
+static vid_t compute_entry_point(const CPUGraph& graph) {
+    size_t n = graph.num_nodes;
+    int dim = graph.dim;
+    const float* data = graph.vectors.data();
+
+    std::vector<float> centroid(dim, 0.0f);
+    float inv = 1.0f / static_cast<float>(n);
+    for (size_t i = 0; i < n; i++) {
+        const float* row = data + i * dim;
+        for (int d = 0; d < dim; d++)
+            centroid[d] += row[d] * inv;
+    }
+
+    vid_t best = 0;
+    float best_dist = FLT_MAX;
+    for (size_t i = 0; i < n; i++) {
+        const float* row = data + i * dim;
+        float dist = 0.0f;
+        for (int d = 0; d < dim; d++) {
+            float diff = row[d] - centroid[d];
+            dist += diff * diff;
+        }
+        if (dist < best_dist) {
+            best_dist = dist;
+            best = static_cast<vid_t>(i);
+        }
+    }
+    return best;
+}
+
+// ── kernels ─────────────────────────────────────────────────────────────────
+
+static constexpr unsigned CLI_BLOCK_SIZE = 256;
+
+__global__ void kernel_base_search(
+    GPUGraphView graph, GPUBaseSearchCfg cfg,
+    int nq, int dim,
+    const float* __restrict__ d_queries,
+    vid_t* __restrict__ d_results, int K)
+{
+    int qid = blockIdx.x;
+    if (qid >= nq) return;
+
+    extern __shared__ char smem[];
+    char* ptr = smem;
+    GPUBaseSearch<CLI_BLOCK_SIZE> searcher(ptr, cfg, graph);
+    __syncthreads();
+    searcher.search(d_queries + qid * dim, d_results + qid * K, K);
+}
+
+template <unsigned NY>
+__global__ void kernel_warp_search(
+    GPUGraphView graph, GPUBaseSearchCfg cfg,
+    int nq, int dim,
+    const float* __restrict__ d_queries,
+    vid_t* __restrict__ d_results, int K)
+{
+    int qid = blockIdx.x * NY + threadIdx.y;
+    if (qid >= nq) return;
+
+    extern __shared__ char smem[];
+    size_t per_warp = GPUWarpSearch<NY>::shared_mem_bytes_per_warp(cfg, dim);
+    char* ptr = smem + threadIdx.y * per_warp;
+    GPUWarpSearch<NY> searcher(ptr, cfg, graph);
+    __syncwarp();
+    searcher.search(d_queries + qid * dim, d_results + qid * K, K);
+}
+
+// ── run functions ───────────────────────────────────────────────────────────
+
+static void run_base(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
+                     int nq, int dim, int K,
+                     const float* d_queries, vid_t* d_results)
+{
+    size_t smem = GPUBaseSearch<CLI_BLOCK_SIZE>::shared_mem_bytes(cfg, dim);
+    int num_blocks = nq;
+
+    auto start = std::chrono::high_resolution_clock::now();
+    kernel_base_search<<<num_blocks, CLI_BLOCK_SIZE, smem>>>(
+        gpu_graph.view(), cfg, nq, dim, d_queries, d_results, K);
+    cudaDeviceSynchronize();
+    auto end = std::chrono::high_resolution_clock::now();
+
+    double elapsed = std::chrono::duration<double>(end - start).count();
+    std::cout << "  time: " << elapsed * 1000.0 << " ms"
+              << "  qps: " << nq / elapsed << std::endl;
+}
+
+template <unsigned NY>
+static void run_warp(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
+                     int nq, int dim, int K,
+                     const float* d_queries, vid_t* d_results)
+{
+    size_t smem = GPUWarpSearch<NY>::shared_mem_bytes(cfg, dim);
+    int num_blocks = (nq + NY - 1) / NY;
+    dim3 block(WARP_SIZE, NY);
+
+    auto start = std::chrono::high_resolution_clock::now();
+    kernel_warp_search<NY><<<num_blocks, block, smem>>>(
+        gpu_graph.view(), cfg, nq, dim, d_queries, d_results, K);
+    cudaDeviceSynchronize();
+    auto end = std::chrono::high_resolution_clock::now();
+
+    double elapsed = std::chrono::duration<double>(end - start).count();
+    std::cout << "  time: " << elapsed * 1000.0 << " ms"
+              << "  qps: " << nq / elapsed << std::endl;
+}
+
+// ── main ────────────────────────────────────────────────────────────────────
+
+int main() {
+    // parse single JSON object from stdin
+    json j;
+    try {
+        j = json::parse(std::cin, nullptr, true, true);
+    } catch (const json::parse_error& e) {
+        std::cerr << "JSON parse error: " << e.what() << std::endl;
+        return 1;
+    }
+
+    // ── data config ─────────────────────────────────────────────────────
+    if (!j.contains("data")) {
+        std::cerr << "Missing \"data\" key" << std::endl;
+        return 1;
+    }
+    auto& jd = j["data"];
+    std::string graph_file = jd.at("graph");
+    std::string base_file  = jd.at("base");
+    std::string query_file = jd.at("query");
+    std::string gt_file    = jd.at("gt");
+
+    // load CPU data
+    CPUGraph cpu_graph;
+    cpu_graph.load(graph_file, base_file);
+    int dim = cpu_graph.dim;
+    size_t npoints = cpu_graph.num_nodes;
+
+    size_t nq = 0, query_dim = 0;
+    float* h_queries = read_fvecs(query_file.c_str(), nq, query_dim);
+
+    size_t gt_nq = 0, gt_k_sz = 0;
+    int* h_gt = read_ivecs(gt_file.c_str(), gt_nq, gt_k_sz);
+    int gt_k = static_cast<int>(gt_k_sz);
+
+    // build GPU graph
+    GPUGraph gpu_graph(cpu_graph);
+    vid_t entry_point = compute_entry_point(cpu_graph);
+
+    // upload queries
+    float* d_queries;
+    cudaMalloc(&d_queries, nq * dim * sizeof(float));
+    cudaMemcpy(d_queries, h_queries, nq * dim * sizeof(float), cudaMemcpyHostToDevice);
+
+    std::cout << "data: " << npoints << " points, dim=" << dim
+              << ", degree=" << cpu_graph.degree
+              << ", queries=" << nq
+              << ", entry=" << entry_point << std::endl;
+
+    // ── search config ───────────────────────────────────────────────────
+    if (!j.contains("search")) {
+        std::cerr << "Missing \"search\" key" << std::endl;
+        return 1;
+    }
+    auto& js = j["search"];
+    std::string mode = js.value("mode", "base");
+    int K              = js.value("K", 100);
+    unsigned topk_size = js.value("topk_size", 256u);
+    unsigned bitlen    = js.value("bitlen", 10u);
+    int max_iterations = js.value("max_iterations", 1024);
+    int reset_interval = js.value("reset_interval", 16);
+
+    GPUBaseSearchCfg cfg;
+    cfg.topk_size      = topk_size;
+    cfg.bitlen         = bitlen;
+    cfg.entry_point    = entry_point;
+    cfg.max_iterations = max_iterations;
+    cfg.reset_interval = reset_interval;
+
+    // allocate results
+    vid_t* d_results;
+    cudaMalloc(&d_results, nq * K * sizeof(vid_t));
+    std::vector<vid_t> h_results(nq * K);
+
+    std::cout << "search: mode=" << mode << " K=" << K
+              << " topk=" << topk_size << " bitlen=" << bitlen << std::endl;
+
+    // ── dispatch ────────────────────────────────────────────────────────
+    if (mode == "base") {
+        run_base(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
+    } else if (mode == "warp4") {
+        run_warp<4>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
+    } else if (mode == "warp8") {
+        run_warp<8>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
+    } else {
+        std::cerr << "Unknown mode: " << mode << std::endl;
+        return 1;
+    }
+
+    // ── results ─────────────────────────────────────────────────────────
+    cudaMemcpy(h_results.data(), d_results, nq * K * sizeof(vid_t), cudaMemcpyDeviceToHost);
+    float recall = compute_recall(h_results.data(), h_gt, nq, K, gt_k);
+    std::cout << "recall@" << K << ": " << recall << std::endl;
+
+    // cleanup
+    cudaFree(d_queries);
+    cudaFree(d_results);
+    delete[] h_queries;
+    delete[] h_gt;
+
+    return 0;
+}

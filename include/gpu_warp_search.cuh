@@ -1,8 +1,5 @@
 #pragma once
-#include "utils.cuh"
-#include "topk.cuh"
-#include "hash_filter.cuh"
-#include "gpu_graph.cuh"
+#include "gpu_base_search.cuh"
 #include <cuda_runtime.h>
 #if defined(__CUDA_ARCH__) || defined(__CUDACC__)
 #include <cuda_pipeline_primitives.h>
@@ -178,7 +175,7 @@ __device__ void GPUWarpSearch<NY, REG>::search(
         prefetch_wait();
         __syncwarp();
 
-        DISTANCE_T d = warp_l2_distance(dim, query_buf_, staged_[0]);
+        DISTANCE_T d = l2_warp_distance(dim, query_buf_, staged_[0]);
         if (lane == 0) {
             cand_idx_[0]  = cfg_.entry_point;
             cand_dist_[0] = d;
@@ -258,7 +255,7 @@ __device__ void GPUWarpSearch<NY, REG>::search(
                                    graph_.vect(cand_idx_[next_valid]).data(), dim);
 
                 // compute L2 from staged buffer
-                DISTANCE_T d = warp_l2_distance(dim, query_buf_, staged_[cur]);
+                DISTANCE_T d = l2_warp_distance(dim, query_buf_, staged_[cur]);
                 if (lane == 0)
                     cand_dist_[cur_valid] = d;
 

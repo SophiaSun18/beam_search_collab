@@ -9,10 +9,16 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Include project root so "include/..." paths work from src/
 include_directories(${CMAKE_SOURCE_DIR})
 
+# ── Third-party interface libraries ──────────────────────────────────────────
+
+add_library(nlohmann_json INTERFACE)
+target_include_directories(nlohmann_json INTERFACE ${CMAKE_SOURCE_DIR}/3rd)
+
 # ── GPU targets ──────────────────────────────────────────────────────────────
 
-add_executable(gpu_search src/main.cu src/beam_gpu_base.cu src/beam_gpu_rabitq.cu)
-target_compile_options(gpu_search PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3 --ptxas-options=-v>)
+add_executable(gpu_cli src/gpu_cli.cu)
+target_link_libraries(gpu_cli PRIVATE nlohmann_json)
+target_compile_options(gpu_cli PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3 --ptxas-options=-v>)
 
 # add_executable(gpu_microbenchmark src/gpu_microbenchmark.cu)
 # target_compile_options(gpu_microbenchmark PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3 --ptxas-options=-v>)
