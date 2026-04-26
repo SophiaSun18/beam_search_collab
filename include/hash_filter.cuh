@@ -23,15 +23,21 @@ public:
     __device__ HashFilter(uint32_t* table, unsigned bitlen);
 
     /**
-     * @brief Self-allocating constructor. Carves table from smem and advances the pointer.
+     * @brief Self-allocating constructor. Carves table from smem.
+     *
+     * When blockDim.y > 1, each instance (threadIdx.y) gets its own table.
+     * Advances smem past all blockDim.y instances.
      */
     __device__ HashFilter(char*& smem, unsigned bitlen);
 
     /**
-     * @brief Shared memory footprint in bytes for a given bitlen.
+     * @brief Shared memory bytes for ny instances.
+     *
+     * @param bitlen  log2 of table size per instance.
+     * @param ny      Number of instances (blockDim.y). Default 1.
      */
-    __host__ __device__ static uint32_t shared_mem_bytes(unsigned bitlen) {
-        return (1u << bitlen) * sizeof(uint32_t);
+    __host__ __device__ static uint32_t shared_mem_bytes(unsigned bitlen, unsigned ny = 1) {
+        return ny * (1u << bitlen) * sizeof(uint32_t);
     }
 
     /**
@@ -61,9 +67,14 @@ __device__ inline HashFilter::HashFilter(uint32_t* table, unsigned bitlen)
       size_(1u << bitlen), mask_((1u << bitlen) - 1) {}
 
 __device__ inline HashFilter::HashFilter(char*& smem, unsigned bitlen)
-    : table_(reinterpret_cast<uint32_t*>(smem)), bitlen_(bitlen),
-      size_(1u << bitlen), mask_((1u << bitlen) - 1)
-{ smem += size_ * sizeof(uint32_t); }
+    : bitlen_(bitlen), size_(1u << bitlen), mask_((1u << bitlen) - 1)
+{
+    // Each instance (threadIdx.y) gets its own table within block-wide smem.
+    size_t per_inst = size_ * sizeof(uint32_t);
+    table_ = reinterpret_cast<uint32_t*>(smem + threadIdx.y * per_inst);
+    // Advance past ALL instances.
+    smem += blockDim.y * per_inst;
+}
 
 __device__ inline void HashFilter::init(unsigned first_tid) {
     if (threadIdx.x < first_tid) return;

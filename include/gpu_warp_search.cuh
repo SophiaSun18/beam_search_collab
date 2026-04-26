@@ -14,9 +14,9 @@
  *   threadIdx.x = lane within warp (0..31)
  *   threadIdx.y = warp / query index (0..NY-1)
  *
- * Shared memory is partitioned: each warp gets its own region for
- * topk buffer, hash filter, query scratch, candidate buffer, and
- * double-buffered staging for async vector prefetch.
+ * Constructor takes block-wide shared memory. Sub-objects (topk, hash
+ * filter) handle threadIdx.y offsets internally. Remaining plain-pointer
+ * buffers are offset in the constructor body.
  *
  * @tparam NY   Number of warps (queries) per block.
  * @tparam REG  Registers per thread for topk merge. topk_size must be >= 32*REG.
@@ -44,11 +44,10 @@ class GPUWarpSearch {
 
 public:
     /**
-     * @brief Construct per-warp search state from a warp-local shared memory region.
+     * @brief Construct per-warp search state from block-wide shared memory.
      *
-     * @param smem   Pointer to this warp's shared memory region. Advanced past allocations.
-     * @param cfg    Search configuration.
-     * @param graph  Immutable graph view.
+     * Sub-objects (topk_, hf_) handle threadIdx.y internally.
+     * Advances smem past ALL NY warps' allocations.
      */
     __device__ GPUWarpSearch(char*& smem, const GPUBaseSearchCfg& cfg,
                              GPUGraphView graph);
@@ -98,42 +97,40 @@ __device__ void GPUWarpSearch<NY, REG>::prefetch_wait() {
 template <unsigned NY, unsigned REG>
 __device__ GPUWarpSearch<NY, REG>::GPUWarpSearch(
     char*& smem, const GPUBaseSearchCfg& cfg, GPUGraphView graph)
-    : topk_(smem, cfg.topk_size),
-      hf_(smem, cfg.bitlen),
-      query_buf_  (reinterpret_cast<float*>(smem)),
-      parent_buf_ (reinterpret_cast<INDEX_T*>(smem + graph.dim() * sizeof(float))),
-      cand_idx_   (reinterpret_cast<INDEX_T*>(smem + graph.dim() * sizeof(float)
-                       + sizeof(INDEX_T))),
-      cand_dist_  (reinterpret_cast<DISTANCE_T*>(smem + graph.dim() * sizeof(float)
-                       + sizeof(INDEX_T)
-                       + CAND * sizeof(INDEX_T))),
-      staged_{
-          reinterpret_cast<float*>(smem + graph.dim() * sizeof(float)
-              + sizeof(INDEX_T)
-              + CAND * (sizeof(INDEX_T) + sizeof(DISTANCE_T))),
-          reinterpret_cast<float*>(smem + graph.dim() * sizeof(float)
-              + sizeof(INDEX_T)
-              + CAND * (sizeof(INDEX_T) + sizeof(DISTANCE_T))
-              + graph.dim() * sizeof(float))
-      },
+    : topk_(smem, cfg.topk_size),     // offsets by threadIdx.y internally
+      hf_(smem, cfg.bitlen),          // offsets by threadIdx.y internally
       graph_(graph),
       cfg_(cfg),
       dim_(graph.dim()),
       max_degree_(graph.degree())
 {
-    smem += graph.dim() * sizeof(float)              // query_buf_
-          + sizeof(INDEX_T)                          // parent_buf_
-          + CAND * sizeof(INDEX_T)                   // cand_idx_
-          + CAND * sizeof(DISTANCE_T)                // cand_dist_
-          + 2 * graph.dim() * sizeof(float);         // staged_[2]
+    // Plain-pointer buffers: manual per-warp offset within remaining smem.
+    const size_t rest = graph.dim() * sizeof(float)       // query_buf_
+                      + sizeof(INDEX_T)                   // parent_buf_
+                      + CAND * sizeof(INDEX_T)            // cand_idx_
+                      + CAND * sizeof(DISTANCE_T)         // cand_dist_
+                      + 2 * graph.dim() * sizeof(float);  // staged_[2]
+
+    char* my = smem + threadIdx.y * rest;
+    query_buf_  = reinterpret_cast<float*>(my);       my += graph.dim() * sizeof(float);
+    parent_buf_ = reinterpret_cast<INDEX_T*>(my);     my += sizeof(INDEX_T);
+    cand_idx_   = reinterpret_cast<INDEX_T*>(my);     my += CAND * sizeof(INDEX_T);
+    cand_dist_  = reinterpret_cast<DISTANCE_T*>(my);  my += CAND * sizeof(DISTANCE_T);
+    staged_[0]  = reinterpret_cast<float*>(my);       my += graph.dim() * sizeof(float);
+    staged_[1]  = reinterpret_cast<float*>(my);
+
+    // Advance past ALL instances so every thread ends at the same position.
+    smem += blockDim.y * rest;
 }
+
+// ── shared memory size ──────────────────────────────────────────────────────
 
 template <unsigned NY, unsigned REG>
 __host__ __device__ size_t GPUWarpSearch<NY, REG>::shared_mem_bytes_per_warp(
     const GPUBaseSearchCfg& cfg, unsigned dim) {
     size_t size = 0;
-    size += SharedBitonicTopK<BX, REG>::shared_mem_bytes(cfg.topk_size);
-    size += HashFilter::shared_mem_bytes(cfg.bitlen);
+    size += SharedBitonicTopK<BX, REG>::shared_mem_bytes_per_instance(cfg.topk_size);
+    size += (1u << cfg.bitlen) * sizeof(uint32_t);   // hash filter
     size += dim * sizeof(float);                     // query_buf_
     size += sizeof(INDEX_T);                         // parent_buf_
     size += CAND * sizeof(INDEX_T);                  // cand_idx_
@@ -170,7 +167,6 @@ __device__ void GPUWarpSearch<NY, REG>::search(
 
     // ── seed entry point ────────────────────────────────────────────────
     {
-        // prefetch entry point vector into staged_[0]
         prefetch_begin(staged_[0], graph_.vect(cfg_.entry_point).data(), dim);
         prefetch_wait();
         __syncwarp();
@@ -229,7 +225,6 @@ __device__ void GPUWarpSearch<NY, REG>::search(
         __syncwarp();
 
         // ── compute L2 with double-buffered prefetch ────────────────────
-        // find first two valid candidates
         int cur_valid = -1, next_valid = -1;
         for (int i = 0; i < static_cast<int>(CAND); i++) {
             if (cand_idx_[i] != MAX_INDEX) {
@@ -240,29 +235,23 @@ __device__ void GPUWarpSearch<NY, REG>::search(
 
         if (cur_valid >= 0) {
             int cur = 0;
-            // prefetch first valid
             prefetch_begin(staged_[cur],
                            graph_.vect(cand_idx_[cur_valid]).data(), dim);
 
             while (cur_valid >= 0) {
-                // wait for current prefetch
                 prefetch_wait();
                 __syncwarp();
 
-                // start prefetch of next while computing current
                 if (next_valid >= 0)
                     prefetch_begin(staged_[1 - cur],
                                    graph_.vect(cand_idx_[next_valid]).data(), dim);
 
-                // compute L2 from staged buffer
                 DISTANCE_T d = l2_warp_distance(dim, query_buf_, staged_[cur]);
                 if (lane == 0)
                     cand_dist_[cur_valid] = d;
 
-                // advance
                 cur_valid = next_valid;
                 cur = 1 - cur;
-                // find next valid after cur_valid
                 next_valid = -1;
                 if (cur_valid >= 0) {
                     for (int i = cur_valid + 1; i < static_cast<int>(CAND); i++) {

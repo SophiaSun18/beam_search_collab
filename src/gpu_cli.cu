@@ -130,8 +130,7 @@ __global__ void kernel_warp_search(
     if (qid >= nq) return;
 
     extern __shared__ char smem[];
-    size_t per_warp = GPUWarpSearch<NY>::shared_mem_bytes_per_warp(cfg, dim);
-    char* ptr = smem + threadIdx.y * per_warp;
+    char* ptr = smem;
     GPUWarpSearch<NY> searcher(ptr, cfg, graph);
     __syncwarp();
     searcher.search(d_queries + qid * dim, d_results + qid * K, K);

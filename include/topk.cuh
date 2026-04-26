@@ -88,23 +88,33 @@ class SharedBitonicTopK {
     /**
      * @brief Self-allocating constructor. Carves all storage from smem.
      *
+     * When blockDim.y > 1, each instance (identified by threadIdx.y)
+     * gets its own region within the block-wide smem. All instances
+     * advance smem to the same final position (past all ny instances).
+     *
      * Allocates topk dist/idx arrays, and scratch buffers (if BX > 32).
      * Initializes all slots to FLT_MAX / 0xFFFFFFFF. All BX threads must call.
-     * Advances smem past all allocations.
      */
     __device__ SharedBitonicTopK(char*& smem, unsigned topk);
 
     /**
-     * @brief Total shared memory bytes needed by the self-allocating constructor.
-     *
-     * Includes topk dist/idx arrays and scratch (if BX > 32).
+     * @brief Shared memory bytes per instance (one topk buffer + scratch).
      */
-    __host__ __device__ static size_t shared_mem_bytes(unsigned topk) {
+    __host__ __device__ static size_t shared_mem_bytes_per_instance(unsigned topk) {
         size_t size = topk * (sizeof(float) + sizeof(uint32_t));
-        // Scratch for cross-warp sort, only when BX > 32
         if constexpr (BX > 32)
             size += N * (sizeof(float) + sizeof(uint32_t));
         return size;
+    }
+
+    /**
+     * @brief Total shared memory bytes for ny instances.
+     *
+     * @param topk  Elements per instance.
+     * @param ny    Number of instances (blockDim.y). Default 1.
+     */
+    __host__ __device__ static size_t shared_mem_bytes(unsigned topk, unsigned ny = 1) {
+        return ny * shared_mem_bytes_per_instance(topk);
     }
 
     /**
@@ -179,20 +189,25 @@ __device__ SharedBitonicTopK<BX, REG>::SharedBitonicTopK(
 
 template <unsigned BX, unsigned REG>
 __device__ SharedBitonicTopK<BX, REG>::SharedBitonicTopK(char*& smem, unsigned topk)
-    : topk(topk),
-      topk_dist(reinterpret_cast<float*>(smem)),
-      topk_idx(reinterpret_cast<uint32_t*>(smem + topk * sizeof(float))),
-      scratch_d_(nullptr), scratch_i_(nullptr)
+    : topk(topk), scratch_d_(nullptr), scratch_i_(nullptr)
 {
-    smem += topk * (sizeof(float) + sizeof(uint32_t));
+    // Each instance (threadIdx.y) gets its own region within block-wide smem.
+    const size_t per_inst = shared_mem_bytes_per_instance(topk);
+    char* my = smem + threadIdx.y * per_inst;
+
+    topk_dist = reinterpret_cast<float*>(my);
+    topk_idx  = reinterpret_cast<uint32_t*>(my + topk * sizeof(float));
+    my += topk * (sizeof(float) + sizeof(uint32_t));
 
     // Allocate scratch only when BX > 32 (cross-warp sort steps need it).
     // When BX <= 32, all sort steps use __shfl_xor_sync — no scratch needed.
     if constexpr (BX > 32) {
-        scratch_d_ = reinterpret_cast<float*>(smem);
-        scratch_i_ = reinterpret_cast<uint32_t*>(smem + N * sizeof(float));
-        smem += N * (sizeof(float) + sizeof(uint32_t));
+        scratch_d_ = reinterpret_cast<float*>(my);
+        scratch_i_ = reinterpret_cast<uint32_t*>(my + N * sizeof(float));
     }
+
+    // Advance smem past ALL instances so every thread ends at the same position.
+    smem += blockDim.y * per_inst;
 
     for (unsigned i = threadIdx.x; i < topk; i += BX) {
         topk_dist[i] = FLT_MAX;
