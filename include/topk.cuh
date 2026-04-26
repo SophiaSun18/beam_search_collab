@@ -100,6 +100,8 @@ class SharedBitonicTopK {
 
 template <unsigned BX, unsigned REG>
 __device__ void SharedBitonicTopK<BX, REG>::merge(float (&dist)[REG], uint32_t (&idx)[REG]) {
+    // Scratch for cross-warp bitonic sort steps. When BX <= 32 (single warp),
+    // the cross-warp path is dead code and the compiler eliminates these.
     __shared__ float    scratch_d[N];
     __shared__ uint32_t scratch_i[N];
     const unsigned tid = threadIdx.x;
