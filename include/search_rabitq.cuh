@@ -1,6 +1,5 @@
 #pragma once
 #include "utils.cuh"
-#include "distance.cuh"
 #include <cuda_runtime.h>
 #if defined(__CUDA_ARCH__) || defined(__CUDACC__)
 #include <cuda_pipeline_primitives.h>

@@ -1,6 +1,5 @@
 #pragma once
 #include "utils.cuh"
-#include "distance.cuh"
 #include <cuda_runtime.h>
 #ifndef INTERNAL_TOPK
 #define INTERNAL_TOPK   128

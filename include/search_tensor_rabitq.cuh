@@ -1,6 +1,5 @@
 #pragma once
 #include "utils.cuh"
-#include "distance.cuh"
 #include <cstdint>
 #include <mma.h>
 #include <cuda_runtime.h>
