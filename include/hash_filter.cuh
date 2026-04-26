@@ -20,17 +20,12 @@ public:
      * @param table   Shared memory array, size >= (1 << bitlen) elements.
      * @param bitlen  log2 of table size.
      */
-    __device__ HashFilter(uint32_t* table, unsigned bitlen)
-        : table_(table), bitlen_(bitlen),
-          size_(1u << bitlen), mask_((1u << bitlen) - 1) {}
+    __device__ HashFilter(uint32_t* table, unsigned bitlen);
 
     /**
      * @brief Self-allocating constructor. Carves table from smem and advances the pointer.
      */
-    __device__ HashFilter(char*& smem, unsigned bitlen)
-        : table_(reinterpret_cast<uint32_t*>(smem)), bitlen_(bitlen),
-          size_(1u << bitlen), mask_((1u << bitlen) - 1)
-    { smem += size_ * sizeof(uint32_t); }
+    __device__ HashFilter(char*& smem, unsigned bitlen);
 
     /**
      * @brief Shared memory footprint in bytes for a given bitlen.
@@ -60,6 +55,15 @@ public:
      */
     __device__ uint32_t contains(uint32_t key);
 };
+
+__device__ inline HashFilter::HashFilter(uint32_t* table, unsigned bitlen)
+    : table_(table), bitlen_(bitlen),
+      size_(1u << bitlen), mask_((1u << bitlen) - 1) {}
+
+__device__ inline HashFilter::HashFilter(char*& smem, unsigned bitlen)
+    : table_(reinterpret_cast<uint32_t*>(smem)), bitlen_(bitlen),
+      size_(1u << bitlen), mask_((1u << bitlen) - 1)
+{ smem += size_ * sizeof(uint32_t); }
 
 __device__ inline void HashFilter::init(unsigned first_tid) {
     if (threadIdx.x < first_tid) return;

@@ -51,31 +51,14 @@ class SharedBitonicTopK {
      * @param topk_dist  Shared memory array of distances, size >= topk.
      * @param topk_idx   Shared memory array of indices, size >= topk.
      */
-    __device__ SharedBitonicTopK(unsigned topk, float* topk_dist, uint32_t* topk_idx)
-        : topk(topk), topk_dist(topk_dist), topk_idx(topk_idx)
-    {
-        for (unsigned i = threadIdx.x; i < topk; i += blockDim.x) {
-            topk_dist[i] = FLT_MAX;
-            topk_idx[i]  = 0xFFFFFFFF;
-        }
-    }
+    __device__ SharedBitonicTopK(unsigned topk, float* topk_dist, uint32_t* topk_idx);
 
     /**
      * @brief Self-allocating constructor. Carves dist/idx arrays from smem,
      *        advances the pointer, and fills the buffer with FLT_MAX / 0xFFFFFFFF.
      *        All threads must participate (block-wide init).
      */
-    __device__ SharedBitonicTopK(char*& smem, unsigned topk)
-        : topk(topk),
-          topk_dist(reinterpret_cast<float*>(smem)),
-          topk_idx(reinterpret_cast<uint32_t*>(smem + topk * sizeof(float)))
-    {
-        smem += topk * (sizeof(float) + sizeof(uint32_t));
-        for (unsigned i = threadIdx.x; i < topk; i += blockDim.x) {
-            topk_dist[i] = FLT_MAX;
-            topk_idx[i]  = 0xFFFFFFFF;
-        }
-    }
+    __device__ SharedBitonicTopK(char*& smem, unsigned topk);
 
     __host__ __device__ static size_t shared_mem_bytes(unsigned topk) {
         return topk * (sizeof(float) + sizeof(uint32_t));
@@ -126,6 +109,30 @@ class SharedBitonicTopK {
     __device__ static inline void butterfly(
             float (&a_d)[REG], uint32_t (&a_i)[REG], float (&b_d)[REG], uint32_t (&b_i)[REG]);
 };
+
+template <unsigned BX, unsigned REG>
+__device__ SharedBitonicTopK<BX, REG>::SharedBitonicTopK(
+    unsigned topk, float* topk_dist, uint32_t* topk_idx)
+    : topk(topk), topk_dist(topk_dist), topk_idx(topk_idx)
+{
+    for (unsigned i = threadIdx.x; i < topk; i += blockDim.x) {
+        topk_dist[i] = FLT_MAX;
+        topk_idx[i]  = 0xFFFFFFFF;
+    }
+}
+
+template <unsigned BX, unsigned REG>
+__device__ SharedBitonicTopK<BX, REG>::SharedBitonicTopK(char*& smem, unsigned topk)
+    : topk(topk),
+      topk_dist(reinterpret_cast<float*>(smem)),
+      topk_idx(reinterpret_cast<uint32_t*>(smem + topk * sizeof(float)))
+{
+    smem += topk * (sizeof(float) + sizeof(uint32_t));
+    for (unsigned i = threadIdx.x; i < topk; i += blockDim.x) {
+        topk_dist[i] = FLT_MAX;
+        topk_idx[i]  = 0xFFFFFFFF;
+    }
+}
 
 template <unsigned BX, unsigned REG>
 __device__ void SharedBitonicTopK<BX, REG>::merge(float (&dist)[REG], uint32_t (&idx)[REG]) {
