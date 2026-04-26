@@ -66,6 +66,7 @@ bool run_merge_test(unsigned topk, unsigned n_total, unsigned seed) {
     // Shuffle
     for (unsigned i = total - 1; i > 0; i--) {
         unsigned j = rng() % (i + 1);
+        if (i == j) { continue; }
         std::swap(all_vals[i], all_vals[j]);
         std::swap(all_ids[i], all_ids[j]);
     }
@@ -114,14 +115,6 @@ bool run_merge_test(unsigned topk, unsigned n_total, unsigned seed) {
     cudaFree(d_in_dist);  cudaFree(d_in_idx);
     cudaFree(d_out_dist); cudaFree(d_out_idx);
 
-    // Print raw output
-    printf("  flush output (dist): ");
-    for (unsigned i = 0; i < topk; i++) printf("%.0f ", h_out_dist[i]);
-    printf("\n");
-    printf("  flush output (idx):  ");
-    for (unsigned i = 0; i < topk; i++) printf("%u ", h_out_idx[i]);
-    printf("\n");
-
     // Verify: output should contain values 0..topk-1
     std::vector<float> sorted_out(h_out_dist.begin(), h_out_dist.end());
     std::sort(sorted_out.begin(), sorted_out.end());
@@ -142,18 +135,21 @@ int main() {
 
     struct { const char* name; bool (*fn)(unsigned, unsigned, unsigned); unsigned topk; unsigned n_total; } tests[] = {
         // BX=32, REG=2, N=64
-        {"merge<64,32,2> topk=128 n=256",  run_merge_test<32,2>,  128, 256},
-        {"merge<64,32,2> topk=256 n=512",  run_merge_test<32,2>,  256, 512},
+        {"merge<32,2> topk=128  n=2560",  run_merge_test<32,2>,  128,  2560},
+        {"merge<32,2> topk=256  n=5120",  run_merge_test<32,2>,  256,  5120},
+        {"merge<32,2> topk=512  n=10240", run_merge_test<32,2>,  512,  10240},
         // BX=32, REG=4, N=128
-        {"merge<128,32,4> topk=128 n=256", run_merge_test<32,4>, 128, 256},
-        {"merge<128,32,4> topk=256 n=512", run_merge_test<32,4>, 256, 512},
-        {"merge<128,32,4> topk=512 n=1024",run_merge_test<32,4>, 512, 1024},
+        {"merge<32,4> topk=128  n=2560",  run_merge_test<32,4>,  128,  2560},
+        {"merge<32,4> topk=256  n=5120",  run_merge_test<32,4>,  256,  5120},
+        {"merge<32,4> topk=512  n=10240", run_merge_test<32,4>,  512,  10240},
         // BX=64, REG=2, N=128
-        {"merge<128,64,2> topk=128 n=256", run_merge_test<64,2>, 128, 256},
-        {"merge<128,64,2> topk=256 n=512", run_merge_test<64,2>, 256, 512},
+        {"merge<64,2> topk=128  n=2560",  run_merge_test<64,2>,  128,  2560},
+        {"merge<64,2> topk=256  n=5120",  run_merge_test<64,2>,  256,  5120},
+        {"merge<64,2> topk=512  n=10240", run_merge_test<64,2>,  512,  10240},
         // BX=64, REG=4, N=256
-        {"merge<256,64,4> topk=256 n=512", run_merge_test<64,4>, 256, 512},
-        {"merge<256,64,4> topk=512 n=1024",run_merge_test<64,4>, 512, 1024},
+        {"merge<64,4> topk=256  n=5120",  run_merge_test<64,4>,  256,  5120},
+        {"merge<64,4> topk=512  n=10240", run_merge_test<64,4>,  512,  10240},
+        {"merge<64,4> topk=1024 n=20480", run_merge_test<64,4>,  1024, 20480},
     };
 
     for (auto& t : tests) {

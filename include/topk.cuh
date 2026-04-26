@@ -93,6 +93,8 @@ class SharedBitonicTopK {
     template <bool asc = true>
     __device__ static inline void bitonic_sort_block(
             float (&d)[REG], uint32_t (&i)[REG], float* scratch_d, uint32_t* scratch_i);
+    __device__ static inline void bitonic_sort_full(
+            float (&d)[REG], uint32_t (&i)[REG], float* scratch_d, uint32_t* scratch_i);
     __device__ static inline void butterfly(
             float (&a_d)[REG], uint32_t (&a_i)[REG], float (&b_d)[REG], uint32_t (&b_i)[REG]);
 };
@@ -105,8 +107,8 @@ __device__ void SharedBitonicTopK<BX, REG>::merge(float (&dist)[REG], uint32_t (
     __shared__ uint32_t scratch_i[N];
     const unsigned tid = threadIdx.x;
     const unsigned chunks = topk / N;
-    // [1] Sort incoming candidates ascending.
-    bitonic_sort_block<true>(dist, idx, scratch_d, scratch_i);
+    // [1] Sort incoming candidates ascending (from arbitrary order).
+    bitonic_sort_full(dist, idx, scratch_d, scratch_i);
     for (unsigned c = 0; c < chunks; c++) {
         // [2] Load chunk c into registers
         float    dist_[REG];
@@ -191,6 +193,86 @@ __device__ void SharedBitonicTopK<BX, REG>::flush(float* dist, uint32_t* idx, un
         unsigned pos = topk - n + i;
         dist[i] = topk_dist[pos];
         idx[i]  = topk_idx[pos] & ~0x80000000u;  // clear MSB mark
+    }
+}
+
+/**
+ * @brief Full bitonic sort of BX*REG key-value pairs from arbitrary order.
+ *        Always produces ascending output.
+ *
+ * Unlike bitonic_sort_block (which assumes bitonic input), this runs
+ * the complete bitonic sorting network from unsorted data.
+ * Direction: ((global_pos & len) == 0) — naturally ascending at top level
+ * since global_pos < TOTAL = len at the final pass.
+ *
+ * @param scratch_d   Shared memory scratch for floats, size >= N.
+ * @param scratch_i   Shared memory scratch for uint32_ts, size >= N.
+ */
+template <unsigned BX, unsigned REG>
+__device__ inline void SharedBitonicTopK<BX, REG>::bitonic_sort_full(
+    float (&d)[REG], uint32_t (&i)[REG],
+    float* scratch_d, uint32_t* scratch_i)
+{
+    const unsigned tid = threadIdx.x;
+    constexpr unsigned TOTAL = BX * REG;
+
+    for (unsigned len = 2; len <= TOTAL; len <<= 1) {
+        for (unsigned stride = len >> 1; stride >= 1; stride >>= 1) {
+            if (stride >= REG) {
+                unsigned thread_stride = stride / REG;
+                if (thread_stride < 32) {
+                    unsigned partner = tid ^ thread_stride;
+                    #pragma unroll
+                    for (unsigned j = 0; j < REG; j++) {
+                        float    pd = __shfl_xor_sync(0xffffffff, d[j], thread_stride);
+                        uint32_t pi = __shfl_xor_sync(0xffffffff, i[j], thread_stride);
+                        unsigned gp = tid * REG + j;
+                        bool dir = ((gp & len) == 0);
+                        bool is_lower = (tid < partner);
+                        bool want_smaller = (dir == is_lower);
+                        if (want_smaller ? (d[j] > pd) : (d[j] < pd)) {
+                            d[j] = pd;
+                            i[j] = pi;
+                        }
+                    }
+                } else {
+                    #pragma unroll
+                    for (unsigned j = 0; j < REG; j++) {
+                        scratch_d[tid * REG + j] = d[j];
+                        scratch_i[tid * REG + j] = i[j];
+                    }
+                    __syncthreads();
+                    unsigned partner = tid ^ thread_stride;
+                    #pragma unroll
+                    for (unsigned j = 0; j < REG; j++) {
+                        float    pd = scratch_d[partner * REG + j];
+                        uint32_t pi = scratch_i[partner * REG + j];
+                        unsigned gp = tid * REG + j;
+                        bool dir = ((gp & len) == 0);
+                        bool is_lower = (tid < partner);
+                        bool want_smaller = (dir == is_lower);
+                        if (want_smaller ? (d[j] > pd) : (d[j] < pd)) {
+                            d[j] = pd;
+                            i[j] = pi;
+                        }
+                    }
+                    __syncthreads();
+                }
+            } else {
+                #pragma unroll
+                for (unsigned k = 0; k < REG; k++) {
+                    unsigned j = k ^ stride;
+                    if (j > k) {
+                        unsigned gp = tid * REG + k;
+                        bool dir = ((gp & len) == 0);
+                        if ((d[k] > d[j]) == dir) {
+                            float    td = d[k]; d[k] = d[j]; d[j] = td;
+                            uint32_t ti = i[k]; i[k] = i[j]; i[j] = ti;
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
