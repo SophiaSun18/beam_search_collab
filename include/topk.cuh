@@ -29,13 +29,13 @@ concept TopKBuffer = requires(
 
 /**
  *  @class SharedBitonicTopK shared memory topk buffer for bitonic sorting
- *  @tparam N assumed max number of neighbors (= BX * REG)
  *  @tparam BX number of threads in the block
  *  @tparam REG rough register pressure parameter per thread
  */
-template <unsigned N, unsigned BX, unsigned REG>
+template <unsigned BX, unsigned REG>
 class SharedBitonicTopK {
     private:
+    static constexpr unsigned N = BX * REG;
     unsigned  topk;       // the number of elements in this buffer
     float*    topk_dist;  // points into shared memory, stored descending
     uint32_t* topk_idx;   // points into shared memory, stored descending
@@ -98,9 +98,8 @@ class SharedBitonicTopK {
             float (&a_d)[REG], uint32_t (&a_i)[REG], float (&b_d)[REG], uint32_t (&b_i)[REG]);
 };
 
-template <unsigned N, unsigned BX, unsigned REG>
-__device__ void SharedBitonicTopK<N, BX, REG>::merge(float (&dist)[REG], uint32_t (&idx)[REG]) {
-    static_assert(N == BX * REG, "N must equal BX * REG");
+template <unsigned BX, unsigned REG>
+__device__ void SharedBitonicTopK<BX, REG>::merge(float (&dist)[REG], uint32_t (&idx)[REG]) {
     __shared__ float    scratch_d[N];
     __shared__ uint32_t scratch_i[N];
     const unsigned tid = threadIdx.x;
@@ -143,8 +142,8 @@ __device__ void SharedBitonicTopK<N, BX, REG>::merge(float (&dist)[REG], uint32_
     __syncthreads();
 }
 
-template <unsigned N, unsigned BX, unsigned REG>
-__device__ unsigned SharedBitonicTopK<N, BX, REG>::pick(uint32_t (&out)[N], unsigned n) {
+template <unsigned BX, unsigned REG>
+__device__ unsigned SharedBitonicTopK<BX, REG>::pick(uint32_t (&out)[N], unsigned n) {
     constexpr uint32_t MSB = 0x80000000;
     const unsigned tid = threadIdx.x;
     unsigned found = 0;
@@ -182,8 +181,8 @@ __device__ unsigned SharedBitonicTopK<N, BX, REG>::pick(uint32_t (&out)[N], unsi
     return (found < n) ? found : n;
 }
 
-template <unsigned N, unsigned BX, unsigned REG>
-__device__ void SharedBitonicTopK<N, BX, REG>::flush(float* dist, uint32_t* idx, unsigned n) {
+template <unsigned BX, unsigned REG>
+__device__ void SharedBitonicTopK<BX, REG>::flush(float* dist, uint32_t* idx, unsigned n) {
     const unsigned tid = threadIdx.x;
     // Copy the n smallest elements (at the tail of the descending buffer).
     for (unsigned i = tid; i < n; i += BX) {
@@ -201,8 +200,8 @@ __device__ void SharedBitonicTopK<N, BX, REG>::flush(float* dist, uint32_t* idx,
  * sequence, the result is two bitonic subsequences where every element in a
  * is <= every element in b.
  */
-template <unsigned N, unsigned BX, unsigned REG>
-__device__ inline void SharedBitonicTopK<N, BX, REG>::butterfly(
+template <unsigned BX, unsigned REG>
+__device__ inline void SharedBitonicTopK<BX, REG>::butterfly(
     float (&a_d)[REG], uint32_t (&a_i)[REG],
     float (&b_d)[REG], uint32_t (&b_i)[REG])
 {
@@ -223,9 +222,9 @@ __device__ inline void SharedBitonicTopK<N, BX, REG>::butterfly(
  *
  * @tparam asc  true for ascending output, false for descending.
  */
-template <unsigned N, unsigned BX, unsigned REG>
+template <unsigned BX, unsigned REG>
 template <bool asc>
-__device__ inline void SharedBitonicTopK<N, BX, REG>::bitonic_sort_local(float (&d)[REG], uint32_t (&i)[REG]) {
+__device__ inline void SharedBitonicTopK<BX, REG>::bitonic_sort_local(float (&d)[REG], uint32_t (&i)[REG]) {
     #pragma unroll
     for (unsigned len = 2; len <= REG; len <<= 1) {
         #pragma unroll
@@ -256,9 +255,9 @@ __device__ inline void SharedBitonicTopK<N, BX, REG>::bitonic_sort_local(float (
  * @param scratch_d   Shared memory scratch for floats, size >= N.
  * @param scratch_i   Shared memory scratch for uint32_ts, size >= N.
  */
-template <unsigned N, unsigned BX, unsigned REG>
+template <unsigned BX, unsigned REG>
 template <bool asc>
-__device__ inline void SharedBitonicTopK<N, BX, REG>::bitonic_sort_block(
+__device__ inline void SharedBitonicTopK<BX, REG>::bitonic_sort_block(
     float (&d)[REG], uint32_t (&i)[REG],
     float* scratch_d, uint32_t* scratch_i)
 {

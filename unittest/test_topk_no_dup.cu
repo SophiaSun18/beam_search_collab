@@ -10,12 +10,13 @@
 // We generate values 0..total-1 with distinct ids, merge them in,
 // then check the output has no duplicate ids.
 
-template <unsigned N, unsigned BX, unsigned REG>
+template <unsigned BX, unsigned REG>
 __global__ void kernel_test_no_dup(
     float* g_buf_dist, uint32_t* g_buf_idx, unsigned topk,
     float* g_input_dist, uint32_t* g_input_idx, unsigned n_inputs,
     float* g_out_dist, uint32_t* g_out_idx)
 {
+    constexpr unsigned N = BX * REG;
     extern __shared__ char smem[];
     float*    s_dist = (float*)smem;
     uint32_t* s_idx  = (uint32_t*)(s_dist + topk);
@@ -28,7 +29,7 @@ __global__ void kernel_test_no_dup(
     }
     __syncthreads();
 
-    SharedBitonicTopK<N, BX, REG> buf(topk, s_dist, s_idx);
+    SharedBitonicTopK<BX, REG> buf(topk, s_dist, s_idx);
 
     unsigned batches = n_inputs / N;
     for (unsigned b = 0; b < batches; b++) {
@@ -46,9 +47,9 @@ __global__ void kernel_test_no_dup(
     buf.flush(g_out_dist, g_out_idx, topk);
 }
 
-template <unsigned N, unsigned BX, unsigned REG>
+template <unsigned BX, unsigned REG>
 bool run_no_dup_test(unsigned topk, unsigned n_total, unsigned seed) {
-    static_assert(N == BX * REG);
+    constexpr unsigned N = BX * REG;
     std::mt19937 rng(seed);
 
     unsigned total = topk + n_total;
@@ -109,7 +110,7 @@ bool run_no_dup_test(unsigned topk, unsigned n_total, unsigned seed) {
     cudaMemcpy(d_in_idx,   h_in_idx.data(),   n_inputs * sizeof(uint32_t), cudaMemcpyHostToDevice);
 
     size_t smem_size = topk * (sizeof(float) + sizeof(uint32_t));
-    kernel_test_no_dup<N, BX, REG><<<1, BX, smem_size>>>(
+    kernel_test_no_dup<BX, REG><<<1, BX, smem_size>>>(
         d_buf_dist, d_buf_idx, topk,
         d_in_dist, d_in_idx, n_inputs,
         d_out_dist, d_out_idx);
@@ -153,14 +154,14 @@ int main() {
     unsigned seed = 200;
 
     struct { const char* name; bool (*fn)(unsigned, unsigned, unsigned); unsigned topk; unsigned n_total; } tests[] = {
-        {"no_dup<64,32,2> topk=128 n=256",   run_no_dup_test<64,32,2>,   128, 256},
-        {"no_dup<64,32,2> topk=256 n=512",   run_no_dup_test<64,32,2>,   256, 512},
-        {"no_dup<128,32,4> topk=128 n=256",  run_no_dup_test<128,32,4>,  128, 256},
-        {"no_dup<128,32,4> topk=256 n=512",  run_no_dup_test<128,32,4>,  256, 512},
-        {"no_dup<128,32,4> topk=512 n=1024", run_no_dup_test<128,32,4>,  512, 1024},
-        {"no_dup<128,64,2> topk=128 n=256",  run_no_dup_test<128,64,2>,  128, 256},
-        {"no_dup<256,64,4> topk=256 n=512",  run_no_dup_test<256,64,4>,  256, 512},
-        {"no_dup<256,64,4> topk=512 n=1024", run_no_dup_test<256,64,4>,  512, 1024},
+        {"no_dup<32,2> topk=128 n=256",   run_no_dup_test<32,2>,   128, 256},
+        {"no_dup<32,2> topk=256 n=512",   run_no_dup_test<32,2>,   256, 512},
+        {"no_dup<32,4> topk=128 n=256",   run_no_dup_test<32,4>,   128, 256},
+        {"no_dup<32,4> topk=256 n=512",   run_no_dup_test<32,4>,   256, 512},
+        {"no_dup<32,4> topk=512 n=1024",  run_no_dup_test<32,4>,   512, 1024},
+        {"no_dup<64,2> topk=128 n=256",   run_no_dup_test<64,2>,   128, 256},
+        {"no_dup<64,4> topk=256 n=512",   run_no_dup_test<64,4>,   256, 512},
+        {"no_dup<64,4> topk=512 n=1024",  run_no_dup_test<64,4>,   512, 1024},
     };
 
     for (auto& t : tests) {

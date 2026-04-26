@@ -9,11 +9,12 @@
 // We generate a random bitonic sequence (ascending then descending)
 // of values 0.0..n-1 and verify the sort produces a fully sorted result.
 
-template <unsigned N, unsigned BX, unsigned REG, bool asc>
+template <unsigned BX, unsigned REG, bool asc>
 __global__ void kernel_test_bitonic_sort(
     float* g_in_dist, uint32_t* g_in_idx,
     float* g_out_dist, uint32_t* g_out_idx)
 {
+    constexpr unsigned N = BX * REG;
     extern __shared__ char smem[];
     float*    scratch_d = (float*)smem;
     uint32_t* scratch_i = (uint32_t*)(scratch_d + N);
@@ -29,7 +30,7 @@ __global__ void kernel_test_bitonic_sort(
         i[j] = g_in_idx[pos];
     }
 
-    SharedBitonicTopK<N, BX, REG>::template bitonic_sort_block<asc>(d, i, scratch_d, scratch_i);
+    SharedBitonicTopK<BX, REG>::template bitonic_sort_block<asc>(d, i, scratch_d, scratch_i);
 
     #pragma unroll
     for (unsigned j = 0; j < REG; j++) {
@@ -39,9 +40,9 @@ __global__ void kernel_test_bitonic_sort(
     }
 }
 
-template <unsigned N, unsigned BX, unsigned REG>
+template <unsigned BX, unsigned REG>
 bool run_bitonic_sort_test(unsigned seed) {
-    static_assert(N == BX * REG);
+    constexpr unsigned N = BX * REG;
     std::mt19937 rng(seed);
 
     // Generate values 0..N-1
@@ -90,7 +91,7 @@ bool run_bitonic_sort_test(unsigned seed) {
     size_t smem_size = N * (sizeof(float) + sizeof(uint32_t));
 
     // Test ascending
-    kernel_test_bitonic_sort<N, BX, REG, true><<<1, BX, smem_size>>>(
+    kernel_test_bitonic_sort<BX, REG, true><<<1, BX, smem_size>>>(
         d_in_dist, d_in_idx, d_out_dist, d_out_idx);
     cudaDeviceSynchronize();
 
@@ -109,7 +110,7 @@ bool run_bitonic_sort_test(unsigned seed) {
     }
 
     // Test descending
-    kernel_test_bitonic_sort<N, BX, REG, false><<<1, BX, smem_size>>>(
+    kernel_test_bitonic_sort<BX, REG, false><<<1, BX, smem_size>>>(
         d_in_dist, d_in_idx, d_out_dist, d_out_idx);
     cudaDeviceSynchronize();
 
@@ -133,12 +134,12 @@ int main() {
     unsigned seed = 100;
 
     struct { const char* name; bool (*fn)(unsigned); } tests[] = {
-        {"bitonic_sort<64,32,2>",   run_bitonic_sort_test<64,32,2>},
-        {"bitonic_sort<128,32,4>",  run_bitonic_sort_test<128,32,4>},
-        {"bitonic_sort<128,64,2>",  run_bitonic_sort_test<128,64,2>},
-        {"bitonic_sort<256,64,4>",  run_bitonic_sort_test<256,64,4>},
-        {"bitonic_sort<256,128,2>", run_bitonic_sort_test<256,128,2>},
-        {"bitonic_sort<512,128,4>", run_bitonic_sort_test<512,128,4>},
+        {"bitonic_sort<32,2>",   run_bitonic_sort_test<32,2>},
+        {"bitonic_sort<32,4>",   run_bitonic_sort_test<32,4>},
+        {"bitonic_sort<64,2>",   run_bitonic_sort_test<64,2>},
+        {"bitonic_sort<64,4>",   run_bitonic_sort_test<64,4>},
+        {"bitonic_sort<128,2>",  run_bitonic_sort_test<128,2>},
+        {"bitonic_sort<128,4>",  run_bitonic_sort_test<128,4>},
     };
 
     for (auto& t : tests) {

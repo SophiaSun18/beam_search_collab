@@ -10,12 +10,13 @@
 // then merge batches of N new elements. After all merges, the buffer
 // should hold the smallest `topk` values from the union.
 
-template <unsigned N, unsigned BX, unsigned REG>
+template <unsigned BX, unsigned REG>
 __global__ void kernel_test_merge(
     float* g_buf_dist, uint32_t* g_buf_idx, unsigned topk,
     float* g_input_dist, uint32_t* g_input_idx, unsigned n_inputs,
     float* g_out_dist, uint32_t* g_out_idx)
 {
+    constexpr unsigned N = BX * REG;
     extern __shared__ char smem[];
     float*    s_dist = (float*)smem;
     uint32_t* s_idx  = (uint32_t*)(s_dist + topk);
@@ -29,7 +30,7 @@ __global__ void kernel_test_merge(
     }
     __syncthreads();
 
-    SharedBitonicTopK<N, BX, REG> buf(topk, s_dist, s_idx);
+    SharedBitonicTopK<BX, REG> buf(topk, s_dist, s_idx);
 
     // Merge batches of N elements
     unsigned batches = n_inputs / N;
@@ -49,9 +50,9 @@ __global__ void kernel_test_merge(
     buf.flush(g_out_dist, g_out_idx, topk);
 }
 
-template <unsigned N, unsigned BX, unsigned REG>
+template <unsigned BX, unsigned REG>
 bool run_merge_test(unsigned topk, unsigned n_total, unsigned seed) {
-    static_assert(N == BX * REG);
+    constexpr unsigned N = BX * REG;
     std::mt19937 rng(seed);
 
     // Generate all values: 0.0, 1.0, ..., n_total + topk - 1
@@ -116,7 +117,7 @@ bool run_merge_test(unsigned topk, unsigned n_total, unsigned seed) {
     cudaMemcpy(d_in_idx,   h_in_idx.data(),   n_inputs * sizeof(uint32_t), cudaMemcpyHostToDevice);
 
     size_t smem_size = topk * (sizeof(float) + sizeof(uint32_t));
-    kernel_test_merge<N, BX, REG><<<1, BX, smem_size>>>(
+    kernel_test_merge<BX, REG><<<1, BX, smem_size>>>(
         d_buf_dist, d_buf_idx, topk,
         d_in_dist, d_in_idx, n_inputs,
         d_out_dist, d_out_idx);
@@ -159,18 +160,18 @@ int main() {
 
     struct { const char* name; bool (*fn)(unsigned, unsigned, unsigned); unsigned topk; unsigned n_total; } tests[] = {
         // BX=32, REG=2, N=64
-        {"merge<64,32,2> topk=128 n=256",  run_merge_test<64,32,2>,  128, 256},
-        {"merge<64,32,2> topk=256 n=512",  run_merge_test<64,32,2>,  256, 512},
+        {"merge<64,32,2> topk=128 n=256",  run_merge_test<32,2>,  128, 256},
+        {"merge<64,32,2> topk=256 n=512",  run_merge_test<32,2>,  256, 512},
         // BX=32, REG=4, N=128
-        {"merge<128,32,4> topk=128 n=256", run_merge_test<128,32,4>, 128, 256},
-        {"merge<128,32,4> topk=256 n=512", run_merge_test<128,32,4>, 256, 512},
-        {"merge<128,32,4> topk=512 n=1024",run_merge_test<128,32,4>, 512, 1024},
+        {"merge<128,32,4> topk=128 n=256", run_merge_test<32,4>, 128, 256},
+        {"merge<128,32,4> topk=256 n=512", run_merge_test<32,4>, 256, 512},
+        {"merge<128,32,4> topk=512 n=1024",run_merge_test<32,4>, 512, 1024},
         // BX=64, REG=2, N=128
-        {"merge<128,64,2> topk=128 n=256", run_merge_test<128,64,2>, 128, 256},
-        {"merge<128,64,2> topk=256 n=512", run_merge_test<128,64,2>, 256, 512},
+        {"merge<128,64,2> topk=128 n=256", run_merge_test<64,2>, 128, 256},
+        {"merge<128,64,2> topk=256 n=512", run_merge_test<64,2>, 256, 512},
         // BX=64, REG=4, N=256
-        {"merge<256,64,4> topk=256 n=512", run_merge_test<256,64,4>, 256, 512},
-        {"merge<256,64,4> topk=512 n=1024",run_merge_test<256,64,4>, 512, 1024},
+        {"merge<256,64,4> topk=256 n=512", run_merge_test<64,4>, 256, 512},
+        {"merge<256,64,4> topk=512 n=1024",run_merge_test<64,4>, 512, 1024},
     };
 
     for (auto& t : tests) {
