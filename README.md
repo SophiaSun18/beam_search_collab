@@ -1,6 +1,6 @@
 # GPU Beam Search
 
-GPU-accelerated graph-based approximate nearest neighbor search with beam search.
+GPU-accelerated graph-based approximate nearest neighbor search.
 
 ## Build
 
