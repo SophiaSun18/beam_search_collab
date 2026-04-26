@@ -29,7 +29,7 @@ concept TopKBuffer = requires(
 
 /**
  *  @class SharedBitonicTopK shared memory topk buffer for bitonic sorting
- *  @tparam BX number of threads in the block
+ *  @tparam BX number of threads in the blocks
  *  @tparam REG rough register pressure parameter per thread
  */
 template <unsigned BX, unsigned REG>
