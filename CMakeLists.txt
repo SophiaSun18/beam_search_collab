@@ -9,14 +9,6 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Include project root so "include/..." paths work from src/
 include_directories(${CMAKE_SOURCE_DIR})
 
-# ── CPU targets (disabled temporarily) ───────────────────────────────────────
-# set(CPU_FLAGS -Wall -Wextra -Ofast -march=native -fpic -ftree-vectorize -fexceptions -DEIGEN_DONT_PARALLELIZE -mavx512f)
-# find_package(OpenMP REQUIRED)
-# add_executable(cpu_base src/beam_cpu_base.cpp)
-# add_executable(cpu_pathw src/beam_cpu_pathw.cpp)
-# add_executable(cpu_rabitq src/beam_cpu_rabitq.cpp)
-# add_executable(preprocess_rabitq src/preprocess_rabitq.cpp)
-
 # ── GPU targets ──────────────────────────────────────────────────────────────
 
 # add_executable(gpu_search src/main.cu src/beam_gpu_base.cu src/beam_gpu_rabitq.cu)
