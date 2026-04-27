@@ -2,17 +2,12 @@
 
 #include "include/qg.hpp"
 #include "include/search_rabitq.cuh"
-#include "include/search_tensor_rabitq.cuh"
 
 #include <chrono>
 #include <cstddef>
 #include <array>
 #include <cfloat>
 #include <vector>
-
-#ifndef USE_TENSOR_RABITQ
-#define USE_TENSOR_RABITQ 0
-#endif
 
 static vidType compute_gpu_rabitq_entry_point(const float* data, size_t npoints,
                                               size_t dim, size_t row_offset) {
@@ -117,25 +112,13 @@ void QuantizationGraph::gpu_search(int nq, const float* queries, int K, float* r
       compute_gpu_rabitq_entry_point(this->get_data_ptr(), npoints, dim, this->get_row_offset());
   printf("GPU rabitq entry point: %u\n", entry_point);
 
-  uint32_t shm_size = USE_TENSOR_RABITQ
-      ? calculate_shared_mem_size_tensor(static_cast<int>(dim), INTERNAL_TOPK, max_degree, SEARCH_WIDTH, BITLEN, K)
-      : calculate_shared_mem_size(static_cast<int>(dim), INTERNAL_TOPK, max_degree, SEARCH_WIDTH, BITLEN);
-  if (USE_TENSOR_RABITQ) {
-    CUDA_SAFE_CALL(cudaFuncSetAttribute(
-        TensorCoreQuantizedBeamSearch,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        static_cast<int>(shm_size)));
-  } else {
-    CUDA_SAFE_CALL(cudaFuncSetAttribute(
-        QuantizedBeamSearch,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        static_cast<int>(shm_size)));
-  }
+  uint32_t shm_size = calculate_shared_mem_size(static_cast<int>(dim), INTERNAL_TOPK, max_degree, SEARCH_WIDTH, BITLEN);
+  CUDA_SAFE_CALL(cudaFuncSetAttribute(
+      QuantizedBeamSearch,
+      cudaFuncAttributeMaxDynamicSharedMemorySize,
+      static_cast<int>(shm_size)));
 
-  cudaError_t err = USE_TENSOR_RABITQ
-      ? cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocksPerSM,
-            TensorCoreQuantizedBeamSearch, blockSize, shm_size)
-      : cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocksPerSM,
+  cudaError_t err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocksPerSM,
             QuantizedBeamSearch, blockSize, shm_size);
   if (err != cudaSuccess) {
     printf("Error: %s\n", cudaGetErrorString(err));
@@ -145,17 +128,10 @@ void QuantizationGraph::gpu_search(int nq, const float* queries, int K, float* r
 
   printf("\nStarting GPU rabitq search...\n");
   auto start = std::chrono::high_resolution_clock::now();
-  if (USE_TENSOR_RABITQ) {
-    TensorCoreQuantizedBeamSearch<<<num_blocks, num_threads, shm_size>>>(
-        K, active_nq, static_cast<int>(dim), max_degree, npoints, d_queries, d_qg_data, d_qg_signs, d_results,
-        d_total_stats, d_total_timing, entry_point, this->get_row_offset(), this->get_neighbor_offset(),
-        this->get_code_offset(), this->get_factor_offset(), debug_mode);
-  } else {
-    QuantizedBeamSearch<<<num_blocks, num_threads, shm_size>>>(
-        K, active_nq, static_cast<int>(dim), max_degree, npoints, d_queries, d_qg_data, d_qg_signs, d_results,
-        d_total_stats, d_total_timing, entry_point, this->get_row_offset(), this->get_neighbor_offset(),
-        this->get_code_offset(), this->get_factor_offset(), debug_mode);
-  }
+  QuantizedBeamSearch<<<num_blocks, num_threads, shm_size>>>(
+      K, active_nq, static_cast<int>(dim), max_degree, npoints, d_queries, d_qg_data, d_qg_signs, d_results,
+      d_total_stats, d_total_timing, entry_point, this->get_row_offset(), this->get_neighbor_offset(),
+      this->get_code_offset(), this->get_factor_offset(), debug_mode);
   CUDA_SAFE_CALL(cudaGetLastError());
   cudaDeviceSynchronize();
   auto end = std::chrono::high_resolution_clock::now();

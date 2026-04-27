@@ -836,24 +836,21 @@ inline void debug_print_candidate_entry(const std::pair<vidType, float>& candida
 }
 
 template <typename CandidateT>
-inline void debug_print_candidate_entry(const CandidateT& candidate) {
-    cout << "    node=" << candidate.vid
-         << ", est_dist=" << fixed << setprecision(6) << candidate.dist << "\n";
-}
-
-template <typename CandidateT>
 inline void debug_print_candidates(
     int iter, vidType cur_node, const vector<CandidateT>& candidates) {
     cout << "[DEBUG] iteration " << iter << "\n";
     cout << "  expanding node: " << cur_node << "\n";
-    cout << "  neighbors:";
+    cout << "  candidate buffer:";
     if (candidates.empty()) {
         cout << " []\n";
         return;
     }
     cout << "\n";
-    for (const auto& candidate : candidates) {
-        debug_print_candidate_entry(candidate);
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        const auto& candidate = candidates[i];
+        cout << "    idx=" << i
+             << ", node=" << candidate.vid
+             << ", dist=" << fixed << setprecision(6) << candidate.dist << "\n";
     }
 }
 
@@ -896,14 +893,14 @@ inline void debug_print_beam_state(both_pqueue_t<T>& frontier) {
 
 template <typename QueueT>
 inline void debug_print_final_results(QueueT& result_pool) {
-    cout << "[DEBUG] final result pool:";
+    cout << "[DEBUG] final result pool";
     if (result_pool.size() == 0) {
         cout << " []\n";
         return;
     }
     cout << "\n";
     for (int i = 0; i < result_pool.size(); i++) {
-        cout << "  rank=" << i
+        cout << "  idx=" << i
              << ", node=" << result_pool[i]
              << ", dist=" << fixed << setprecision(6) << result_pool.get_dist(i) << "\n";
     }

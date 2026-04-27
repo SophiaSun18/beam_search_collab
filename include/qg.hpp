@@ -176,8 +176,7 @@ public:
         const float inv_width = 1.0f / qf.width;
         int32_t sum = 0;
         for (size_t i = 0; i < padded_dim_; ++i) {
-            const float scaled = ((qf.rotated_query[i] - qf.low_val) * inv_width) + 0.5f;
-            const uint8_t cur = static_cast<uint8_t>(lroundf(scaled));
+            const uint8_t cur = static_cast<uint8_t>(lroundf(((qf.rotated_query[i] - qf.low_val) * inv_width) + 0.5f));
             qf.quantized_query[i] = cur;
             sum += cur;
         }

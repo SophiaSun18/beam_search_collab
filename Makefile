@@ -29,7 +29,6 @@ CPU_TARGETS = cpu_base cpu_pathw cpu_rabitq preprocess_rabitq
 GPU_SOURCES = main.cu beam_gpu_base.cu beam_gpu_rabitq.cu
 GPU_HEADERS = $(HEADERS_DIR)index.hpp $(HEADERS_DIR)qg.hpp $(HEADERS_DIR)utils.h $(HEADERS_DIR)search_bitonic.cuh $(HEADERS_DIR)search_rabitq.cuh
 GPU_TARGET = gpu_search
-GPU_MICROBENCH_TARGET = gpu_microbenchmark
 
 .PHONY: all cpu gpu clean
 
@@ -62,14 +61,10 @@ preprocess_rabitq: $(SRC_PREPROCESS_RABITQ)
 # --------------------------------------------
 # GPU build
 # --------------------------------------------
-gpu: $(GPU_TARGET) $(GPU_MICROBENCH_TARGET)
+gpu: $(GPU_TARGET)
 
 $(GPU_TARGET): $(GPU_SOURCES) $(GPU_HEADERS)
 	$(NVCC) $(NVFLAGS) $(PTXAS_FLAGS) $(INCLUDES) -o $@ $(GPU_SOURCES)
-	mv $@ $(BIN_DIR)/
-
-$(GPU_MICROBENCH_TARGET): gpu_microbenchmark.cu $(GPU_HEADERS)
-	$(NVCC) $(NVFLAGS) $(PTXAS_FLAGS) $(INCLUDES) -o $@ $<
 	mv $@ $(BIN_DIR)/
 
 # --------------------------------------------
@@ -77,4 +72,4 @@ $(GPU_MICROBENCH_TARGET): gpu_microbenchmark.cu $(GPU_HEADERS)
 # --------------------------------------------
 clean:
 	rm -f $(CPU_TARGETS) $(BIN_DIR)/cpu_base $(BIN_DIR)/cpu_pathw \
-	      $(BIN_DIR)/$(GPU_TARGET) $(BIN_DIR)/$(GPU_MICROBENCH_TARGET) *.o
+	      $(BIN_DIR)/$(GPU_TARGET) *.o

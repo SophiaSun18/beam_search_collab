@@ -6,17 +6,12 @@
 #include "include/search_radix.cuh"
 #else
 #include "include/search_bitonic.cuh"
-#include "include/search_tensor_bitonic.cuh"
 #endif
 
 #include <chrono>
 #include <array>
 #include <cfloat>
 #include <vector>
-
-#ifndef USE_TENSOR_BITONIC
-#define USE_TENSOR_BITONIC 0
-#endif
 
 static vid_t compute_gpu_base_entry_point(const float* data, size_t npoints, size_t dim) {
   std::vector<float> centroid(dim, 0.0f);
@@ -52,8 +47,7 @@ void IndexGraph<T>::search(int nq, const T* queries, int K, T *result_vec, vid_t
   auto npoints = this->ntotal;
   auto max_degree = this->maxDeg;
   auto beam_size = beam_sz;
-  printf("Beam search on GPU%s: K=%d, nq=%d, dim=%d, npoints=%ld, beam_size=%d, internal_topk=%d\n",
-         USE_TENSOR_BITONIC ? " (tensor bitonic)" : "", K, nq, dim, npoints, beam_size, INTERNAL_TOPK);
+  printf("Beam search on GPU: K=%d, nq=%d, dim=%d, npoints=%ld, beam_size=%d, internal_topk=%d\n", K, nq, dim, npoints, beam_size, INTERNAL_TOPK);
 
   size_t num_threads = BLOCK_SIZE;
   size_t num_blocks = GPU_DISTANCE_TIMING ? 1 : nq;
@@ -109,9 +103,7 @@ void IndexGraph<T>::search(int nq, const T* queries, int K, T *result_vec, vid_t
   BeamSearch<T><<<num_blocks, num_threads>>>(K, nq, dim, npoints, d_queries, d_data,
                                              d_results, d_total_stats, d_total_timing, d_starting_points, d_total_hops, gg);
 #else
-  uint32_t shm_size = USE_TENSOR_BITONIC
-      ? calculate_shared_mem_size_tensor_bitonic(dim, INTERNAL_TOPK, max_degree, SEARCH_WIDTH, BITLEN)
-      : calculate_shared_mem_size(dim, INTERNAL_TOPK, max_degree, SEARCH_WIDTH, BITLEN);
+  uint32_t shm_size = calculate_shared_mem_size(dim, INTERNAL_TOPK, max_degree, SEARCH_WIDTH, BITLEN);
   vid_t *d_seed_map = nullptr;
   if (USE_SEED) {
     size_t ghost_scale_factor = 100;
@@ -129,17 +121,8 @@ void IndexGraph<T>::search(int nq, const T* queries, int K, T *result_vec, vid_t
   }
 
   cudaError_t err = cudaSuccess;
-  if (USE_TENSOR_BITONIC) {
-    CUDA_SAFE_CALL(cudaFuncSetAttribute(
-        BeamSearchTensor<T>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        static_cast<int>(shm_size)));
-    err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &numBlocksPerSM, BeamSearchTensor<T>, blockSize, shm_size);
-  } else {
-    err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+  err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
         &numBlocksPerSM, BeamSearch<T>, blockSize, shm_size);
-  }
   if (err != cudaSuccess) {
     printf("Error: %s\n", cudaGetErrorString(err));
     exit(-1);
@@ -147,16 +130,10 @@ void IndexGraph<T>::search(int nq, const T* queries, int K, T *result_vec, vid_t
   printf("Max active blocks per SM = %d\n", numBlocksPerSM);
 
   // Execute the search
-  printf("\nStarting GPU %sbeam search...\n", USE_TENSOR_BITONIC ? "tensor " : "");
+  printf("\nStarting GPU %sbeam search...\n");
   auto start = std::chrono::high_resolution_clock::now();
-  if (USE_TENSOR_BITONIC) {
-    BeamSearchTensor<T><<<num_blocks, num_threads, shm_size>>>(
-        K, nq, dim, npoints, d_queries, d_data, d_results,
-        d_total_stats, d_total_timing, d_starting_points, d_seed_map, d_sign_bit, gg, debug_mode);
-  } else {
-    BeamSearch<T><<<num_blocks, num_threads, shm_size>>>(K, nq, dim, npoints, d_queries, d_data, d_results, 
+  BeamSearch<T><<<num_blocks, num_threads, shm_size>>>(K, nq, dim, npoints, d_queries, d_data, d_results, 
                                                          d_total_stats, d_total_timing, d_starting_points, d_seed_map, d_sign_bit, gg, debug_mode);
-  }
   CUDA_SAFE_CALL(cudaGetLastError());
   cudaDeviceSynchronize();
   auto end = std::chrono::high_resolution_clock::now();

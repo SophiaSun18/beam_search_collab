@@ -100,8 +100,8 @@ L2_END_ITER=0
 L2_PERIOD=0
 RERANK_TOP_M=1
 # TRIALS=${TRIALS_OVERRIDE:-1}
-TRIALS=3
-MODE="${MODE_OVERRIDE:-sequential}"               # "fastscan" = enabled, "sequential" = fastscan disabled
+TRIALS=1
+MODE="${MODE_OVERRIDE:-fastscan}"               # "fastscan" = enabled, "sequential" = fastscan disabled
 RABITQ_LOAD_MODE="codebook"  # "bins" = -graph + -rabitq + -sign, "codebook" = -qg
 ESTIMATE_STATS="off"          # "on" = write estimate reuse stats, "off" = disable
 STEP_EFFICIENCY="off"         # "on" = write per-step exact-distance reduction stats

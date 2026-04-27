@@ -6,6 +6,7 @@ result/
 profile_result/
 data/
 scripts/
+archived/
 
 *.log
 *.out
