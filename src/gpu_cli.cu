@@ -276,19 +276,14 @@ int main() {
     }
     auto& js = j["search"];
     std::string mode = js.value("mode", "base");
-    int K              = js.value("K", 100);
-    unsigned topk_size = js.value("topk_size", 256u);
-    unsigned bitlen    = js.value("bitlen", 10u);
-    int max_iterations = js.value("max_iterations", 1024);
-    int reset_interval = js.value("reset_interval", 16);
+    int K            = js.value("K", 100);
 
     // allocate results
     vid_t* d_results;
     cudaMalloc(&d_results, nq * K * sizeof(vid_t));
     std::vector<vid_t> h_results(nq * K);
 
-    std::cout << "search: mode=" << mode << " K=" << K
-              << " topk=" << topk_size << " bitlen=" << bitlen << std::endl;
+    std::cout << "search: mode=" << mode << " K=" << K << std::endl;
 
     // ── dispatch ────────────────────────────────────────────────────────
     if (mode == "rabitq") {
@@ -304,20 +299,20 @@ int main() {
                        ? cpu_rq.entry_point : entry_point;
 
         GPURabitqSearchCfg rq_cfg;
-        rq_cfg.topk_size      = topk_size;
-        rq_cfg.bitlen         = bitlen;
+        rq_cfg.topk_size      = js.value("topk_size", 256u);
+        rq_cfg.bitlen         = js.value("bitlen", 10u);
         rq_cfg.entry_point    = rq_entry;
-        rq_cfg.max_iterations = max_iterations;
-        rq_cfg.reset_interval = reset_interval;
+        rq_cfg.max_iterations = js.value("max_iterations", 1024);
+        rq_cfg.reset_interval = js.value("reset_interval", 16);
 
         run_rabitq(gpu_graph, gpu_rq, rq_cfg, nq, dim, K, d_queries, d_results);
     } else {
         GPUBaseSearchCfg cfg;
-        cfg.topk_size      = topk_size;
-        cfg.bitlen         = bitlen;
+        cfg.topk_size      = js.value("topk_size", 256u);
+        cfg.bitlen         = js.value("bitlen", 10u);
         cfg.entry_point    = entry_point;
-        cfg.max_iterations = max_iterations;
-        cfg.reset_interval = reset_interval;
+        cfg.max_iterations = js.value("max_iterations", 1024);
+        cfg.reset_interval = js.value("reset_interval", 16);
 
         if (mode == "base") {
             run_base(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
