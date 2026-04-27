@@ -4,10 +4,10 @@
 #include <cstdlib>
 #include <cstring>
 
-#include "include/index.hpp"
-#include "include/qg.hpp"
-#include "include/utils.h"
-#include "include/search_bitonic.cuh"
+#include "index.hpp"
+#include "qg.hpp"
+#include "utils.h"
+#include "search_bitonic.cuh"
 using namespace std;
 
 static void usage(const char* prog) {

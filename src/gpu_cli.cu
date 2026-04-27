@@ -6,11 +6,11 @@
 #include <cstdint>
 
 #include <nlohmann/json.hpp>
-#include "include/cpu_graph.hpp"
-#include "include/gpu_graph.cuh"
-#include "include/gpu_base_search.cuh"
-#include "include/gpu_warp_search.cuh"
-#include "include/gpu_rabitq_search.cuh"
+#include "cpu_graph.hpp"
+#include "gpu_graph.cuh"
+#include "gpu_base_search.cuh"
+#include "gpu_warp_search.cuh"
+#include "gpu_rabitq_search.cuh"
 
 using json = nlohmann::json;
 

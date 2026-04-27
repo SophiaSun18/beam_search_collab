@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <random>
 #include <vector>
-#include "include/topk.cuh"
+#include "topk.cuh"
 
 // Test: bitonic_sort_block should correctly sort a bitonic sequence.
 // We generate a random bitonic sequence (ascending then descending)

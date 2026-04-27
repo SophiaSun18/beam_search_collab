@@ -1,8 +1,8 @@
 //#include <cuda_profiler_api.h>
 
-#include "include/qg.hpp"
-#include "include/search_rabitq.cuh"
-#include "include/search_tensor_rabitq.cuh"
+#include "qg.hpp"
+#include "search_rabitq.cuh"
+#include "search_tensor_rabitq.cuh"
 
 #include <chrono>
 #include <cstddef>

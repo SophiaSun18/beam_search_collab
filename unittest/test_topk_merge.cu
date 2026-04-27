@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <random>
 #include <vector>
-#include "include/topk.cuh"
+#include "topk.cuh"
 
 // Test: merge should retain the smallest elements.
 // We fill the buffer with 0..topk-1 (shuffled, stored descending),

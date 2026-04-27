@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <random>
 #include <vector>
-#include "include/topk.cuh"
+#include "topk.cuh"
 
 // Test: bitonic_sort_full should correctly sort arbitrary unsorted data.
 

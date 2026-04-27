@@ -1,7 +1,7 @@
-#include "include/index.hpp"
-#include "include/gpu_base_search.cuh"
-#include "include/cpu_graph.hpp"
-#include "include/gpu_graph.cuh"
+#include "index.hpp"
+#include "gpu_base_search.cuh"
+#include "cpu_graph.hpp"
+#include "gpu_graph.cuh"
 
 #include <chrono>
 #include <array>

@@ -4,7 +4,7 @@
 #include <random>
 #include <vector>
 #include <set>
-#include "include/topk.cuh"
+#include "topk.cuh"
 
 // Test: interleaved pick/merge must never yield duplicate node IDs.
 // A shuffled list of (dist, id) pairs is merged in batches of N.
