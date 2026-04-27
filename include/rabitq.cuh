@@ -337,7 +337,10 @@ __device__ RabitqQuery<BX>::RabitqQuery(
 {
     int padded_dim = padded_dim_;
 
-    // carve shared memory
+    // carve shared memory — align before each typed allocation
+    smem = reinterpret_cast<char*>(
+        (reinterpret_cast<uintptr_t>(smem) + alignof(float) - 1)
+            & ~(static_cast<uintptr_t>(alignof(float)) - 1));
     rotated_query_   = reinterpret_cast<float*>(smem);
     smem += padded_dim * sizeof(float);
 
@@ -347,6 +350,10 @@ __device__ RabitqQuery<BX>::RabitqQuery(
     lut_             = reinterpret_cast<uint8_t*>(smem);
     smem += padded_dim * 4;
 
+    // realign after uint8_t allocations
+    smem = reinterpret_cast<char*>(
+        (reinterpret_cast<uintptr_t>(smem) + alignof(float) - 1)
+            & ~(static_cast<uintptr_t>(alignof(float)) - 1));
     low_val_         = reinterpret_cast<float*>(smem);
     smem += sizeof(float);
 
@@ -369,10 +376,11 @@ template <unsigned BX>
 __host__ __device__ size_t RabitqQuery<BX>::shared_mem_bytes(int dim)
 {
     int padded_dim = rabitq_padded_dim(dim);
-    size_t size = 0;
+    size_t size = alignof(float) - 1;      // worst-case initial alignment
     size += padded_dim * sizeof(float);    // rotated_query
     size += padded_dim;                    // quantized_query
     size += padded_dim * 4;                // lut
+    size = (size + alignof(float) - 1) & ~(alignof(float) - 1);  // realign
     size += sizeof(float);                 // low_val
     size += sizeof(float);                 // width
     size += sizeof(int32_t);               // sum_q

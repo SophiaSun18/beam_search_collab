@@ -105,16 +105,6 @@ __device__ GPURabitqSearch<BX>::GPURabitqSearch(
     GPUGraphView graph, GPURabitqView rabitq)
     : topk_(smem, cfg.topk_size),
       hf_(smem, cfg.bitlen),
-      query_buf_  (reinterpret_cast<float*>(smem)),
-      parent_buf_ (reinterpret_cast<INDEX_T*>(smem + graph.dim() * sizeof(float))),
-      cand_idx_   (reinterpret_cast<INDEX_T*>(smem + graph.dim() * sizeof(float)
-                       + sizeof(INDEX_T))),
-      cand_dist_  (reinterpret_cast<DISTANCE_T*>(smem + graph.dim() * sizeof(float)
-                       + sizeof(INDEX_T)
-                       + CAND * sizeof(INDEX_T))),
-      query_smem_(nullptr),
-      staged_codes_(nullptr),
-      staged_factors_(nullptr),
       graph_(graph),
       rabitq_(rabitq),
       cfg_(cfg),
@@ -122,30 +112,42 @@ __device__ GPURabitqSearch<BX>::GPURabitqSearch(
       max_degree_(graph.degree()),
       bitcode_words_(rabitq.padded_dim() / 64)
 {
-    int pdim = rabitq.padded_dim();
+    // align for float/uint32_t
+    smem = reinterpret_cast<char*>(
+        (reinterpret_cast<uintptr_t>(smem) + alignof(float) - 1)
+            & ~(static_cast<uintptr_t>(alignof(float)) - 1));
 
-    // advance smem past base allocations
-    char* p = smem + graph.dim() * sizeof(float)
-                   + sizeof(INDEX_T)
-                   + CAND * sizeof(INDEX_T)
-                   + CAND * sizeof(DISTANCE_T);
+    query_buf_  = reinterpret_cast<float*>(smem);
+    smem += graph.dim() * sizeof(float);
+
+    parent_buf_ = reinterpret_cast<INDEX_T*>(smem);
+    smem += sizeof(INDEX_T);
+
+    cand_idx_   = reinterpret_cast<INDEX_T*>(smem);
+    smem += CAND * sizeof(INDEX_T);
+
+    cand_dist_  = reinterpret_cast<DISTANCE_T*>(smem);
+    smem += CAND * sizeof(DISTANCE_T);
 
     // reserve region for RabitqQuery (constructed later in search())
-    query_smem_ = p;
-    p += RabitqQuery<BX>::shared_mem_bytes(graph.dim());
+    query_smem_ = smem;
+    smem += RabitqQuery<BX>::shared_mem_bytes(graph.dim());
 
     // align for uint64_t before staged codes
-    p = reinterpret_cast<char*>(
-        (reinterpret_cast<uintptr_t>(p) + alignof(uint64_t) - 1)
+    smem = reinterpret_cast<char*>(
+        (reinterpret_cast<uintptr_t>(smem) + alignof(uint64_t) - 1)
             & ~(static_cast<uintptr_t>(alignof(uint64_t)) - 1));
 
-    staged_codes_ = reinterpret_cast<uint64_t*>(p);
-    p += static_cast<size_t>(graph.degree()) * bitcode_words_ * sizeof(uint64_t);
+    staged_codes_ = reinterpret_cast<uint64_t*>(smem);
+    smem += static_cast<size_t>(graph.degree()) * bitcode_words_ * sizeof(uint64_t);
 
-    staged_factors_ = reinterpret_cast<float*>(p);
-    p += 3 * static_cast<size_t>(graph.degree()) * sizeof(float);
+    // align for float before staged factors
+    smem = reinterpret_cast<char*>(
+        (reinterpret_cast<uintptr_t>(smem) + alignof(float) - 1)
+            & ~(static_cast<uintptr_t>(alignof(float)) - 1));
 
-    smem = p;
+    staged_factors_ = reinterpret_cast<float*>(smem);
+    smem += 3 * static_cast<size_t>(graph.degree()) * sizeof(float);
 }
 
 // ── shared_mem_bytes ─────────���─────────────────────────────────────────────
@@ -160,6 +162,7 @@ __host__ __device__ size_t GPURabitqSearch<BX>::shared_mem_bytes(
     size_t size = 0;
     size += SharedBitonicTopK<BX, 1>::shared_mem_bytes(cfg.topk_size);
     size += HashFilter::shared_mem_bytes(cfg.bitlen);
+    size = (size + alignof(float) - 1) & ~(alignof(float) - 1);
     size += dim * sizeof(float);                     // query_buf
     size += sizeof(INDEX_T);                         // parent_buf
     size += CAND * sizeof(INDEX_T);                  // cand_idx
@@ -167,6 +170,7 @@ __host__ __device__ size_t GPURabitqSearch<BX>::shared_mem_bytes(
     size += RabitqQuery<BX>::shared_mem_bytes(dim);  // RabitqQuery region
     size = (size + alignof(uint64_t) - 1) & ~(alignof(uint64_t) - 1);
     size += static_cast<size_t>(degree) * bitcode_words * sizeof(uint64_t);
+    size = (size + alignof(float) - 1) & ~(alignof(float) - 1);
     size += 3 * static_cast<size_t>(degree) * sizeof(float);
     return size;
 }
@@ -224,10 +228,8 @@ __device__ void GPURabitqSearch<BX>::search(
 
         // merge candidates into topk
         {
-            float    d[1];
-            uint32_t x[1];
-            d[0] = (tid < CAND) ? cand_dist_[tid] : FLT_MAX;
-            x[0] = (tid < CAND) ? cand_idx_[tid]  : MAX_INDEX;
+            float d[1] = {(tid < CAND) ? cand_dist_[tid] : FLT_MAX};
+            uint32_t x[1] = {(tid < CAND) ? cand_idx_[tid]  : MAX_INDEX};
             topk_.merge(d, x);
         }
 

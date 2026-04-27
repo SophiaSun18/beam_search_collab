@@ -82,22 +82,27 @@ __device__ GPUBaseSearch<BX>::GPUBaseSearch(
     char*& smem, const GPUBaseSearchCfg& cfg, GPUGraphView graph)
     : topk_(smem, cfg.topk_size),
       hf_(smem, cfg.bitlen),
-      query_buf_  (reinterpret_cast<float*>(smem)),
-      parent_buf_ (reinterpret_cast<INDEX_T*>(smem + graph.dim() * sizeof(float))),
-      cand_idx_   (reinterpret_cast<INDEX_T*>(smem + graph.dim() * sizeof(float)
-                       + sizeof(INDEX_T))),
-      cand_dist_  (reinterpret_cast<DISTANCE_T*>(smem + graph.dim() * sizeof(float)
-                       + sizeof(INDEX_T)
-                       + CAND * sizeof(INDEX_T))),
       graph_(graph),
       cfg_(cfg),
       dim_(graph.dim()),
       max_degree_(graph.degree())
 {
-    smem += graph.dim() * sizeof(float)              // query_buf_
-          + sizeof(INDEX_T)                          // parent_buf_
-          + CAND * sizeof(INDEX_T)                   // cand_idx_
-          + CAND * sizeof(DISTANCE_T);               // cand_dist_
+    // align for float/uint32_t
+    smem = reinterpret_cast<char*>(
+        (reinterpret_cast<uintptr_t>(smem) + alignof(float) - 1)
+            & ~(static_cast<uintptr_t>(alignof(float)) - 1));
+
+    query_buf_  = reinterpret_cast<float*>(smem);
+    smem += graph.dim() * sizeof(float);
+
+    parent_buf_ = reinterpret_cast<INDEX_T*>(smem);
+    smem += sizeof(INDEX_T);
+
+    cand_idx_   = reinterpret_cast<INDEX_T*>(smem);
+    smem += CAND * sizeof(INDEX_T);
+
+    cand_dist_  = reinterpret_cast<DISTANCE_T*>(smem);
+    smem += CAND * sizeof(DISTANCE_T);
 }
 
 template <unsigned BX>
@@ -106,6 +111,7 @@ __host__ __device__ size_t GPUBaseSearch<BX>::shared_mem_bytes(
     size_t size = 0;
     size += SharedBitonicTopK<BX, 1>::shared_mem_bytes(cfg.topk_size);
     size += HashFilter::shared_mem_bytes(cfg.bitlen);
+    size = (size + alignof(float) - 1) & ~(alignof(float) - 1);
     size += dim * sizeof(float);                     // query_buf_
     size += sizeof(INDEX_T);                         // parent_buf_
     size += CAND * sizeof(INDEX_T);                  // cand_idx_

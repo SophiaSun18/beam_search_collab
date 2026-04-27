@@ -37,7 +37,7 @@ public:
      * @param ny      Number of instances (blockDim.y). Default 1.
      */
     __host__ __device__ static uint32_t shared_mem_bytes(unsigned bitlen, unsigned ny = 1) {
-        return ny * (1u << bitlen) * sizeof(uint32_t);
+        return (alignof(uint32_t) - 1) + ny * (1u << bitlen) * sizeof(uint32_t);
     }
 
     /**
@@ -69,6 +69,10 @@ __device__ inline HashFilter::HashFilter(uint32_t* table, unsigned bitlen)
 __device__ inline HashFilter::HashFilter(char*& smem, unsigned bitlen)
     : bitlen_(bitlen), size_(1u << bitlen), mask_((1u << bitlen) - 1)
 {
+    // Align for uint32_t.
+    smem = reinterpret_cast<char*>(
+        (reinterpret_cast<uintptr_t>(smem) + alignof(uint32_t) - 1)
+            & ~(static_cast<uintptr_t>(alignof(uint32_t)) - 1));
     // Each instance (threadIdx.y) gets its own table within block-wide smem.
     size_t per_inst = size_ * sizeof(uint32_t);
     table_ = reinterpret_cast<uint32_t*>(smem + threadIdx.y * per_inst);

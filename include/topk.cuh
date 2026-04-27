@@ -117,7 +117,8 @@ class SharedBitonicTopK : private BitonicScratchBase<(BX > 32)> {
      * @brief Shared memory bytes per instance (one topk buffer + scratch).
      */
     __host__ __device__ static size_t shared_mem_bytes_per_instance(unsigned topk) {
-        size_t size = topk * (sizeof(float) + sizeof(uint32_t));
+        size_t size = alignof(float) - 1;  // worst-case initial alignment
+        size += topk * (sizeof(float) + sizeof(uint32_t));
         if constexpr (BX > 32)
             size += N * (sizeof(float) + sizeof(uint32_t));
         return size;
@@ -211,6 +212,10 @@ __device__ SharedBitonicTopK<BX, REG>::SharedBitonicTopK(char*& smem, unsigned t
     const size_t per_inst = shared_mem_bytes_per_instance(topk);
     char* my = smem + threadIdx.y * per_inst;
 
+    // align for float/uint32_t
+    my = reinterpret_cast<char*>(
+        (reinterpret_cast<uintptr_t>(my) + alignof(float) - 1)
+            & ~(static_cast<uintptr_t>(alignof(float)) - 1));
     topk_dist = reinterpret_cast<float*>(my);
     topk_idx  = reinterpret_cast<uint32_t*>(my + topk * sizeof(float));
     my += topk * (sizeof(float) + sizeof(uint32_t));
