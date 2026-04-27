@@ -5,6 +5,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_ARCHITECTURES 89)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_INCLUDES 0)
 
 # ── Third-party interface libraries ──────────────────────────────────────────
 
