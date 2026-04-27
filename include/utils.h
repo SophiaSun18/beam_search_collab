@@ -326,14 +326,18 @@ inline float compute_distance_vec256(int dim, const float* __restrict__ a, const
         sum = _mm256_fmadd_ps(tmp_vec, tmp_vec, sum);
     }
     // horizontal add sum
-    return _mm256_reduce_add_ps(sum);
+    float dist = _mm256_reduce_add_ps(sum);
+    for (int i = static_cast<int>(niters) * 8; i < dim; ++i) {
+        const float diff = a[i] - b[i];
+        dist += diff * diff;
+    }
+    return dist;
 }
 #endif // __AVX2__
 
 #ifdef __AVX512F__
 // adapted from DiskANN
 inline float compute_distance_vec512(int dim, const float* __restrict__ a, const float* __restrict__ b) {
-    // assume size is divisible by 16
     uint16_t niters = (uint16_t)(dim / 16);
     __m512 sum = _mm512_setzero_ps();
     for (uint16_t j = 0; j < niters; j++) {
@@ -348,7 +352,12 @@ inline float compute_distance_vec512(int dim, const float* __restrict__ a, const
         sum = _mm512_fmadd_ps(tmp_vec, tmp_vec, sum);
     }
     // horizontal add sum
-    return _mm512_reduce_add_ps(sum);
+    float dist = _mm512_reduce_add_ps(sum);
+    for (int i = static_cast<int>(niters) * 16; i < dim; ++i) {
+        const float diff = a[i] - b[i];
+        dist += diff * diff;
+    }
+    return dist;
 }
 #endif // __AVX512F__
 
@@ -548,23 +557,23 @@ inline void fwht_inplace(float* data, size_t B) {
 
 inline void rotate_vector(const float* src, float* dst, const float* signs, 
                          size_t dim, size_t padded_dim) {
+    size_t i = 0;
 #ifdef __AVX512F__
-    for (size_t i = 0; i + 16 <= dim; i += 16) {
-        __m512 v_src   = _mm512_load_ps(src + i);
+    for (; i + 16 <= dim; i += 16) {
+        __m512 v_src   = _mm512_loadu_ps(src + i);
         __m512 v_signs = _mm512_loadu_ps(signs + i);
         _mm512_store_ps(dst + i, _mm512_mul_ps(v_src, v_signs));
     }
 #elif defined(__AVX2__)
-    for (size_t i = 0; i + 8 <= dim; i += 8) {
-        __m256 v_src   = _mm256_load_ps(src + i);
+    for (; i + 8 <= dim; i += 8) {
+        __m256 v_src   = _mm256_loadu_ps(src + i);
         __m256 v_signs = _mm256_loadu_ps(signs + i);
         _mm256_store_ps(dst + i, _mm256_mul_ps(v_src, v_signs));
     }
-#else
-    for (size_t i = 0; i < dim; i++) {
+#endif
+    for (; i < dim; i++) {
         dst[i] = src[i] * signs[i];
     }
-#endif
     if (padded_dim > dim) {
         std::fill(dst + dim, dst + padded_dim, 0.0f);
     }

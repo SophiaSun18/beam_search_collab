@@ -13,7 +13,7 @@
 #define LOG_WARP_SIZE 5
 #define WARPS_PER_BLOCK (BLOCK_SIZE / WARP_SIZE)
 
-#define GPU_HASH_BASE_BITLEN 10
+#define GPU_HASH_BASE_BITLEN 11
 #define GPU_HASH_BITLEN_FOR_TOPK(topk)                                            \
   (((topk) * 4 > 3 * (1 << GPU_HASH_BASE_BITLEN)) ? (GPU_HASH_BASE_BITLEN + 1) : GPU_HASH_BASE_BITLEN)
    
@@ -958,6 +958,10 @@ static __device__ inline void scan_all_neighbors_32_gpu(
     float exact_dist, int padded_dim, float* appro_dist, int active_neighbors = WARP_SIZE) {
   const int lane_id = threadIdx.x & (WARP_SIZE - 1);
   if (lane_id >= active_neighbors) return;
+  if (triple_x[lane_id] == FLT_MAX) {
+    appro_dist[lane_id] = 0.0f;
+    return;
+  }
 
   const int num_codebook = padded_dim >> 2;
   uint32_t raw_sum = 0;
