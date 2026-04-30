@@ -243,6 +243,13 @@ void QuantizedBeamSearch(
         topk_by_sort_candidates_and_merge<2, INTERNAL_TOPK / WARP_SIZE>(ALL_INDEX, ALL_DISTANCE, RESULT_BUFFER_SIZE,
             CANDIDATE_BUFFER_SIZE, INTERNAL_TOPK, (iter == 0));
         __syncthreads();
+        
+        // clear the candidate buffer before next iteration to avoid stale entries
+        for (int i = tid; i < CANDIDATE_BUFFER_SIZE; i += blockDim.x) {
+            CANDIDATE_INDEX[i] = MAX_INDEX;
+            CANDIDATE_DISTANCE[i] = FLT_MAX;
+        }
+        __syncthreads();
         if (GPU_DISTANCE_TIMING && tid == 0) {
             atomicAdd(&timing[GPU_TIMING_SORT_CYCLES], gpu_globaltimer() - sort_start);
         }
@@ -397,9 +404,8 @@ void QuantizedBeamSearch(
                 if (lane_id < active_neighbors) {
                     const int candidate_idx = batch_begin + lane_id;
                     const bool invalid_candidate = (CANDIDATE_INDEX[candidate_idx] == MAX_INDEX);
-                    const bool invalid_factor = (triple_x[lane_id] == FLT_MAX);
                     const bool invalid_distance = !isfinite(CANDIDATE_DISTANCE[candidate_idx]);
-                    if (invalid_candidate || invalid_factor || invalid_distance) {
+                    if (invalid_candidate || invalid_distance) {
                         CANDIDATE_DISTANCE[candidate_idx] = FLT_MAX;
                     }
                 }
