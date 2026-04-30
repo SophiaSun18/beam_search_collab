@@ -152,9 +152,14 @@ void BeamSearch(
         }
       
         // use warp level sort to find the actual closest top K elements and update the topK list
+        gpu_long_t sort_start = 0;
+        if (GPU_DISTANCE_TIMING && tid == 0) sort_start = gpu_globaltimer();
         topk_by_sort_candidates_and_merge<2, INTERNAL_TOPK / WARP_SIZE>(ALL_INDEX, ALL_DISTANCE, RESULT_BUFFER_SIZE,
             CANDIDATE_BUFFER_SIZE, INTERNAL_TOPK, (iter == 0));
         __syncthreads();
+        if (GPU_DISTANCE_TIMING && tid == 0) {
+            atomicAdd(&timing[GPU_TIMING_SORT_CYCLES], gpu_globaltimer() - sort_start);
+        }
 
         if (debug_mode && query_id == 0 && tid == 0) {
             printf("[DEBUG] iteration %d\n", iter + 1);
@@ -179,10 +184,15 @@ void BeamSearch(
 
         // warp 0 pick the top-N unexpanded nodes and store in shared memory
         // this already marks the expanded nodes MSB to 1, no need to mark again
+        gpu_long_t pick_start = 0;
+        if (GPU_DISTANCE_TIMING && tid == 0) pick_start = gpu_globaltimer();
         if (warp_id == 0) {
             keep_expanding = pick_expanders(SEARCH_WIDTH, PARENT_LIST, INTERNAL_TOPK, TOP_K_INDEX);
         }
         __syncthreads();
+        if (GPU_DISTANCE_TIMING && tid == 0) {
+            atomicAdd(&timing[GPU_TIMING_PICK_CYCLES], gpu_globaltimer() - pick_start);
+        }
         if (debug_mode && query_id == 0 && tid == 0) {
             const INDEX_T parent_slot = PARENT_LIST[0];
             const INDEX_T parent_raw =
@@ -219,6 +229,8 @@ void BeamSearch(
         }
         __syncthreads();
 
+        gpu_long_t visited_start = 0;
+        if (GPU_DISTANCE_TIMING && tid == 0) visited_start = gpu_globaltimer();
         for (int i = tid; i < CANDIDATE_BUFFER_SIZE; i += blockDim.x) {
             INDEX_T child_id = (i < maxDegree) ? neighbors[i] : MAX_INDEX;      // only in-bound threads take from the neighbor list
 
@@ -233,6 +245,9 @@ void BeamSearch(
             CANDIDATE_INDEX[i] = child_id;
         }
         __syncthreads();
+        if (GPU_DISTANCE_TIMING && tid == 0) {
+            atomicAdd(&timing[GPU_TIMING_VISITED_CYCLES], gpu_globaltimer() - visited_start);
+        }
 
         // all warps work together to compute candidate distance
         for (int i = warp_id; i < CANDIDATE_BUFFER_SIZE; i += WARPS_PER_BLOCK) {
@@ -256,9 +271,14 @@ void BeamSearch(
     }
 
     // final sort before writeback
+    gpu_long_t final_sort_start = 0;
+    if (GPU_DISTANCE_TIMING && tid == 0) final_sort_start = gpu_globaltimer();
     topk_by_sort_candidates_and_merge<2, INTERNAL_TOPK / WARP_SIZE>(ALL_INDEX, ALL_DISTANCE, RESULT_BUFFER_SIZE,
         CANDIDATE_BUFFER_SIZE, INTERNAL_TOPK, false);
     __syncthreads();
+    if (GPU_DISTANCE_TIMING && tid == 0) {
+        atomicAdd(&timing[GPU_TIMING_FINAL_SORT_CYCLES], gpu_globaltimer() - final_sort_start);
+    }
 
     // return the top K result
     for (int i = tid; i < K; i += blockDim.x) {

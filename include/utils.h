@@ -839,9 +839,27 @@ inline size_t count_duplicate_estimates(
     return duplicates;
 }
 
+inline vidType debug_candidate_node(const std::pair<vidType, float>& candidate) {
+    return candidate.first;
+}
+
+inline float debug_candidate_dist(const std::pair<vidType, float>& candidate) {
+    return candidate.second;
+}
+
+template <typename CandidateT>
+inline vidType debug_candidate_node(const CandidateT& candidate) {
+    return candidate.vid;
+}
+
+template <typename CandidateT>
+inline float debug_candidate_dist(const CandidateT& candidate) {
+    return candidate.dist;
+}
+
 inline void debug_print_candidate_entry(const std::pair<vidType, float>& candidate) {
-    cout << "    node=" << candidate.first
-         << ", est_dist=" << fixed << setprecision(6) << candidate.second << "\n";
+    cout << "    node=" << debug_candidate_node(candidate)
+         << ", est_dist=" << fixed << setprecision(6) << debug_candidate_dist(candidate) << "\n";
 }
 
 template <typename CandidateT>
@@ -858,8 +876,8 @@ inline void debug_print_candidates(
     for (size_t i = 0; i < candidates.size(); ++i) {
         const auto& candidate = candidates[i];
         cout << "    idx=" << i
-             << ", node=" << candidate.vid
-             << ", dist=" << fixed << setprecision(6) << candidate.dist << "\n";
+             << ", node=" << debug_candidate_node(candidate)
+             << ", dist=" << fixed << setprecision(6) << debug_candidate_dist(candidate) << "\n";
     }
 }
 

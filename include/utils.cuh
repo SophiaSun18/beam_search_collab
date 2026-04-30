@@ -6,6 +6,7 @@
 #include <iostream>
 #include <stdio.h>
 #include <cuda_runtime.h>
+#include <cub/cub.cuh>
 
 #define FULL_MASK     0xffffffff
 #define BLOCK_SIZE    256
@@ -559,6 +560,110 @@ __device__ void topk_by_candidate_sort_and_merge(
   (void)first;
 }
 
+template <unsigned kPerThread>
+__device__ __forceinline__ void merge_tail_candidates(
+    INDEX_T* result_indices_ptr,
+    DISTANCE_T* result_distances_ptr,
+    INDEX_T* candidate_indices,
+    DISTANCE_T* candidate_distances,
+    uint32_t CANDIDATE_BUFFER_SIZE,
+    uint32_t internal_topk,
+    unsigned lane_id) {
+  DISTANCE_T merge_keys[kPerThread];
+  INDEX_T merge_vals[kPerThread];
+  const uint32_t tail_begin = internal_topk - CANDIDATE_BUFFER_SIZE;
+
+  #pragma unroll
+  for (unsigned i = 0; i < kPerThread; ++i) {
+    const uint32_t j = lane_id + (WARP_SIZE * i);
+    if (j < CANDIDATE_BUFFER_SIZE) {
+      merge_keys[i] = result_distances_ptr[tail_begin + j];
+      merge_vals[i] = result_indices_ptr[tail_begin + j];
+    } else {
+      const uint32_t cj = j - CANDIDATE_BUFFER_SIZE;
+      merge_keys[i] = candidate_distances[cj];
+      merge_vals[i] = candidate_indices[cj];
+    }
+  }
+
+  warp_sort<float, uint32_t, kPerThread>(merge_keys, merge_vals);
+
+  #pragma unroll
+  for (unsigned i = 0; i < kPerThread; ++i) {
+    const uint32_t j = (kPerThread * lane_id) + i;
+    if (j < CANDIDATE_BUFFER_SIZE) {
+      result_distances_ptr[tail_begin + j] = merge_keys[i];
+      result_indices_ptr[tail_begin + j] = merge_vals[i];
+    }
+  }
+}
+
+template <unsigned N_1, unsigned N_2>
+__device__ void topk_by_tail_compare_radix_sort(
+    INDEX_T* result_indices_ptr,
+    DISTANCE_T* result_distances_ptr,
+    uint32_t RESULT_BUFFER_SIZE,
+    uint32_t CANDIDATE_BUFFER_SIZE,
+    uint32_t internal_topk) {
+  // step 1: sort the candidate buffer by bitonic sort
+  auto candidate_indices = result_indices_ptr + internal_topk;
+  auto candidate_distances = result_distances_ptr + internal_topk;
+
+  candidate_by_bitonic_sort<N_1, 0>(candidate_indices, candidate_distances, CANDIDATE_BUFFER_SIZE);
+  __syncthreads();
+
+  // step 2: load the tail of current TOPK, size = CANDIDATE_BUFFER_SIZE, to registers
+  // then do a bitonic sort on the tail of TOPK and current candidates
+  // final result: unsorted TOPK with the worst part replaced by candidates
+  const unsigned lane_id = threadIdx.x % WARP_SIZE;
+  const unsigned warp_id = threadIdx.x / WARP_SIZE;
+  if (warp_id == 0) {
+    assert(internal_topk >= CANDIDATE_BUFFER_SIZE);
+    if (CANDIDATE_BUFFER_SIZE == 32) {
+      merge_tail_candidates<2>(
+          result_indices_ptr, result_distances_ptr,
+          candidate_indices, candidate_distances,
+          CANDIDATE_BUFFER_SIZE, internal_topk, lane_id);
+    } else {
+      assert(CANDIDATE_BUFFER_SIZE == 64);
+      merge_tail_candidates<4>(
+          result_indices_ptr, result_distances_ptr,
+          candidate_indices, candidate_distances,
+          CANDIDATE_BUFFER_SIZE, internal_topk, lane_id);
+    }
+  }
+  __syncthreads();
+
+  // step 3: call external library cub to do radix sort on the TOPK
+  constexpr unsigned TopKPerThread = (N_2 * WARP_SIZE + BLOCK_SIZE - 1) / BLOCK_SIZE;
+  using TopkRadixSort = cub::BlockRadixSort<DISTANCE_T, BLOCK_SIZE, TopKPerThread, INDEX_T>;
+  __shared__ typename TopkRadixSort::TempStorage radix_sort_storage;
+
+  DISTANCE_T topk_dist[TopKPerThread];
+  INDEX_T topk_idx[TopKPerThread];
+  for (unsigned i = 0; i < TopKPerThread; ++i) {
+    const uint32_t j = (threadIdx.x * TopKPerThread) + i;
+    if (j < internal_topk) {
+      topk_dist[i] = result_distances_ptr[j];
+      topk_idx[i] = result_indices_ptr[j];
+    } else {
+      topk_dist[i] = FLT_MAX;
+      topk_idx[i] = MAX_INDEX;
+    }
+  }
+  TopkRadixSort(radix_sort_storage).Sort(topk_dist, topk_idx);
+  for (unsigned i = 0; i < TopKPerThread; ++i) {
+    const uint32_t j = (threadIdx.x * TopKPerThread) + i;
+    if (j < internal_topk) {
+      result_distances_ptr[j] = topk_dist[i];
+      result_indices_ptr[j] = topk_idx[i];
+    }
+  }
+  __syncthreads();
+
+  (void)RESULT_BUFFER_SIZE;
+}
+
 template <unsigned N_1, unsigned N_2>
 __device__ void topk_by_sort_candidates_and_merge(
     INDEX_T* result_indices_ptr,
@@ -575,6 +680,9 @@ __device__ void topk_by_sort_candidates_and_merge(
     topk_by_candidate_sort_and_merge<N_1, N_2>(
         result_indices_ptr, result_distances_ptr, RESULT_BUFFER_SIZE,
         CANDIDATE_BUFFER_SIZE, internal_topk, first);
+    // tok_by_tail_compare_radix_sort<N_1, N_2>(
+    //     result_indices_ptr, result_distances_ptr, RESULT_BUFFER_SIZE,
+    //     CANDIDATE_BUFFER_SIZE, internal_topk);
   }
 }
 

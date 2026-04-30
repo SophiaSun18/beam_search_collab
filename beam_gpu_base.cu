@@ -130,7 +130,7 @@ void IndexGraph<T>::search(int nq, const T* queries, int K, T *result_vec, vid_t
   printf("Max active blocks per SM = %d\n", numBlocksPerSM);
 
   // Execute the search
-  printf("\nStarting GPU %sbeam search...\n");
+  printf("\nStarting GPU beam search...\n");
   auto start = std::chrono::high_resolution_clock::now();
   BeamSearch<T><<<num_blocks, num_threads, shm_size>>>(K, nq, dim, npoints, d_queries, d_data, d_results, 
                                                          d_total_stats, d_total_timing, d_starting_points, d_seed_map, d_sign_bit, gg, debug_mode);
