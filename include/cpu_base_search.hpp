@@ -12,8 +12,6 @@ struct CPUBaseSearchCfg {
     unsigned topk_size;
     vid_t    entry_point;
     int      max_iterations;
-    bool     trace_first_query = false;
-    int      trace_iterations = 0;
 };
 
 class CPUBaseSearch {
@@ -21,7 +19,7 @@ public:
     CPUBaseSearch(const CPUGraph& graph, const CPUBaseSearchCfg& cfg)
         : graph_(graph), cfg_(cfg) {}
 
-    void search(const float* query, vid_t* results, int K, bool trace = false) const {
+    void search(const float* query, vid_t* results, int K) const {
         struct BeamEntry {
             float dist;
             vid_t node;
@@ -58,9 +56,6 @@ public:
             if (it == beam.end()) break;
 
             const vid_t current = it->node;
-            if (trace && iter < cfg_.trace_iterations) {
-                std::cout << "cpu iter " << iter << " expand " << current << "\n";
-            }
             it->expanded = true;
             for (vid_t child : graph_.nbrs(current)) {
                 if (!seen.insert(child).second) continue;

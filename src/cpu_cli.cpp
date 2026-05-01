@@ -151,9 +151,6 @@ int main() {
     cfg.topk_size = js.value("topk_size", 256u);
     cfg.entry_point = entry_point;
     cfg.max_iterations = js.value("max_iterations", 1024);
-    cfg.trace_first_query = js.value("trace_first_query", false);
-    cfg.trace_iterations = js.value("trace_iterations", 0);
-
     CPUBaseSearch searcher(cpu_graph, cfg);
     std::vector<vid_t> h_results(nq * static_cast<size_t>(K));
 
@@ -161,8 +158,7 @@ int main() {
     auto start = std::chrono::high_resolution_clock::now();
     for (size_t qid = 0; qid < nq; ++qid) {
         searcher.search(h_queries + qid * static_cast<size_t>(dim),
-                        h_results.data() + qid * static_cast<size_t>(K), K,
-                        cfg.trace_first_query && qid == 0);
+                        h_results.data() + qid * static_cast<size_t>(K), K);
     }
     auto end = std::chrono::high_resolution_clock::now();
 

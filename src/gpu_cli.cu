@@ -181,14 +181,17 @@ static void run_base(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
                          static_cast<int>(smem)));
 
+    constexpr int NRUNS = 5;
     auto start = std::chrono::high_resolution_clock::now();
-    kernel_base_search<<<num_blocks, CLI_BLOCK_SIZE, smem>>>(
-        gpu_graph.view(), cfg, nq, dim, d_queries, d_results, K);
-    CUDA_CHECK(cudaGetLastError());
+    for (int r = 0; r < NRUNS; r++) {
+        kernel_base_search<<<num_blocks, CLI_BLOCK_SIZE, smem>>>(
+            gpu_graph.view(), cfg, nq, dim, d_queries, d_results, K);
+        CUDA_CHECK(cudaGetLastError());
+    }
     CUDA_CHECK(cudaDeviceSynchronize());
     auto end = std::chrono::high_resolution_clock::now();
 
-    double elapsed = std::chrono::duration<double>(end - start).count();
+    double elapsed = std::chrono::duration<double>(end - start).count() / NRUNS;
     std::cout << "  time: " << elapsed * 1000.0 << " ms"
               << "  qps: " << nq / elapsed << std::endl;
 }
@@ -206,14 +209,17 @@ static void run_warp(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
                          static_cast<int>(smem)));
 
+    constexpr int NRUNS = 5;
     auto start = std::chrono::high_resolution_clock::now();
-    kernel_warp_search<NY><<<num_blocks, block, smem>>>(
-        gpu_graph.view(), cfg, nq, dim, d_queries, d_results, K);
-    CUDA_CHECK(cudaGetLastError());
+    for (int r = 0; r < NRUNS; r++) {
+        kernel_warp_search<NY><<<num_blocks, block, smem>>>(
+            gpu_graph.view(), cfg, nq, dim, d_queries, d_results, K);
+        CUDA_CHECK(cudaGetLastError());
+    }
     CUDA_CHECK(cudaDeviceSynchronize());
     auto end = std::chrono::high_resolution_clock::now();
 
-    double elapsed = std::chrono::duration<double>(end - start).count();
+    double elapsed = std::chrono::duration<double>(end - start).count() / NRUNS;
     std::cout << "  time: " << elapsed * 1000.0 << " ms"
               << "  qps: " << nq / elapsed << std::endl;
 }
@@ -231,15 +237,18 @@ static void run_rabitq(const GPUGraph& gpu_graph, const GPURabitq& gpu_rabitq,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
                          static_cast<int>(smem)));
 
+    constexpr int NRUNS = 5;
     auto start = std::chrono::high_resolution_clock::now();
-    kernel_rabitq_search<<<num_blocks, CLI_BLOCK_SIZE, smem>>>(
-        gpu_graph.view(), gpu_rabitq.view(), cfg, nq, dim,
-        d_queries, d_results, K);
-    CUDA_CHECK(cudaGetLastError());
+    for (int r = 0; r < NRUNS; r++) {
+        kernel_rabitq_search<<<num_blocks, CLI_BLOCK_SIZE, smem>>>(
+            gpu_graph.view(), gpu_rabitq.view(), cfg, nq, dim,
+            d_queries, d_results, K);
+        CUDA_CHECK(cudaGetLastError());
+    }
     CUDA_CHECK(cudaDeviceSynchronize());
     auto end = std::chrono::high_resolution_clock::now();
 
-    double elapsed = std::chrono::duration<double>(end - start).count();
+    double elapsed = std::chrono::duration<double>(end - start).count() / NRUNS;
     std::cout << "  time: " << elapsed * 1000.0 << " ms"
               << "  qps: " << nq / elapsed << std::endl;
 }
@@ -339,7 +348,6 @@ int main() {
         cfg.entry_point    = entry_point;
         cfg.max_iterations = js.value("max_iterations", 1024);
         cfg.reset_interval = js.value("reset_interval", 16);
-        cfg.trace_iterations = js.value("trace_iterations", 0);
 
         if (mode == "base") {
             run_base(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
@@ -355,16 +363,6 @@ int main() {
 
     // ── results ─────────────────────────────────────────────────────────
     CUDA_CHECK(cudaMemcpy(h_results.data(), d_results, nq * K * sizeof(vid_t), cudaMemcpyDeviceToHost));
-    std::cout << "pred[0]:";
-    for (int i = 0; i < K; ++i) {
-        std::cout << ' ' << h_results[static_cast<size_t>(i)];
-    }
-    std::cout << std::endl;
-    std::cout << "gt[0]:";
-    for (int i = 0; i < gt_k; ++i) {
-        std::cout << ' ' << h_gt[static_cast<size_t>(i)];
-    }
-    std::cout << std::endl;
     float recall = compute_recall(h_results.data(), h_gt, nq, K, gt_k);
     std::cout << "recall@" << K << ": " << recall << std::endl;
 

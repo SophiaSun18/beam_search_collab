@@ -22,7 +22,6 @@ struct GPUBaseSearchCfg {
     vid_t    entry_point;
     int      max_iterations;
     int      reset_interval;
-    int      trace_iterations;
 };
 
 /**
@@ -200,8 +199,6 @@ __device__ void GPUBaseSearch<BX>::search(
             if (warp_id == 0 && lane_id == 0) {
                 keep_expanding = found;
                 if (found > 0) parent_buf_[0] = picked;
-                if (found > 0 && blockIdx.x == 0 && iter < cfg_.trace_iterations)
-                    printf("gpu iter %d expand %u\n", iter, picked);
             }
         }
         __syncthreads();
@@ -231,13 +228,6 @@ __device__ void GPUBaseSearch<BX>::search(
                 cand_dist_[i] = d;
         }
         __syncthreads();
-        if (blockIdx.x == 0 && iter == 0 && tid == 0) {
-            for (unsigned i = 0; i < CAND; ++i) {
-                if (cand_idx_[i] != MAX_INDEX) {
-                    printf("gpu cand %u node %u dist %.0f\n", i, cand_idx_[i], cand_dist_[i]);
-                }
-            }
-        }
     }
 
     // ── final merge (catch unmerged candidates from last iteration) ─────
