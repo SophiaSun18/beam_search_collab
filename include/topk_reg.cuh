@@ -28,28 +28,38 @@ class RegBitonicTopK {
 public:
     __device__ RegBitonicTopK();
 
+    /**
+     * @brief Merge incoming candidates into the descending internal buffer.
+     *
+     * Input may be unsorted. REGX must be divisible by REGY. The merge
+     * sorts incoming, then sweeps through the topk in REGY-sized chunks
+     * via butterfly, keeping the smallest 32*REGX elements.
+     */
     __device__ void merge(float (&dist)[REGY], uint32_t (&idx)[REGY]);
 
+    /**
+     * @brief Pick up to n unmarked nodes with the smallest distances.
+     *
+     * Scans from the tail (smallest). Unmarked means MSB==0 and not
+     * 0xFFFFFFFF. Found nodes are marked (MSB set). Lane 0 receives
+     * the picked node IDs in out[0..found-1].
+     */
     __device__ unsigned pick(uint32_t (&out)[32 * REGY], unsigned n);
 
+    /**
+     * @brief Flush the n smallest elements to memory.
+     *
+     * Reads from the tail of the descending buffer. Clears MSB marks.
+     */
     __device__ void flush(float* dist, uint32_t* idx, unsigned n);
 
-    __device__ unsigned capacity() const { return 32 * REGX; }
+    /** @brief Number of slots in the buffer. */
+    __device__ unsigned capacity() const;
 
-    __device__ uint32_t id(unsigned pos) const {
-        unsigned src_lane = pos / REGX;
-        unsigned src_reg  = pos % REGX;
-        uint32_t val = 0xFFFFFFFF;
-        for (unsigned r = 0; r < REGX; r++) {
-            uint32_t tmp = __shfl_sync(0xffffffff, topk_i_[r], src_lane);
-            if (r == src_reg) val = tmp;
-        }
-        return val & ~0x80000000u;
-    }
+    /** @brief Node ID at position pos (MSB cleared). 0xFFFFFFFF for empty. */
+    __device__ uint32_t id(unsigned pos) const;
 
 private:
-    // ── warp-level bitonic sort primitives (shuffle-only, no smem) ──────
-
     template <bool asc, unsigned N>
     __device__ static void sort_local(float (&d)[N], uint32_t (&i)[N]);
 
@@ -74,6 +84,23 @@ __device__ RegBitonicTopK<REGX, REGY>::RegBitonicTopK() {
         topk_d_[j] = FLT_MAX;
         topk_i_[j] = 0xFFFFFFFF;
     }
+}
+
+template <unsigned REGX, unsigned REGY>
+__device__ unsigned RegBitonicTopK<REGX, REGY>::capacity() const {
+    return 32 * REGX;
+}
+
+template <unsigned REGX, unsigned REGY>
+__device__ uint32_t RegBitonicTopK<REGX, REGY>::id(unsigned pos) const {
+    unsigned src_lane = pos / REGX;
+    unsigned src_reg  = pos % REGX;
+    uint32_t val = 0xFFFFFFFF;
+    for (unsigned r = 0; r < REGX; r++) {
+        uint32_t tmp = __shfl_sync(0xffffffff, topk_i_[r], src_lane);
+        if (r == src_reg) val = tmp;
+    }
+    return val & ~0x80000000u;
 }
 
 // ── merge ───────────────────────────────────────────────────────────────────
@@ -185,8 +212,10 @@ __device__ void RegBitonicTopK<REGX, REGY>::flush(
     }
 }
 
-// ── sort_local ──────────────────────────────────────────────────────────────
-
+/**
+ * @brief Bitonic sort of N key-value pairs within a single thread.
+ *        No cross-thread communication.
+ */
 template <unsigned REGX, unsigned REGY>
 template <bool asc, unsigned N>
 __device__ void RegBitonicTopK<REGX, REGY>::sort_local(
@@ -211,11 +240,12 @@ __device__ void RegBitonicTopK<REGX, REGY>::sort_local(
     }
 }
 
-// ── sort_warp ───────────────────────────────────────────────────────────────
-//
-// Bitonic sort of 32*N key-value pairs (N per thread). Input must already
-// be locally sorted within each thread. Uses __shfl_xor_sync only.
-
+/**
+ * @brief Bitonic sort of 32*N key-value pairs (N per thread).
+ *
+ * Input must already be locally sorted within each thread.
+ * Uses __shfl_xor_sync only.
+ */
 template <unsigned REGX, unsigned REGY>
 template <bool asc, unsigned N>
 __device__ void RegBitonicTopK<REGX, REGY>::sort_warp(
@@ -262,10 +292,10 @@ __device__ void RegBitonicTopK<REGX, REGY>::sort_warp(
     }
 }
 
-// ── sort_warp_full ──────────────────────────────────────────────────────────
-//
-// Full bitonic sort from arbitrary order. Always ascending.
-
+/**
+ * @brief Full bitonic sort of 32*N key-value pairs from arbitrary order.
+ *        Always produces ascending output.
+ */
 template <unsigned REGX, unsigned REGY>
 template <unsigned N>
 __device__ void RegBitonicTopK<REGX, REGY>::sort_warp_full(
@@ -310,8 +340,7 @@ __device__ void RegBitonicTopK<REGX, REGY>::sort_warp_full(
     }
 }
 
-// ── butterfly ───────────────────────────────────────────────────────────────
-
+/** @brief Pairwise min/max split on N register pairs. */
 template <unsigned REGX, unsigned REGY>
 template <unsigned N>
 __device__ void RegBitonicTopK<REGX, REGY>::butterfly(
