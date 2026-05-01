@@ -25,6 +25,12 @@ concept TopKBuffer = requires(
 
     // Write internal storage out to result arrays (e.g. global memory).
     { buf.flush((float*)nullptr, (uint32_t*)nullptr, n) } -> std::same_as<void>;
+
+    // Number of slots in the buffer.
+    { buf.capacity() } -> std::convertible_to<unsigned>;
+
+    // Node ID at position pos (MSB cleared). 0xFFFFFFFF for empty slots.
+    { buf.id(n) } -> std::convertible_to<uint32_t>;
 };
 
 /**
@@ -167,6 +173,14 @@ class SharedBitonicTopK : private BitonicScratchBase<(BX > 32)> {
      * @param n     Number of elements to write, must be <= topk.
      */
     __device__ void flush(float* dist, uint32_t* idx, unsigned n);
+    /**
+     * @brief Number of slots in the buffer.
+     */
+    __device__ unsigned capacity() const { return topk; }
+    /**
+     * @brief Node ID at position pos (MSB cleared). Returns 0xFFFFFFFF for empty slots.
+     */
+    __device__ uint32_t id(unsigned pos) const { return topk_idx[pos] & ~0x80000000u; }
     // -- helpers
     template <bool asc = true>
     __device__ static inline void bitonic_sort_local(
