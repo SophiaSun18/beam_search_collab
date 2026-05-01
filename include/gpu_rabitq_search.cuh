@@ -20,8 +20,6 @@ typedef float    DISTANCE_T;
 #define MAX_INDEX UINT_MAX
 #endif
 
-#define GPU_RABITQ_SEARCH_CANDIDATE_BUFFER_SIZE 64
-
 struct GPURabitqSearchCfg {
     unsigned topk_size;
     unsigned bitlen;
@@ -42,14 +40,12 @@ struct GPURabitqSearchCfg {
  */
 template <unsigned BX>
 class GPURabitqSearch {
-    static constexpr unsigned CAND = GPU_RABITQ_SEARCH_CANDIDATE_BUFFER_SIZE;
-
     SharedBitonicTopK<BX, 1> topk_;
     HashFilter               hf_;
     float*                   query_buf_;     // dim floats
     INDEX_T*                 parent_buf_;    // 1 element
-    INDEX_T*                 cand_idx_;      // CAND elements
-    DISTANCE_T*              cand_dist_;     // CAND elements
+    INDEX_T*                 cand_idx_;      // max_degree_ elements
+    DISTANCE_T*              cand_dist_;     // max_degree_ elements
     char*                    query_smem_;    // saved pointer for RabitqQuery
     uint64_t*                staged_codes_;
     float*                   staged_factors_;
@@ -124,10 +120,10 @@ __device__ GPURabitqSearch<BX>::GPURabitqSearch(
     smem += sizeof(INDEX_T);
 
     cand_idx_   = reinterpret_cast<INDEX_T*>(smem);
-    smem += CAND * sizeof(INDEX_T);
+    smem += max_degree_ * sizeof(INDEX_T);
 
     cand_dist_  = reinterpret_cast<DISTANCE_T*>(smem);
-    smem += CAND * sizeof(DISTANCE_T);
+    smem += max_degree_ * sizeof(DISTANCE_T);
 
     // reserve region for RabitqQuery (constructed later in search())
     query_smem_ = smem;
@@ -165,8 +161,8 @@ __host__ __device__ size_t GPURabitqSearch<BX>::shared_mem_bytes(
     size = (size + alignof(float) - 1) & ~(alignof(float) - 1);
     size += dim * sizeof(float);                     // query_buf
     size += sizeof(INDEX_T);                         // parent_buf
-    size += CAND * sizeof(INDEX_T);                  // cand_idx
-    size += CAND * sizeof(DISTANCE_T);               // cand_dist
+    size += degree * sizeof(INDEX_T);                 // cand_idx
+    size += degree * sizeof(DISTANCE_T);              // cand_dist
     size += RabitqQuery<BX>::shared_mem_bytes(dim);  // RabitqQuery region
     size = (size + alignof(uint64_t) - 1) & ~(alignof(uint64_t) - 1);
     size += static_cast<size_t>(degree) * bitcode_words * sizeof(uint64_t);
@@ -197,7 +193,7 @@ __device__ void GPURabitqSearch<BX>::search(
     __syncthreads();
 
     // ── init candidate buffer ───────────────────────────────────────
-    for (unsigned i = tid; i < CAND; i += BX) {
+    for (unsigned i = tid; i < max_degree_; i += BX) {
         cand_idx_[i]  = MAX_INDEX;
         cand_dist_[i] = FLT_MAX;
     }
@@ -207,7 +203,7 @@ __device__ void GPURabitqSearch<BX>::search(
 
     // ── seed entry point with L2 distance ────────────────��──────────
     if (warp_id == 0) {
-        DISTANCE_T d = l2_warp_distance(dim, query_buf_,
+        DISTANCE_T d = l2_warp(dim, query_buf_,
                                          graph_.vect(cfg_.entry_point).data());
         if (lane_id == 0) {
             cand_idx_[0]  = cfg_.entry_point;
@@ -231,8 +227,8 @@ __device__ void GPURabitqSearch<BX>::search(
 
         // merge candidates into topk
         {
-            float d[1] = {(tid < CAND) ? cand_dist_[tid] : FLT_MAX};
-            uint32_t x[1] = {(tid < CAND) ? cand_idx_[tid]  : MAX_INDEX};
+            float d[1] = {(tid < max_degree_) ? cand_dist_[tid] : FLT_MAX};
+            uint32_t x[1] = {(tid < max_degree_) ? cand_idx_[tid]  : MAX_INDEX};
             topk_.merge(d, x);
         }
 
@@ -275,13 +271,13 @@ __device__ void GPURabitqSearch<BX>::search(
                     static_cast<int>(3 * max_degree_));
 
         // L2 distance to expanding node (all warps collaborate)
-        DISTANCE_T exact_dist = l2_warp_distance(
+        DISTANCE_T exact_dist = l2_warp(
             dim, query_buf_, graph_.vect(current_node).data());
 
         // fill candidate buffer with neighbors, filtered by hash
         Span<const vid_t> nbrs = graph_.nbrs(current_node);
-        for (unsigned i = tid; i < CAND; i += BX) {
-            INDEX_T child = (i < max_degree_) ? nbrs[i] : MAX_INDEX;
+        for (unsigned i = tid; i < max_degree_; i += BX) {
+            INDEX_T child = nbrs[i];
             if (child != MAX_INDEX && hf_.contains(child))
                 child = MAX_INDEX;
             cand_idx_[i]  = child;
@@ -324,8 +320,8 @@ __device__ void GPURabitqSearch<BX>::search(
     {
         float    d[1];
         uint32_t x[1];
-        d[0] = (tid < CAND) ? cand_dist_[tid] : FLT_MAX;
-        x[0] = (tid < CAND) ? cand_idx_[tid]  : MAX_INDEX;
+        d[0] = (tid < max_degree_) ? cand_dist_[tid] : FLT_MAX;
+        x[0] = (tid < max_degree_) ? cand_idx_[tid]  : MAX_INDEX;
         topk_.merge(d, x);
     }
 

@@ -14,8 +14,6 @@ typedef uint32_t INDEX_T;
 typedef float    DISTANCE_T;
 #define MAX_INDEX UINT_MAX
 
-#define GPU_BASE_SEARCH_CANDIDATE_BUFFER_SIZE 64
-
 struct GPUBaseSearchCfg {
     unsigned topk_size;
     unsigned bitlen;
@@ -35,14 +33,12 @@ struct GPUBaseSearchCfg {
  */
 template <unsigned BX>
 class GPUBaseSearch {
-    static constexpr unsigned CAND = GPU_BASE_SEARCH_CANDIDATE_BUFFER_SIZE;
-
     SharedBitonicTopK<BX, 1> topk_;
     HashFilter               hf_;
     float*                   query_buf_;    // dim floats in shared memory
     INDEX_T*                 parent_buf_;   // 1 element in shared memory
-    INDEX_T*                 cand_idx_;     // CAND elements
-    DISTANCE_T*              cand_dist_;    // CAND elements
+    INDEX_T*                 cand_idx_;     // max_degree_ elements
+    DISTANCE_T*              cand_dist_;    // max_degree_ elements
 
     GPUGraphView             graph_;
     GPUBaseSearchCfg         cfg_;
@@ -72,7 +68,7 @@ public:
      * @brief Total shared memory bytes needed for construction.
      */
     __host__ __device__ static size_t shared_mem_bytes(
-        const GPUBaseSearchCfg& cfg, unsigned dim);
+        const GPUBaseSearchCfg& cfg, unsigned dim, unsigned degree);
 };
 
 // ── implementation ──────────────────────────────────────────────────────────
@@ -99,23 +95,23 @@ __device__ GPUBaseSearch<BX>::GPUBaseSearch(
     smem += sizeof(INDEX_T);
 
     cand_idx_   = reinterpret_cast<INDEX_T*>(smem);
-    smem += CAND * sizeof(INDEX_T);
+    smem += max_degree_ * sizeof(INDEX_T);
 
     cand_dist_  = reinterpret_cast<DISTANCE_T*>(smem);
-    smem += CAND * sizeof(DISTANCE_T);
+    smem += max_degree_ * sizeof(DISTANCE_T);
 }
 
 template <unsigned BX>
 __host__ __device__ size_t GPUBaseSearch<BX>::shared_mem_bytes(
-    const GPUBaseSearchCfg& cfg, unsigned dim) {
+    const GPUBaseSearchCfg& cfg, unsigned dim, unsigned degree) {
     size_t size = 0;
     size += SharedBitonicTopK<BX, 1>::shared_mem_bytes(cfg.topk_size);
     size += HashFilter::shared_mem_bytes(cfg.bitlen);
     size = (size + alignof(float) - 1) & ~(alignof(float) - 1);
     size += dim * sizeof(float);                     // query_buf_
     size += sizeof(INDEX_T);                         // parent_buf_
-    size += CAND * sizeof(INDEX_T);                  // cand_idx_
-    size += CAND * sizeof(DISTANCE_T);               // cand_dist_
+    size += degree * sizeof(INDEX_T);                // cand_idx_
+    size += degree * sizeof(DISTANCE_T);             // cand_dist_
     return size;
 }
 
@@ -135,7 +131,7 @@ __device__ void GPUBaseSearch<BX>::search(
         query_buf_[i] = query[i];
 
     // ── init candidate buffer ───────────────────────────────────────────
-    for (unsigned i = tid; i < CAND; i += BX) {
+    for (unsigned i = tid; i < max_degree_; i += BX) {
         cand_idx_[i]  = MAX_INDEX;
         cand_dist_[i] = FLT_MAX;
     }
@@ -145,7 +141,7 @@ __device__ void GPUBaseSearch<BX>::search(
 
     // ── seed entry point ────────────────────────────────────────────────
         if (warp_id == 0) {
-            DISTANCE_T d = l2_warp_distance(dim, query_buf_,
+            DISTANCE_T d = l2_warp(dim, query_buf_,
                                          graph_.vect(cfg_.entry_point).data());
         if (lane_id == 0) {
             cand_idx_[0]  = cfg_.entry_point;
@@ -176,8 +172,8 @@ __device__ void GPUBaseSearch<BX>::search(
         {
             float    d[1];
             uint32_t x[1];
-            d[0] = (tid < CAND) ? cand_dist_[tid] : FLT_MAX;
-            x[0] = (tid < CAND) ? cand_idx_[tid]  : MAX_INDEX;
+            d[0] = (tid < max_degree_) ? cand_dist_[tid] : FLT_MAX;
+            x[0] = (tid < max_degree_) ? cand_idx_[tid]  : MAX_INDEX;
             topk_.merge(d, x);
         }
 
@@ -210,8 +206,8 @@ __device__ void GPUBaseSearch<BX>::search(
         Span<const vid_t> nbrs = graph_.nbrs(current_node);
 
         // filter neighbors through hash, init candidate buffer
-        for (unsigned i = tid; i < CAND; i += BX) {
-            INDEX_T child = (i < max_degree_) ? nbrs[i] : MAX_INDEX;
+        for (unsigned i = tid; i < max_degree_; i += BX) {
+            INDEX_T child = nbrs[i];
             if (child != MAX_INDEX && hf_.insert(child) == 0)
                 child = MAX_INDEX;
             cand_idx_[i]  = child;
@@ -220,9 +216,9 @@ __device__ void GPUBaseSearch<BX>::search(
         __syncthreads();
 
         // all warps compute L2 distances in parallel
-        for (unsigned i = warp_id; i < CAND; i += BX / WARP_SIZE) {
+        for (unsigned i = warp_id; i < max_degree_; i += BX / WARP_SIZE) {
             if (cand_idx_[i] == MAX_INDEX) continue;
-            DISTANCE_T d = l2_warp_distance(dim, query_buf_,
+            DISTANCE_T d = l2_warp(dim, query_buf_,
                                               graph_.vect(cand_idx_[i]).data());
             if (lane_id == 0)
                 cand_dist_[i] = d;
@@ -234,8 +230,8 @@ __device__ void GPUBaseSearch<BX>::search(
     {
         float    d[1];
         uint32_t x[1];
-        d[0] = (tid < CAND) ? cand_dist_[tid] : FLT_MAX;
-        x[0] = (tid < CAND) ? cand_idx_[tid]  : MAX_INDEX;
+        d[0] = (tid < max_degree_) ? cand_dist_[tid] : FLT_MAX;
+        x[0] = (tid < max_degree_) ? cand_idx_[tid]  : MAX_INDEX;
         topk_.merge(d, x);
     }
 

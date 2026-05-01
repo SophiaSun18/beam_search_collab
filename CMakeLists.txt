@@ -58,3 +58,17 @@ add_executable(test_bitonic_sort_full unittest/test_bitonic_sort_full.cu)
 target_include_directories(test_bitonic_sort_full PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_compile_options(test_bitonic_sort_full PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
 add_test(NAME test_bitonic_sort_full COMMAND test_bitonic_sort_full)
+
+# ── Profiling ───────────────────────────────────────────────────────────────
+
+add_executable(prof_hash_filter unittest/prof_hash_filter.cu)
+target_include_directories(prof_hash_filter PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_compile_options(prof_hash_filter PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
+
+add_executable(prof_l2 unittest/prof_l2.cu)
+target_include_directories(prof_l2 PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_compile_options(prof_l2 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
+
+add_executable(prof_topk unittest/prof_topk.cu)
+target_include_directories(prof_topk PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_compile_options(prof_topk PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)

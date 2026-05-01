@@ -24,7 +24,7 @@
  * @return     Squared L2 distance (same value in all lanes).
  */
 template <typename T = float>
-__device__ __forceinline__ T l2_warp_distance(int dim, const T* a, const T* b) {
+__device__ __forceinline__ T l2_warp(int dim, const T* a, const T* b) {
     int lane = threadIdx.x & 31;
     T val = T(0);
     for (int i = lane; i < dim; i += 32)
@@ -36,5 +36,27 @@ __device__ __forceinline__ T l2_warp_distance(int dim, const T* a, const T* b) {
     sum += __shfl_down_sync(L2_FULL_MASK, sum, 2);
     sum += __shfl_down_sync(L2_FULL_MASK, sum, 1);
     sum  = __shfl_sync(L2_FULL_MASK, sum, 0);
+    return sum;
+}
+
+/**
+ * @brief Per-lane squared L2 distance (column-parallel pattern).
+ *
+ * Each lane independently computes the full squared L2 distance between
+ * a shared query and its own vector. All lanes read the same query
+ * (shared memory broadcast) but different vectors from global memory.
+ *
+ * @param dim  Number of dimensions.
+ * @param a    Query vector (typically in shared memory), dim elements.
+ * @param b    Per-lane vector (typically in global memory), dim elements.
+ * @return     Squared L2 distance (independent per lane).
+ */
+template <typename T = float>
+__device__ __forceinline__ T l2_column(int dim, const T* a, const T* b) {
+    T sum = T(0);
+    for (int i = 0; i < dim; i++) {
+        T diff = a[i] - b[i];
+        sum += diff * diff;
+    }
     return sum;
 }
