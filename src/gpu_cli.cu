@@ -15,6 +15,14 @@
 
 using json = nlohmann::json;
 
+#define CUDA_CHECK(call) do {                                           \
+    cudaError_t err_ = (call);                                          \
+    if (err_ != cudaSuccess)                                            \
+        throw std::runtime_error(std::string(__FILE__) + ":" +          \
+            std::to_string(__LINE__) + " " + #call + " failed: " +     \
+            cudaGetErrorString(err_));                                   \
+} while (0)
+
 // ── file I/O ────────────────────────────────────────────────────────────────
 
 static float* read_fvecs(const char* filename, size_t& n, size_t& d) {
@@ -169,10 +177,15 @@ static void run_base(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
     size_t smem = GPUBaseSearch<CLI_BLOCK_SIZE>::shared_mem_bytes(cfg, dim);
     int num_blocks = nq;
 
+    CUDA_CHECK(cudaFuncSetAttribute(kernel_base_search,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         static_cast<int>(smem)));
+
     auto start = std::chrono::high_resolution_clock::now();
     kernel_base_search<<<num_blocks, CLI_BLOCK_SIZE, smem>>>(
         gpu_graph.view(), cfg, nq, dim, d_queries, d_results, K);
-    cudaDeviceSynchronize();
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
     auto end = std::chrono::high_resolution_clock::now();
 
     double elapsed = std::chrono::duration<double>(end - start).count();
@@ -189,23 +202,15 @@ static void run_warp(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
     int num_blocks = (nq + NY - 1) / NY;
     dim3 block(WARP_SIZE, NY);
 
-    cudaFuncSetAttribute(kernel_warp_search<NY>,
+    CUDA_CHECK(cudaFuncSetAttribute(kernel_warp_search<NY>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         static_cast<int>(smem));
+                         static_cast<int>(smem)));
 
     auto start = std::chrono::high_resolution_clock::now();
     kernel_warp_search<NY><<<num_blocks, block, smem>>>(
         gpu_graph.view(), cfg, nq, dim, d_queries, d_results, K);
-    cudaError_t launch_err = cudaGetLastError();
-    if (launch_err != cudaSuccess) {
-        throw std::runtime_error(std::string("warp kernel launch failed: ") +
-                                 cudaGetErrorString(launch_err));
-    }
-    cudaError_t sync_err = cudaDeviceSynchronize();
-    if (sync_err != cudaSuccess) {
-        throw std::runtime_error(std::string("warp kernel execution failed: ") +
-                                 cudaGetErrorString(sync_err));
-    }
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
     auto end = std::chrono::high_resolution_clock::now();
 
     double elapsed = std::chrono::duration<double>(end - start).count();
@@ -222,15 +227,16 @@ static void run_rabitq(const GPUGraph& gpu_graph, const GPURabitq& gpu_rabitq,
         cfg, dim, gpu_graph.degree());
     int num_blocks = nq;
 
-    cudaFuncSetAttribute(kernel_rabitq_search,
+    CUDA_CHECK(cudaFuncSetAttribute(kernel_rabitq_search,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         static_cast<int>(smem));
+                         static_cast<int>(smem)));
 
     auto start = std::chrono::high_resolution_clock::now();
     kernel_rabitq_search<<<num_blocks, CLI_BLOCK_SIZE, smem>>>(
         gpu_graph.view(), gpu_rabitq.view(), cfg, nq, dim,
         d_queries, d_results, K);
-    cudaDeviceSynchronize();
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
     auto end = std::chrono::high_resolution_clock::now();
 
     double elapsed = std::chrono::duration<double>(end - start).count();
@@ -281,8 +287,8 @@ int main() {
 
     // upload queries
     float* d_queries;
-    cudaMalloc(&d_queries, nq * dim * sizeof(float));
-    cudaMemcpy(d_queries, h_queries, nq * dim * sizeof(float), cudaMemcpyHostToDevice);
+    CUDA_CHECK(cudaMalloc(&d_queries, nq * dim * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(d_queries, h_queries, nq * dim * sizeof(float), cudaMemcpyHostToDevice));
 
     std::cout << "data: " << npoints << " points, dim=" << dim
               << ", degree=" << cpu_graph.degree
@@ -300,7 +306,7 @@ int main() {
 
     // allocate results
     vid_t* d_results;
-    cudaMalloc(&d_results, nq * K * sizeof(vid_t));
+    CUDA_CHECK(cudaMalloc(&d_results, nq * K * sizeof(vid_t)));
     std::vector<vid_t> h_results(nq * K);
 
     std::cout << "search: mode=" << mode << " K=" << K << std::endl;
@@ -348,7 +354,7 @@ int main() {
     }
 
     // ── results ─────────────────────────────────────────────────────────
-    cudaMemcpy(h_results.data(), d_results, nq * K * sizeof(vid_t), cudaMemcpyDeviceToHost);
+    CUDA_CHECK(cudaMemcpy(h_results.data(), d_results, nq * K * sizeof(vid_t), cudaMemcpyDeviceToHost));
     std::cout << "pred[0]:";
     for (int i = 0; i < K; ++i) {
         std::cout << ' ' << h_results[static_cast<size_t>(i)];
@@ -363,8 +369,8 @@ int main() {
     std::cout << "recall@" << K << ": " << recall << std::endl;
 
     // cleanup
-    cudaFree(d_queries);
-    cudaFree(d_results);
+    CUDA_CHECK(cudaFree(d_queries));
+    CUDA_CHECK(cudaFree(d_results));
     delete[] h_queries;
     delete[] h_gt;
 
