@@ -25,6 +25,10 @@ target_include_directories(cpu_cli PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(cpu_cli PRIVATE nlohmann_json)
 target_compile_options(cpu_cli PRIVATE -O3)
 
+add_executable(replicate_queries src/replicate_queries.cpp)
+target_include_directories(replicate_queries PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_compile_options(replicate_queries PRIVATE -O3)
+
 add_executable(gpu_cli src/gpu_cli.cu)
 target_include_directories(gpu_cli PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(gpu_cli PRIVATE nlohmann_json)

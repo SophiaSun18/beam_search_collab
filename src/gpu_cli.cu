@@ -7,6 +7,7 @@
 #include <unordered_set>
 
 #include <nlohmann/json.hpp>
+#include "data_loader.hpp"
 #include "cpu_graph.hpp"
 #include "gpu_graph.cuh"
 #include "gpu_base_search.cuh"
@@ -24,46 +25,6 @@ using json = nlohmann::json;
             std::to_string(__LINE__) + " " + #call + " failed: " +     \
             cudaGetErrorString(err_));                                   \
 } while (0)
-
-// ── file I/O ────────────────────────────────────────────────────────────────
-
-static float* read_fvecs(const char* filename, size_t& n, size_t& d) {
-    std::ifstream in(filename, std::ios::binary);
-    if (!in) throw std::runtime_error(std::string("Cannot open ") + filename);
-    int dim;
-    in.read(reinterpret_cast<char*>(&dim), sizeof(int));
-    in.seekg(0, std::ios::end);
-    size_t file_size = in.tellg();
-    in.seekg(0, std::ios::beg);
-    n = file_size / (dim * sizeof(float) + sizeof(int));
-    d = dim;
-    float* data = new float[n * d];
-    for (size_t i = 0; i < n; i++) {
-        int dd;
-        in.read(reinterpret_cast<char*>(&dd), sizeof(int));
-        in.read(reinterpret_cast<char*>(data + i * d), d * sizeof(float));
-    }
-    return data;
-}
-
-static int* read_ivecs(const char* filename, size_t& n, size_t& d) {
-    std::ifstream in(filename, std::ios::binary);
-    if (!in) throw std::runtime_error(std::string("Cannot open ") + filename);
-    int dim;
-    in.read(reinterpret_cast<char*>(&dim), sizeof(int));
-    in.seekg(0, std::ios::end);
-    size_t file_size = in.tellg();
-    in.seekg(0, std::ios::beg);
-    n = file_size / ((dim + 1) * sizeof(int));
-    d = dim;
-    int* data = new int[n * d];
-    for (size_t i = 0; i < n; i++) {
-        int dd;
-        in.read(reinterpret_cast<char*>(&dd), sizeof(int));
-        in.read(reinterpret_cast<char*>(data + i * d), d * sizeof(int));
-    }
-    return data;
-}
 
 static float compute_recall(const vid_t* predicted, const int* groundtruth,
                              size_t nq, int topk, int gt_k) {
