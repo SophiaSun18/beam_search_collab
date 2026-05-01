@@ -100,7 +100,7 @@ __global__ void kernel_base_search(
     searcher.search(d_queries + qid * dim, d_results + qid * K, K);
 }
 
-template <unsigned NY>
+template <unsigned NY, unsigned REG = 2>
 __global__ void kernel_warp_search(
     GPUGraphView graph, GPUBaseSearchCfg cfg,
     int nq, int dim,
@@ -112,7 +112,7 @@ __global__ void kernel_warp_search(
 
     extern __shared__ char smem[];
     char* ptr = smem;
-    GPUWarpSearch<NY> searcher(ptr, cfg, graph);
+    GPUWarpSearch<NY, REG> searcher(ptr, cfg, graph);
     __syncwarp();
     searcher.search(d_queries + qid * dim, d_results + qid * K, K);
 }
@@ -334,23 +334,23 @@ static void run_reg(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
               << "  qps: " << nq / elapsed << std::endl;
 }
 
-template <unsigned NY>
+template <unsigned NY, unsigned REG = 2>
 static void run_warp(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
                      int nq, int dim, int K,
                      const float* d_queries, vid_t* d_results)
 {
-    size_t smem = GPUWarpSearch<NY>::shared_mem_bytes(cfg, dim, gpu_graph.degree());
+    size_t smem = GPUWarpSearch<NY, REG>::shared_mem_bytes(cfg, dim, gpu_graph.degree());
     int num_blocks = (nq + NY - 1) / NY;
     dim3 block(WARP_SIZE, NY);
 
-    CUDA_CHECK(cudaFuncSetAttribute(kernel_warp_search<NY>,
+    CUDA_CHECK(cudaFuncSetAttribute((kernel_warp_search<NY, REG>),
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
                          static_cast<int>(smem)));
 
     constexpr int NRUNS = 5;
     auto start = std::chrono::high_resolution_clock::now();
     for (int r = 0; r < NRUNS; r++) {
-        kernel_warp_search<NY><<<num_blocks, block, smem>>>(
+        kernel_warp_search<NY, REG><<<num_blocks, block, smem>>>(
             gpu_graph.view(), cfg, nq, dim, d_queries, d_results, K);
         CUDA_CHECK(cudaGetLastError());
     }
@@ -499,10 +499,18 @@ int main() {
             run_pipe<4>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
         } else if (mode == "pipe8") {
             run_pipe<8>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
-        } else if (mode == "warp4") {
-            run_warp<4>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
-        } else if (mode == "warp8") {
-            run_warp<8>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
+        } else if (mode == "warp42") {
+            run_warp<4, 2>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
+        } else if (mode == "warp44") {
+            run_warp<4, 4>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
+        } else if (mode == "warp48") {
+            run_warp<4, 8>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
+        } else if (mode == "warp82") {
+            run_warp<8, 2>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
+        } else if (mode == "warp84") {
+            run_warp<8, 4>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
+        } else if (mode == "warp88") {
+            run_warp<8, 8>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
         } else {
             std::cerr << "Unknown mode: " << mode << std::endl;
             return 1;
