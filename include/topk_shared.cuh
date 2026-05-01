@@ -50,9 +50,10 @@ template <unsigned BX, unsigned REG>
 class SharedBitonicTopK : private BitonicScratchBase<(BX > 32)> {
     private:
     static constexpr unsigned N = BX * REG;
-    unsigned  topk;       // the number of elements in this buffer
-    float*    topk_dist;  // points into shared memory, stored descending
-    uint32_t* topk_idx;   // points into shared memory, stored descending
+    unsigned  topk;         // the number of elements in this buffer
+    float*    topk_dist;    // points into shared memory, stored descending
+    uint32_t* topk_idx;     // points into shared memory, stored descending
+    unsigned  next_expand;  // topk position of last picked node (set by pick)
 
     /// Correct sync for the number of participating threads.
     /// BX <= 32 (single warp): __syncwarp.
@@ -179,7 +180,8 @@ template <unsigned BX, unsigned REG>
 __device__ SharedBitonicTopK<BX, REG>::SharedBitonicTopK(
     unsigned topk, float* topk_dist, uint32_t* topk_idx,
     float* scratch_d, uint32_t* scratch_i)
-    : topk(topk), topk_dist(topk_dist), topk_idx(topk_idx)
+    : topk(topk), topk_dist(topk_dist), topk_idx(topk_idx),
+      next_expand(topk > 0 ? topk - 1 : 0)
 {
     this->set_scratch(scratch_d, scratch_i);
     for (unsigned i = threadIdx.x; i < topk; i += BX) {
@@ -190,7 +192,7 @@ __device__ SharedBitonicTopK<BX, REG>::SharedBitonicTopK(
 
 template <unsigned BX, unsigned REG>
 __device__ SharedBitonicTopK<BX, REG>::SharedBitonicTopK(char*& smem, unsigned topk)
-    : topk(topk)
+    : topk(topk), next_expand(topk > 0 ? topk - 1 : 0)
 {
     // Each instance (threadIdx.y) gets its own region within block-wide smem.
     const size_t per_inst = shared_mem_bytes_per_instance(topk);
@@ -251,6 +253,9 @@ __device__ void SharedBitonicTopK<BX, REG>::merge(float (&dist)[REG], uint32_t (
                 unsigned pos = (c - 1) * N + tid * REG + j;
                 topk_dist[pos] = dist_[j];
                 topk_idx[pos]  = idx_[j];
+                if ((idx_[j] & 0x80000000) == 0 && idx_[j] != 0xFFFFFFFF
+                    && pos > next_expand)
+                    next_expand = pos;
             }
             sync();
         }
@@ -259,11 +264,24 @@ __device__ void SharedBitonicTopK<BX, REG>::merge(float (&dist)[REG], uint32_t (
     }
     // [7] Flush last chunk descending
     bitonic_sort_block<false>(dist, idx, sd, si);
+    unsigned best = next_expand;
     #pragma unroll
     for (unsigned j = 0; j < REG; j++) {
         unsigned pos = (chunks - 1) * N + tid * REG + j;
         topk_dist[pos] = dist[j];
         topk_idx[pos]  = idx[j];
+        if ((idx[j] & 0x80000000) == 0 && idx[j] != 0xFFFFFFFF
+            && pos > best)
+            best = pos;
+    }
+    // Reduce to find max across all threads so every thread agrees.
+    if constexpr (BX <= 32) {
+        for (unsigned o = 16; o > 0; o >>= 1)
+            best = max(best, __shfl_xor_sync(0xffffffff, best, o));
+        next_expand = best;
+    } else {
+        // BX > 32: skip cursor optimization, reset to tail.
+        next_expand = topk - 1;
     }
     sync();
 }
@@ -277,8 +295,9 @@ __device__ unsigned SharedBitonicTopK<BX, REG>::pick(uint32_t (&out)[N], unsigne
 
     unsigned found = 0;
 
-    // Smallest elements at the tail (descending buffer). Scan backwards.
-    unsigned base = (topk > 32) ? topk - 32 : 0;
+    // Start from next_expand cursor (positions beyond it are already expanded).
+    // Align down to 32-element window boundary.
+    unsigned base = (next_expand >= 32) ? (next_expand & ~31u) : 0;
     while (found < n) {
         uint32_t val = 0;
         bool unmarked = false;
@@ -302,6 +321,8 @@ __device__ unsigned SharedBitonicTopK<BX, REG>::pick(uint32_t (&out)[N], unsigne
         if (unmarked && found + lane_prefix < n) {
             out[found + lane_prefix] = val;  // node ID (MSB clear)
             topk_idx[pos] = val | MSB;
+            if (found + lane_prefix == 0)
+                next_expand = pos;  // advance cursor
         }
 
         found += count;

@@ -44,7 +44,7 @@ public:
      * 0xFFFFFFFF. Found nodes are marked (MSB set). Lane 0 receives
      * the picked node IDs in out[0..found-1].
      */
-    __device__ unsigned pick(uint32_t (&out)[32 * REGY], unsigned n);
+    __device__ unsigned pick(uint32_t (&out)[REGY], unsigned n);
 
     /**
      * @brief Flush the n smallest elements to memory.
@@ -148,13 +148,19 @@ __device__ void RegBitonicTopK<REGX, REGY>::merge(
         topk_d_[(chunks - 1) * REGY + j] = dist[j];
         topk_i_[(chunks - 1) * REGY + j] = idx[j];
     }
+
+    // [7] Re-sort full topk descending to restore correct position order
+    //     for pick/flush. Only needed when chunks > 1 (REGY < REGX).
+    if constexpr (chunks > 1) {
+        sort_warp<false, REGX>(topk_d_, topk_i_);
+    }
 }
 
 // ── pick ────────────────────────────────────────────────────────────────────
 
 template <unsigned REGX, unsigned REGY>
 __device__ unsigned RegBitonicTopK<REGX, REGY>::pick(
-    uint32_t (&out)[32 * REGY], unsigned n)
+    uint32_t (&out)[REGY], unsigned n)
 {
     constexpr uint32_t MSB = 0x80000000;
     const unsigned lane = threadIdx.x & 31;

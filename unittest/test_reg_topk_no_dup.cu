@@ -31,9 +31,9 @@ __global__ void kernel_test_reg_no_dup(
         buf.merge(dist, idx);
 
         // pick 1 node
-        uint32_t pbuf[N];
+        uint32_t pbuf[REGY];
         #pragma unroll
-        for (unsigned j = 0; j < N; ++j) pbuf[j] = 0xFFFFFFFF;
+        for (unsigned j = 0; j < REGY; ++j) pbuf[j] = 0xFFFFFFFF;
         unsigned found = buf.pick(pbuf, 1);
         uint32_t picked = 0xFFFFFFFF;
         if (found > 0 && pbuf[0] != 0xFFFFFFFF) {
