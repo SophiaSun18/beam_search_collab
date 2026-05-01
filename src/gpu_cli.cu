@@ -499,6 +499,18 @@ int main() {
             run_pipe<4>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
         } else if (mode == "pipe8") {
             run_pipe<8>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
+        } else if (mode == "warp11") {
+            run_warp<1, 1>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
+        } else if (mode == "warp12") {
+            run_warp<1, 2>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
+        } else if (mode == "warp14") {
+            run_warp<1, 4>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
+        } else if (mode == "warp21") {
+            run_warp<2, 1>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
+        } else if (mode == "warp22") {
+            run_warp<2, 2>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
+        } else if (mode == "warp24") {
+            run_warp<2, 4>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
         } else if (mode == "warp42") {
             run_warp<4, 2>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
         } else if (mode == "warp44") {
