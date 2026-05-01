@@ -63,6 +63,16 @@ target_include_directories(test_bitonic_sort_full PRIVATE ${CMAKE_SOURCE_DIR}/in
 target_compile_options(test_bitonic_sort_full PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
 add_test(NAME test_bitonic_sort_full COMMAND test_bitonic_sort_full)
 
+add_executable(test_reg_topk_merge unittest/test_reg_topk_merge.cu)
+target_include_directories(test_reg_topk_merge PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_compile_options(test_reg_topk_merge PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
+add_test(NAME test_reg_topk_merge COMMAND test_reg_topk_merge)
+
+add_executable(test_reg_topk_no_dup unittest/test_reg_topk_no_dup.cu)
+target_include_directories(test_reg_topk_no_dup PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_compile_options(test_reg_topk_no_dup PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
+add_test(NAME test_reg_topk_no_dup COMMAND test_reg_topk_no_dup)
+
 # ── Profiling ───────────────────────────────────────────────────────────────
 
 add_executable(prof_hash_filter unittest/prof_hash_filter.cu)

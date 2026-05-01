@@ -13,6 +13,7 @@
 #include "gpu_base_search.cuh"
 #include "gpu_col_search.cuh"
 #include "gpu_pipe_search.cuh"
+#include "gpu_split_search.cuh"
 #include "gpu_warp_search.cuh"
 #include "gpu_rabitq_search.cuh"
 
@@ -148,6 +149,22 @@ __global__ void kernel_pipe_search(
     searcher.search(d_queries + qid * dim, d_results + qid * K, K);
 }
 
+__global__ void kernel_split_search(
+    GPUGraphView graph, GPUBaseSearchCfg cfg,
+    int nq, int dim,
+    const float* __restrict__ d_queries,
+    vid_t* __restrict__ d_results, int K)
+{
+    int qid = blockIdx.x;
+    if (qid >= nq) return;
+
+    extern __shared__ char smem[];
+    char* ptr = smem;
+    GPUSplitSearch<CLI_BLOCK_SIZE> searcher(ptr, cfg, graph);
+    __syncthreads();
+    searcher.search(d_queries + qid * dim, d_results + qid * K, K);
+}
+
 __global__ void kernel_rabitq_search(
     GPUGraphView graph, GPURabitqView rabitq, GPURabitqSearchCfg cfg,
     int nq, int dim,
@@ -235,6 +252,32 @@ static void run_pipe(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
     auto start = std::chrono::high_resolution_clock::now();
     for (int r = 0; r < NRUNS; r++) {
         kernel_pipe_search<NY><<<num_blocks, block, smem>>>(
+            gpu_graph.view(), cfg, nq, dim, d_queries, d_results, K);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    auto end = std::chrono::high_resolution_clock::now();
+
+    double elapsed = std::chrono::duration<double>(end - start).count() / NRUNS;
+    std::cout << "  time: " << elapsed * 1000.0 << " ms"
+              << "  qps: " << nq / elapsed << std::endl;
+}
+
+static void run_split(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
+                      int nq, int dim, int K,
+                      const float* d_queries, vid_t* d_results)
+{
+    size_t smem = GPUSplitSearch<CLI_BLOCK_SIZE>::shared_mem_bytes(cfg, dim, gpu_graph.degree());
+    int num_blocks = nq;
+
+    CUDA_CHECK(cudaFuncSetAttribute(kernel_split_search,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         static_cast<int>(smem)));
+
+    constexpr int NRUNS = 5;
+    auto start = std::chrono::high_resolution_clock::now();
+    for (int r = 0; r < NRUNS; r++) {
+        kernel_split_search<<<num_blocks, CLI_BLOCK_SIZE, smem>>>(
             gpu_graph.view(), cfg, nq, dim, d_queries, d_results, K);
         CUDA_CHECK(cudaGetLastError());
     }
@@ -403,6 +446,8 @@ int main() {
             run_base(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
         } else if (mode == "col") {
             run_col(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
+        } else if (mode == "split") {
+            run_split(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
         } else if (mode == "pipe4") {
             run_pipe<4>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
         } else if (mode == "pipe8") {
