@@ -49,6 +49,11 @@ target_include_directories(test_topk_no_dup PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_compile_options(test_topk_no_dup PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
 add_test(NAME test_topk_no_dup COMMAND test_topk_no_dup)
 
+add_executable(test_hash_filter unittest/test_hash_filter.cu)
+target_include_directories(test_hash_filter PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_compile_options(test_hash_filter PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
+add_test(NAME test_hash_filter COMMAND test_hash_filter)
+
 add_executable(test_bitonic_sort_full unittest/test_bitonic_sort_full.cu)
 target_include_directories(test_bitonic_sort_full PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_compile_options(test_bitonic_sort_full PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
