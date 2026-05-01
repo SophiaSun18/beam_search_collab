@@ -1,58 +1,48 @@
 #pragma once
-#include "l2.cuh"
-#include "topk.cuh"
-#include "hash_filter.cuh"
-#include "gpu_graph.cuh"
+#include "gpu_base_search.cuh"
 #include <cuda_runtime.h>
 #if defined(__CUDA_ARCH__) || defined(__CUDACC__)
 #include <cuda_pipeline_primitives.h>
 #endif
-#include <climits>
-
-#ifndef WARP_SIZE
-#define WARP_SIZE 32
-#endif
-
-typedef uint32_t INDEX_T;
-typedef float    DISTANCE_T;
-#ifndef MAX_INDEX
-#define MAX_INDEX UINT_MAX
-#endif
 
 /**
- * @class GPUPipeSearch — pipelined L2 beam search visitor.
+ * @class GPUPipeSearch — warp-level pipelined L2 beam search visitor.
  *
- * Same structure as GPUBaseSearch, but each warp double-buffers one
- * neighbor vector at a time: while computing L2 for the current
- * neighbor from shared memory, the next neighbor's vector is being
- * async-loaded into the alternate slot.
+ * Same warp-level structure as GPUWarpSearch (dim3(32, NY), each warp
+ * handles one query with __syncwarp), but the per-neighbor L2 loop is
+ * double-buffered: while computing L2 for the current neighbor from
+ * shared memory, the next neighbor's vector is async-loaded into the
+ * alternate staging slot via 128-bit cp.async.
  *
- * Staging layout: [NWARPS][2][dim] — each warp owns two vector slots.
- *
- * @tparam BX  Block size (number of threads).
+ * @tparam NY   Number of warps (queries) per block.
+ * @tparam REG  Registers per thread for topk merge.
  */
-template <unsigned BX>
+template <unsigned NY, unsigned REG = 2>
 class GPUPipeSearch {
-    static constexpr unsigned NWARPS = BX / WARP_SIZE;
+    static constexpr unsigned BX = WARP_SIZE;  // 32
 
-    SharedBitonicTopK<BX, 1> topk_;
-    HashFilter               hf_;
-    float*                   query_buf_;    // [dim]
-    INDEX_T*                 parent_buf_;   // [1]
-    INDEX_T*                 cand_idx_;     // [degree]
-    DISTANCE_T*              cand_dist_;    // [degree]
-    float*                   staged_vecs_;  // [NWARPS * 2 * dim]
+    SharedBitonicTopK<BX, REG> topk_;
+    HashFilter                 hf_;
+    float*                     query_buf_;     // [dim]
+    INDEX_T*                   parent_buf_;    // [1]
+    INDEX_T*                   cand_idx_;      // [degree]
+    DISTANCE_T*                cand_dist_;     // [degree]
+    uint32_t*                  compact_map_;   // [degree]
+    float*                     staged_vecs_;   // [2 * dim] double-buffer
 
-    GPUGraphView             graph_;
-    GPUBaseSearchCfg         cfg_;
-    unsigned                 dim_;
-    unsigned                 max_degree_;
+    GPUGraphView               graph_;
+    GPUBaseSearchCfg           cfg_;
+    unsigned                   dim_;
+    unsigned                   max_degree_;
 
 public:
     __device__ GPUPipeSearch(char*& smem, const GPUBaseSearchCfg& cfg,
                              GPUGraphView graph);
 
     __device__ void search(const float* query, vid_t* results, int K);
+
+    __host__ __device__ static size_t shared_mem_bytes_per_warp(
+        const GPUBaseSearchCfg& cfg, unsigned dim, unsigned degree);
 
     __host__ __device__ static size_t shared_mem_bytes(
         const GPUBaseSearchCfg& cfg, unsigned dim, unsigned degree);
@@ -61,92 +51,112 @@ private:
     __device__ void compute_distances_pipelined();
 };
 
-// ── implementation ──────────────────────────────────────────────────────────
+// ── constructor ─────────────────────────────────────────────────────────────
 
-template <unsigned BX>
-__device__ GPUPipeSearch<BX>::GPUPipeSearch(
+template <unsigned NY, unsigned REG>
+__device__ GPUPipeSearch<NY, REG>::GPUPipeSearch(
     char*& smem, const GPUBaseSearchCfg& cfg, GPUGraphView graph)
     : topk_(smem, cfg.topk_size),
       hf_(smem, cfg.bitlen),
       graph_(graph), cfg_(cfg),
       dim_(graph.dim()), max_degree_(graph.degree())
 {
+    // Align smem to 16 bytes so every per-warp region starts aligned.
     smem = reinterpret_cast<char*>(
-        (reinterpret_cast<uintptr_t>(smem) + alignof(float) - 1)
-            & ~(static_cast<uintptr_t>(alignof(float)) - 1));
+        (reinterpret_cast<uintptr_t>(smem) + 15) & ~static_cast<uintptr_t>(15));
 
-    query_buf_  = reinterpret_cast<float*>(smem);
-    smem += dim_ * sizeof(float);
+    const size_t plain = graph.dim() * sizeof(float)    // query_buf_
+                       + sizeof(INDEX_T)                // parent_buf_
+                       + max_degree_ * sizeof(INDEX_T)  // cand_idx_
+                       + max_degree_ * sizeof(DISTANCE_T) // cand_dist_
+                       + max_degree_ * sizeof(uint32_t);  // compact_map_
+    const size_t plain_pad = (plain + 15) & ~static_cast<size_t>(15);
+    const size_t staged = 2 * graph.dim() * sizeof(float);
+    // Round total per-warp size to 16 so every warp starts 16-byte aligned.
+    const size_t rest = (plain_pad + staged + 15) & ~static_cast<size_t>(15);
 
-    parent_buf_ = reinterpret_cast<INDEX_T*>(smem);
-    smem += sizeof(INDEX_T);
+    char* my = smem + threadIdx.y * rest;
+    query_buf_   = reinterpret_cast<float*>(my);       my += graph.dim() * sizeof(float);
+    parent_buf_  = reinterpret_cast<INDEX_T*>(my);     my += sizeof(INDEX_T);
+    cand_idx_    = reinterpret_cast<INDEX_T*>(my);     my += max_degree_ * sizeof(INDEX_T);
+    cand_dist_   = reinterpret_cast<DISTANCE_T*>(my);  my += max_degree_ * sizeof(DISTANCE_T);
+    compact_map_ = reinterpret_cast<uint32_t*>(my);
+    staged_vecs_ = reinterpret_cast<float*>(smem + threadIdx.y * rest + plain_pad);
 
-    cand_idx_   = reinterpret_cast<INDEX_T*>(smem);
-    smem += max_degree_ * sizeof(INDEX_T);
-
-    cand_dist_  = reinterpret_cast<DISTANCE_T*>(smem);
-    smem += max_degree_ * sizeof(DISTANCE_T);
-
-    smem = reinterpret_cast<char*>(
-        (reinterpret_cast<uintptr_t>(smem) + alignof(float) - 1)
-            & ~(static_cast<uintptr_t>(alignof(float)) - 1));
-
-    staged_vecs_ = reinterpret_cast<float*>(smem);
-    smem += NWARPS * 2 * dim_ * sizeof(float);
+    smem += blockDim.y * rest;
 }
 
-template <unsigned BX>
-__host__ __device__ size_t GPUPipeSearch<BX>::shared_mem_bytes(
+// ── shared memory size ──────────────────────────────────────────────────────
+
+template <unsigned NY, unsigned REG>
+__host__ __device__ size_t GPUPipeSearch<NY, REG>::shared_mem_bytes_per_warp(
     const GPUBaseSearchCfg& cfg, unsigned dim, unsigned degree) {
+    // topk + hash are allocated before the 16-byte aligned per-warp region
+    size_t prefix = 0;
+    prefix += SharedBitonicTopK<BX, REG>::shared_mem_bytes_per_instance(cfg.topk_size);
+    prefix += (1u << cfg.bitlen) * sizeof(uint32_t);   // hash filter
+
+    size_t plain = dim * sizeof(float)                 // query_buf_
+                 + sizeof(INDEX_T)                     // parent_buf_
+                 + degree * sizeof(INDEX_T)            // cand_idx_
+                 + degree * sizeof(DISTANCE_T)         // cand_dist_
+                 + degree * sizeof(uint32_t);          // compact_map_
+    size_t plain_pad = (plain + 15) & ~static_cast<size_t>(15);
+    size_t staged = 2 * dim * sizeof(float);           // staged_vecs_
+    size_t per_warp = (plain_pad + staged + 15) & ~static_cast<size_t>(15);
+    return prefix + per_warp;
+}
+
+template <unsigned NY, unsigned REG>
+__host__ __device__ size_t GPUPipeSearch<NY, REG>::shared_mem_bytes(
+    const GPUBaseSearchCfg& cfg, unsigned dim, unsigned degree) {
+    // topk and hash handle NY internally; plain+staged are per-warp.
     size_t size = 0;
-    size += SharedBitonicTopK<BX, 1>::shared_mem_bytes(cfg.topk_size);
-    size += HashFilter::shared_mem_bytes(cfg.bitlen);
-    size = (size + alignof(float) - 1) & ~(alignof(float) - 1);
-    size += dim * sizeof(float);                     // query_buf_
-    size += sizeof(INDEX_T);                         // parent_buf_
-    size += degree * sizeof(INDEX_T);                // cand_idx_
-    size += degree * sizeof(DISTANCE_T);             // cand_dist_
-    size = (size + alignof(float) - 1) & ~(alignof(float) - 1);
-    size += (BX / WARP_SIZE) * 2 * dim * sizeof(float);  // staged_vecs_
+    size += SharedBitonicTopK<BX, REG>::shared_mem_bytes(cfg.topk_size, NY);
+    size += HashFilter::shared_mem_bytes(cfg.bitlen, NY);
+    size = (size + 15) & ~static_cast<size_t>(15);  // 16-byte align
+    size_t plain = dim * sizeof(float) + sizeof(INDEX_T)
+                 + degree * sizeof(INDEX_T) + degree * sizeof(DISTANCE_T)
+                 + degree * sizeof(uint32_t);
+    size_t plain_pad = (plain + 15) & ~static_cast<size_t>(15);
+    size_t staged = 2 * dim * sizeof(float);
+    size_t per_warp = (plain_pad + staged + 15) & ~static_cast<size_t>(15);
+    size += NY * per_warp;
     return size;
 }
 
 // ── search ──────────────────────────────────────────────────────────────────
 
-template <unsigned BX>
-__device__ void GPUPipeSearch<BX>::search(
+template <unsigned NY, unsigned REG>
+__device__ void GPUPipeSearch<NY, REG>::search(
     const float* query, vid_t* results, int K)
 {
-    const unsigned tid = threadIdx.x;
-    const unsigned warp_id = tid / WARP_SIZE;
-    const unsigned lane_id = tid % WARP_SIZE;
+    const unsigned lane = threadIdx.x;
     const int dim = static_cast<int>(dim_);
 
-    // ── load query into shared memory ───────────────────────────────────
-    for (unsigned i = tid; i < dim_; i += BX)
+    // ── load query ──────────────────────────────────────────────────────
+    for (unsigned i = lane; i < dim_; i += BX)
         query_buf_[i] = query[i];
 
-    for (unsigned i = tid; i < max_degree_; i += BX) {
+    for (unsigned i = lane; i < max_degree_; i += BX) {
         cand_idx_[i]  = MAX_INDEX;
         cand_dist_[i] = FLT_MAX;
     }
 
     hf_.init();
-    __syncthreads();
+    __syncwarp();
 
     // ── seed entry point ────────────────────────────────────────────────
-    if (warp_id == 0) {
+    {
         DISTANCE_T d = l2_warp(dim, query_buf_,
                                graph_.vect(cfg_.entry_point).data());
-        if (lane_id == 0) {
+        if (lane == 0) {
             cand_idx_[0]  = cfg_.entry_point;
             cand_dist_[0] = d;
             hf_.insert(cfg_.entry_point);
         }
     }
-    __syncthreads();
-
-    __shared__ uint32_t keep_expanding;
+    __syncwarp();
 
     // ── main loop ───────────────────────────────────────────────────────
     for (int iter = 0; iter < cfg_.max_iterations; iter++) {
@@ -154,136 +164,150 @@ __device__ void GPUPipeSearch<BX>::search(
         // ── hash reset + re-populate ────────────────────────────────────
         if ((iter + 1) % cfg_.reset_interval == 0) {
             hf_.init();
-            __syncthreads();
-            for (unsigned i = tid; i < topk_.capacity(); i += BX) {
+            __syncwarp();
+            for (unsigned i = lane; i < topk_.capacity(); i += BX) {
                 uint32_t node = topk_.id(i);
                 if (node != MAX_INDEX) hf_.insert(node);
             }
         }
-        __syncthreads();
+        __syncwarp();
 
         // ── merge candidates into topk ──────────────────────────────────
         {
-            float    d[1];
-            uint32_t x[1];
-            d[0] = (tid < max_degree_) ? cand_dist_[tid] : FLT_MAX;
-            x[0] = (tid < max_degree_) ? cand_idx_[tid]  : MAX_INDEX;
+            float    d[REG];
+            uint32_t x[REG];
+            #pragma unroll
+            for (unsigned j = 0; j < REG; j++) {
+                unsigned pos = lane * REG + j;
+                d[j] = (pos < max_degree_) ? cand_dist_[pos] : FLT_MAX;
+                x[j] = (pos < max_degree_) ? cand_idx_[pos]  : MAX_INDEX;
+            }
             topk_.merge(d, x);
         }
 
         // ── pick ────────────────────────────────────────────────────────
-        {
-            uint32_t pbuf[BX];
-            #pragma unroll
-            for (unsigned i = 0; i < BX; ++i) pbuf[i] = MAX_INDEX;
-            unsigned found = topk_.pick(pbuf, 1);
-            uint32_t picked = MAX_INDEX;
-            if (warp_id == 0) {
-                const bool has_pick = found > 0 && pbuf[0] != MAX_INDEX;
-                const uint32_t ballot = __ballot_sync(0xffffffff, has_pick);
-                if (ballot != 0) {
-                    const int src_lane = __ffs(ballot) - 1;
-                    picked = __shfl_sync(0xffffffff, pbuf[0], src_lane);
-                }
-            }
-            if (warp_id == 0 && lane_id == 0) {
-                keep_expanding = found;
-                if (found > 0) parent_buf_[0] = picked;
-            }
+        uint32_t pbuf[BX * REG];
+        #pragma unroll
+        for (unsigned i = 0; i < BX * REG; ++i) pbuf[i] = MAX_INDEX;
+        unsigned found = topk_.pick(pbuf, 1);
+        uint32_t picked = MAX_INDEX;
+        const bool has_pick = found > 0 && pbuf[0] != MAX_INDEX;
+        const uint32_t ballot = __ballot_sync(0xffffffff, has_pick);
+        if (ballot != 0) {
+            const int src_lane = __ffs(ballot) - 1;
+            picked = __shfl_sync(0xffffffff, pbuf[0], src_lane);
         }
-        __syncthreads();
-        if (!keep_expanding) break;
+        if (lane == 0 && found > 0)
+            parent_buf_[0] = picked;
+        __syncwarp();
+
+        if (found == 0) break;
 
         // ── expand: hash filter ─────────────────────────────────────────
         vid_t current_node = parent_buf_[0];
         Span<const vid_t> nbrs = graph_.nbrs(current_node);
 
-        for (unsigned i = tid; i < max_degree_; i += BX) {
+        for (unsigned i = lane; i < max_degree_; i += BX) {
             INDEX_T child = nbrs[i];
             if (child != MAX_INDEX && hf_.insert(child) == 0)
                 child = MAX_INDEX;
             cand_idx_[i]  = child;
             cand_dist_[i] = FLT_MAX;
         }
-        __syncthreads();
+        __syncwarp();
 
+        // ── pipelined L2 ────────────────────────────────────────────────
         compute_distances_pipelined();
-        __syncthreads();
+        __syncwarp();
     }
 
     // ── final merge ─────────────────────────────────────────────────────
     {
-        float    d[1];
-        uint32_t x[1];
-        d[0] = (tid < max_degree_) ? cand_dist_[tid] : FLT_MAX;
-        x[0] = (tid < max_degree_) ? cand_idx_[tid]  : MAX_INDEX;
+        float    d[REG];
+        uint32_t x[REG];
+        #pragma unroll
+        for (unsigned j = 0; j < REG; j++) {
+            unsigned pos = lane * REG + j;
+            d[j] = (pos < max_degree_) ? cand_dist_[pos] : FLT_MAX;
+            x[j] = (pos < max_degree_) ? cand_idx_[pos]  : MAX_INDEX;
+        }
         topk_.merge(d, x);
     }
 
-    topk_.flush(reinterpret_cast<float*>(cand_dist_), results, K);
+    topk_.flush(cand_dist_, results, K);
 }
 
+// ── compute_distances_pipelined ─────────────────────────────────────────────
+
 /**
- * @brief Pipelined L2 distances for all neighbors in cand_idx_.
+ * @brief Pipelined L2 over compacted valid neighbors.
  *
- * Per-warp double-buffered vector loading. Each warp owns two dim-sized
- * slots in staged_vecs_. Iteration schedule for warp w (step s):
- *   neighbor index = w + s * NWARPS
- *   Each lane loads dim/WARP_SIZE floats per vector.
- *
- * Pipeline: while computing L2 for step s from slot (s&1), async-load
- * step s+1's vector into slot ((s+1)&1).
- *
- * Reads cand_idx_[0..degree-1] (MAX_INDEX entries are skipped).
- * Writes cand_dist_[i] for each valid neighbor.
+ * Compacts valid entries in cand_idx_ to eliminate pipeline bubbles,
+ * then iterates the dense list with double-buffered 128-bit async
+ * vector loads. One warp, two dim-sized staging slots.
  */
-template <unsigned BX>
-__device__ void GPUPipeSearch<BX>::compute_distances_pipelined()
+template <unsigned NY, unsigned REG>
+__device__ void GPUPipeSearch<NY, REG>::compute_distances_pipelined()
 {
-    const unsigned warp_id = threadIdx.x / WARP_SIZE;
-    const unsigned lane_id = threadIdx.x % WARP_SIZE;
+    const unsigned lane = threadIdx.x;
     const int dim = static_cast<int>(dim_);
 
-    float* my_stage = staged_vecs_ + warp_id * 2 * dim_;
-    const unsigned steps = (max_degree_ + NWARPS - 1) / NWARPS;
+    // ── compact valid neighbors (warp-collaborative) ────────────────────
+    // Each lane checks one or more candidates, ballot to count & place.
+    unsigned valid_count = 0;
+    for (unsigned base = 0; base < max_degree_; base += WARP_SIZE) {
+        unsigned i = base + lane;
+        bool valid = (i < max_degree_) && (cand_idx_[i] != MAX_INDEX);
+        uint32_t mask = __ballot_sync(0xffffffff, valid);
+        unsigned count = __popc(mask);
+        unsigned prefix = __popc(mask & ((1u << lane) - 1));
+        if (valid)
+            compact_map_[valid_count + prefix] = i;
+        valid_count += count;
+    }
+
+    if (valid_count == 0) return;
+
+    // ── pipelined L2 over compacted list ────────────────────────────────
+    constexpr unsigned COPY_WIDTH = 4;  // floats per 128-bit async copy
+    const unsigned copies_per_lane = dim_ / (WARP_SIZE * COPY_WIDTH);
 
     // Pre-load first vector into slot 0
     {
-        unsigned nbr0 = warp_id;
-        vid_t child = (nbr0 < max_degree_) ? cand_idx_[nbr0] : MAX_INDEX;
-        if (child != MAX_INDEX) {
-            const float* src = graph_.vect(child).data();
-            for (unsigned d = lane_id; d < dim_; d += WARP_SIZE) {
+        vid_t child = cand_idx_[compact_map_[0]];
+        const float* src = graph_.vect(child).data();
+        for (unsigned c = 0; c < copies_per_lane; c++) {
+            unsigned d = lane * COPY_WIDTH + c * WARP_SIZE * COPY_WIDTH;
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
-                __pipeline_memcpy_async(my_stage + d, src + d, sizeof(float));
+            __pipeline_memcpy_async(staged_vecs_ + d, src + d,
+                                    COPY_WIDTH * sizeof(float));
 #else
-                my_stage[d] = src[d];
+            for (unsigned k = 0; k < COPY_WIDTH; k++)
+                staged_vecs_[d + k] = src[d + k];
 #endif
-            }
         }
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
         __pipeline_commit();
 #endif
     }
 
-    for (unsigned s = 0; s < steps; s++) {
+    for (unsigned s = 0; s < valid_count; s++) {
         unsigned cur_slot = s & 1;
 
         // Pre-load next vector into alternate slot
-        if (s + 1 < steps) {
-            unsigned nxt_nbr = warp_id + (s + 1) * NWARPS;
-            vid_t child = (nxt_nbr < max_degree_)
-                        ? cand_idx_[nxt_nbr] : MAX_INDEX;
-            if (child != MAX_INDEX) {
-                const float* src = graph_.vect(child).data();
-                float* dst = my_stage + ((s + 1) & 1) * dim_;
-                for (unsigned d = lane_id; d < dim_; d += WARP_SIZE) {
+        if (s + 1 < valid_count) {
+            vid_t child = cand_idx_[compact_map_[s + 1]];
+            const float* src = graph_.vect(child).data();
+            float* dst = staged_vecs_ + ((s + 1) & 1) * dim_;
+            for (unsigned c = 0; c < copies_per_lane; c++) {
+                unsigned d = lane * COPY_WIDTH + c * WARP_SIZE * COPY_WIDTH;
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
-                    __pipeline_memcpy_async(dst + d, src + d, sizeof(float));
+                __pipeline_memcpy_async(dst + d, src + d,
+                                        COPY_WIDTH * sizeof(float));
 #else
-                    dst[d] = src[d];
+                for (unsigned k = 0; k < COPY_WIDTH; k++)
+                    dst[d + k] = src[d + k];
 #endif
-                }
             }
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
             __pipeline_commit();
@@ -299,13 +323,10 @@ __device__ void GPUPipeSearch<BX>::compute_distances_pipelined()
         __syncwarp();
 
         // Compute L2 from staged vector
-        unsigned cur_nbr = warp_id + s * NWARPS;
-        if (cur_nbr < max_degree_ && cand_idx_[cur_nbr] != MAX_INDEX) {
-            const float* vec = my_stage + cur_slot * dim_;
-            DISTANCE_T d = l2_warp(dim, query_buf_, vec);
-            if (lane_id == 0)
-                cand_dist_[cur_nbr] = d;
-        }
+        const float* vec = staged_vecs_ + cur_slot * dim_;
+        DISTANCE_T d = l2_warp(dim, query_buf_, vec);
+        if (lane == 0)
+            cand_dist_[compact_map_[s]] = d;
         __syncwarp();
     }
 }
