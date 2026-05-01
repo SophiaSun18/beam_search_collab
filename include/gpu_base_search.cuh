@@ -22,6 +22,7 @@ struct GPUBaseSearchCfg {
     vid_t    entry_point;
     int      max_iterations;
     int      reset_interval;
+    int      trace_iterations;
 };
 
 /**
@@ -161,11 +162,6 @@ __device__ void GPUBaseSearch<BX>::search(
     // ── main loop ───────────────────────────────────────────────────────
     for (int iter = 0; iter < cfg_.max_iterations; iter++) {
 
-        // forgettable hash table reset
-        if ((iter + 1) % cfg_.reset_interval == 0)
-            hf_.init();
-        __syncthreads();
-
         // ── merge candidates into topk ──────────────────────────────────
         {
             float    d[1];
@@ -193,6 +189,8 @@ __device__ void GPUBaseSearch<BX>::search(
             if (warp_id == 0 && lane_id == 0) {
                 keep_expanding = found;
                 if (found > 0) parent_buf_[0] = picked;
+                if (found > 0 && blockIdx.x == 0 && iter < cfg_.trace_iterations)
+                    printf("gpu iter %d expand %u\n", iter, picked);
             }
         }
         __syncthreads();
@@ -217,11 +215,18 @@ __device__ void GPUBaseSearch<BX>::search(
         for (unsigned i = warp_id; i < CAND; i += BX / WARP_SIZE) {
             if (cand_idx_[i] == MAX_INDEX) continue;
             DISTANCE_T d = l2_warp_distance(dim, query_buf_,
-                                             graph_.vect(cand_idx_[i]).data());
+                                              graph_.vect(cand_idx_[i]).data());
             if (lane_id == 0)
                 cand_dist_[i] = d;
         }
         __syncthreads();
+        if (blockIdx.x == 0 && iter == 0 && tid == 0) {
+            for (unsigned i = 0; i < CAND; ++i) {
+                if (cand_idx_[i] != MAX_INDEX) {
+                    printf("gpu cand %u node %u dist %.0f\n", i, cand_idx_[i], cand_dist_[i]);
+                }
+            }
+        }
     }
 
     // ── final merge (catch unmerged candidates from last iteration) ─────

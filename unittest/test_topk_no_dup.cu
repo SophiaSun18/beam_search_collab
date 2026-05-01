@@ -43,9 +43,18 @@ __global__ void kernel_test_no_dup(
 
         // pick 1 node
         uint32_t pbuf[N];
+        #pragma unroll
+        for (unsigned j = 0; j < N; ++j) pbuf[j] = 0xFFFFFFFF;
         unsigned found = buf.pick(pbuf, 1);
+        uint32_t picked = 0xFFFFFFFF;
+        const bool has_pick = found > 0 && pbuf[0] != 0xFFFFFFFF;
+        const uint32_t ballot = __ballot_sync(0xffffffff, has_pick);
+        if (ballot != 0) {
+            const int src_lane = __ffs(ballot) - 1;
+            picked = __shfl_sync(0xffffffff, pbuf[0], src_lane);
+        }
         if (tid == 0 && found > 0) {
-            g_picked[picked_count] = pbuf[0];
+            g_picked[picked_count] = picked;
             picked_count++;
         }
         __syncthreads();

@@ -59,14 +59,17 @@ static float compute_recall(const vid_t* predicted, const int* groundtruth,
                              size_t nq, int topk, int gt_k) {
     size_t correct = 0;
     for (size_t i = 0; i < nq; i++) {
+        std::unordered_set<int> gt_set;
+        gt_set.reserve(static_cast<size_t>(gt_k));
+        for (int k = 0; k < gt_k; k++) {
+            gt_set.insert(groundtruth[i * gt_k + k]);
+        }
         std::unordered_set<int> seen;
         seen.reserve(static_cast<size_t>(topk));
         for (int j = 0; j < topk; j++) {
             int pred = static_cast<int>(predicted[i * topk + j]);
             if (!seen.insert(pred).second) continue;
-            for (int k = 0; k < gt_k; k++) {
-                if (pred == groundtruth[i * gt_k + k]) { correct++; break; }
-            }
+            if (gt_set.count(pred) != 0) correct++;
         }
     }
     return static_cast<float>(correct) / (nq * topk);
@@ -330,6 +333,7 @@ int main() {
         cfg.entry_point    = entry_point;
         cfg.max_iterations = js.value("max_iterations", 1024);
         cfg.reset_interval = js.value("reset_interval", 16);
+        cfg.trace_iterations = js.value("trace_iterations", 0);
 
         if (mode == "base") {
             run_base(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
@@ -345,6 +349,16 @@ int main() {
 
     // ── results ─────────────────────────────────────────────────────────
     cudaMemcpy(h_results.data(), d_results, nq * K * sizeof(vid_t), cudaMemcpyDeviceToHost);
+    std::cout << "pred[0]:";
+    for (int i = 0; i < K; ++i) {
+        std::cout << ' ' << h_results[static_cast<size_t>(i)];
+    }
+    std::cout << std::endl;
+    std::cout << "gt[0]:";
+    for (int i = 0; i < gt_k; ++i) {
+        std::cout << ' ' << h_gt[static_cast<size_t>(i)];
+    }
+    std::cout << std::endl;
     float recall = compute_recall(h_results.data(), h_gt, nq, K, gt_k);
     std::cout << "recall@" << K << ": " << recall << std::endl;
 

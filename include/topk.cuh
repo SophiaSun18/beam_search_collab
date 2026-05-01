@@ -298,8 +298,10 @@ __device__ unsigned SharedBitonicTopK<BX, REG>::pick(uint32_t (&out)[N], unsigne
     while (found < n) {
         uint32_t val = 0;
         bool unmarked = false;
-        if (tid < 32 && base + tid < topk) {
-            val = topk_idx[base + tid];
+        const unsigned rev_tid = 31 - tid;
+        const unsigned pos = base + rev_tid;
+        if (tid < 32 && pos < topk) {
+            val = topk_idx[pos];
             unmarked = ((val & MSB) == 0) && (val != 0xFFFFFFFF);
         }
 
@@ -315,7 +317,7 @@ __device__ unsigned SharedBitonicTopK<BX, REG>::pick(uint32_t (&out)[N], unsigne
 
         if (unmarked && found + lane_prefix < n) {
             out[found + lane_prefix] = val;  // node ID (MSB clear)
-            topk_idx[base + tid] = val | MSB;
+            topk_idx[pos] = val | MSB;
         }
 
         found += count;
