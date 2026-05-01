@@ -12,7 +12,18 @@ set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_INCLUDES 0)
 add_library(nlohmann_json INTERFACE)
 target_include_directories(nlohmann_json INTERFACE ${CMAKE_SOURCE_DIR}/3rd)
 
-# ── GPU targets ──────────────────────────────────────────────────────────────
+find_package(OpenMP REQUIRED COMPONENTS CXX)
+
+# ── CLI targets ──────────────────────────────────────────────────────────────
+
+add_executable(build_graph src/build_graph.cpp)
+target_compile_options(build_graph PRIVATE -O3)
+target_link_libraries(build_graph PRIVATE OpenMP::OpenMP_CXX)
+
+add_executable(cpu_cli src/cpu_cli.cpp)
+target_include_directories(cpu_cli PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(cpu_cli PRIVATE nlohmann_json)
+target_compile_options(cpu_cli PRIVATE -O3)
 
 add_executable(gpu_cli src/gpu_cli.cu)
 target_include_directories(gpu_cli PRIVATE ${CMAKE_SOURCE_DIR}/include)
@@ -42,5 +53,3 @@ add_executable(test_bitonic_sort_full unittest/test_bitonic_sort_full.cu)
 target_include_directories(test_bitonic_sort_full PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_compile_options(test_bitonic_sort_full PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
 add_test(NAME test_bitonic_sort_full COMMAND test_bitonic_sort_full)
-
-

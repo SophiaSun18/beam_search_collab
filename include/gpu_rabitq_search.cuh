@@ -201,6 +201,8 @@ __device__ void GPURabitqSearch<BX>::search(
         cand_idx_[i]  = MAX_INDEX;
         cand_dist_[i] = FLT_MAX;
     }
+
+    hf_.init();
     __syncthreads();
 
     // ── seed entry point with L2 distance ────────────────��──────────
@@ -210,6 +212,7 @@ __device__ void GPURabitqSearch<BX>::search(
         if (lane_id == 0) {
             cand_idx_[0]  = cfg_.entry_point;
             cand_dist_[0] = d;
+            hf_.insert(cfg_.entry_point);
         }
     }
     __syncthreads();
@@ -236,10 +239,21 @@ __device__ void GPURabitqSearch<BX>::search(
         // pick next node to expand
         {
             uint32_t pbuf[BX];
+            #pragma unroll
+            for (unsigned i = 0; i < BX; ++i) pbuf[i] = MAX_INDEX;
             unsigned found = topk_.pick(pbuf, 1);
+            uint32_t picked = MAX_INDEX;
+            if (warp_id == 0) {
+                const bool has_pick = found > 0 && pbuf[0] != MAX_INDEX;
+                const uint32_t ballot = __ballot_sync(0xffffffff, has_pick);
+                if (ballot != 0) {
+                    const int src_lane = __ffs(ballot) - 1;
+                    picked = __shfl_sync(0xffffffff, pbuf[0], src_lane);
+                }
+            }
             if (warp_id == 0 && lane_id == 0) {
                 keep_expanding = found;
-                if (found > 0) parent_buf_[0] = pbuf[0];
+                if (found > 0) parent_buf_[0] = picked;
             }
         }
         __syncthreads();

@@ -14,8 +14,44 @@ make -j$(nproc)
 
 This produces:
 
+- `build_graph` — host-side Vamana graph builder for `.fvecs` input
 - `gpu_cli` — unified search CLI (JSON config from stdin)
 - `test_*` — unit tests
+
+## Data Preparation
+
+### HDF5 to project binaries
+
+`script/unpack.py` converts ANN-benchmarks style HDF5 files into the formats consumed by `gpu_cli`:
+
+```bash
+uv run script/unpack.py sift-128-euclidean.hdf5 data/sift
+```
+
+Generated files:
+
+- `base.fvecs` from dataset `train`
+- `query.fvecs` from dataset `test`
+- `groundtruth.ivecs` from dataset `neighbors`
+- optional `groundtruth_distances.npy` from dataset `distances`
+
+### Build a graph
+
+`build_graph` implements the Vamana-style build loop from the imported `index.hpp` and writes the legacy graph format already loaded by `CPUGraph`:
+
+```bash
+./build/build_graph \
+  --base data/sift/base.fvecs \
+  --graph data/sift/graph.bin \
+  --degree 32 \
+  --beam-width 128 \
+  --alpha 2.0
+```
+
+Options:
+
+- `--metric l2|ip` selects the build distance metric
+- `--seed` controls insertion order shuffling
 
 ## Usage
 
@@ -89,7 +125,7 @@ The CLI expects pre-built graph files in the ScaleANN `.bin` format:
 - **query.fvecs** — same format
 - **groundtruth.ivecs** — standard ivecs format
 
-Graph building is not yet integrated. Use [ScaleANN](https://github.com/scalable-anns/ScaleANN) to build graphs, then point `gpu_cli` at the output files.
+Graph building is available via `build_graph`, which emits the same `.bin` layout expected by `gpu_cli`.
 
 ## Tests
 
@@ -120,6 +156,7 @@ cd build && ctest
 | `include/rabitq.hpp` | `CPURabitqData` — host-side RAbitQ codebook loader |
 | `include/rabitq.cuh` | `GPURabitq` (owning) + `GPURabitqView` (kernel-safe) + `RabitqQuery` (prepared query) |
 | `include/gpu_rabitq_search.cuh` | `GPURabitqSearch` — block-level RAbitQ beam search with fastscan |
+| `src/build_graph.cpp` | Host-side Vamana graph builder |
 | `src/gpu_cli.cu` | Unified CLI binary |
 | `3rd/nlohmann/json.hpp` | Vendored JSON parser (v3.11.3) |
 
@@ -141,6 +178,5 @@ cd build && ctest
 
 ### Not yet integrated
 
-- **Graph building** — Vamana graph construction currently requires [ScaleANN](https://github.com/scalable-anns/ScaleANN). Integrating the builder would improve reproducibility.
 - **RAbitQ search** — The scalar RAbitQ kernel has been migrated (`GPURabitqSearch`). The tensor-core variant (`search_tensor_rabitq.cuh`) has not.
 - **Microbenchmarks** — `gpu_microbenchmark.cu` is functional but not included in the default build.

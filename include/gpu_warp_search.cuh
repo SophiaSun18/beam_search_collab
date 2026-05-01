@@ -130,6 +130,8 @@ __device__ void GPUWarpSearch<NY, REG>::search(
         cand_idx_[i]  = MAX_INDEX;
         cand_dist_[i] = FLT_MAX;
     }
+
+    hf_.init();
     __syncwarp();
 
     // ── seed entry point ────────────────────────────────────────────────
@@ -167,9 +169,18 @@ __device__ void GPUWarpSearch<NY, REG>::search(
 
         // ── pick next node to expand ────────────────────────────────────
         uint32_t pbuf[BX * REG];
+        #pragma unroll
+        for (unsigned i = 0; i < BX * REG; ++i) pbuf[i] = MAX_INDEX;
         unsigned found = topk_.pick(pbuf, 1);
+        uint32_t picked = MAX_INDEX;
+        const bool has_pick = found > 0 && pbuf[0] != MAX_INDEX;
+        const uint32_t ballot = __ballot_sync(0xffffffff, has_pick);
+        if (ballot != 0) {
+            const int src_lane = __ffs(ballot) - 1;
+            picked = __shfl_sync(0xffffffff, pbuf[0], src_lane);
+        }
         if (lane == 0 && found > 0)
-            parent_buf_[0] = pbuf[0];
+            parent_buf_[0] = picked;
         __syncwarp();
 
         if (found == 0) break;

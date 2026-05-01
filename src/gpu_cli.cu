@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cfloat>
 #include <cstdint>
+#include <unordered_set>
 
 #include <nlohmann/json.hpp>
 #include "cpu_graph.hpp"
@@ -58,8 +59,11 @@ static float compute_recall(const vid_t* predicted, const int* groundtruth,
                              size_t nq, int topk, int gt_k) {
     size_t correct = 0;
     for (size_t i = 0; i < nq; i++) {
+        std::unordered_set<int> seen;
+        seen.reserve(static_cast<size_t>(topk));
         for (int j = 0; j < topk; j++) {
             int pred = static_cast<int>(predicted[i * topk + j]);
+            if (!seen.insert(pred).second) continue;
             for (int k = 0; k < gt_k; k++) {
                 if (pred == groundtruth[i * gt_k + k]) { correct++; break; }
             }
@@ -182,10 +186,23 @@ static void run_warp(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
     int num_blocks = (nq + NY - 1) / NY;
     dim3 block(WARP_SIZE, NY);
 
+    cudaFuncSetAttribute(kernel_warp_search<NY>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         static_cast<int>(smem));
+
     auto start = std::chrono::high_resolution_clock::now();
     kernel_warp_search<NY><<<num_blocks, block, smem>>>(
         gpu_graph.view(), cfg, nq, dim, d_queries, d_results, K);
-    cudaDeviceSynchronize();
+    cudaError_t launch_err = cudaGetLastError();
+    if (launch_err != cudaSuccess) {
+        throw std::runtime_error(std::string("warp kernel launch failed: ") +
+                                 cudaGetErrorString(launch_err));
+    }
+    cudaError_t sync_err = cudaDeviceSynchronize();
+    if (sync_err != cudaSuccess) {
+        throw std::runtime_error(std::string("warp kernel execution failed: ") +
+                                 cudaGetErrorString(sync_err));
+    }
     auto end = std::chrono::high_resolution_clock::now();
 
     double elapsed = std::chrono::duration<double>(end - start).count();

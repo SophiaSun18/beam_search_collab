@@ -290,6 +290,7 @@ template <unsigned BX, unsigned REG>
 __device__ unsigned SharedBitonicTopK<BX, REG>::pick(uint32_t (&out)[N], unsigned n) {
     constexpr uint32_t MSB = 0x80000000;
     const unsigned tid = threadIdx.x;
+
     unsigned found = 0;
 
     // Smallest elements at the tail (descending buffer). Scan backwards.
