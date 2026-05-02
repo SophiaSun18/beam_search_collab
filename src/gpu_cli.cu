@@ -14,7 +14,6 @@
 #include "gpu_reg_search.cuh"
 #include "gpu_warp_search.cuh"
 #include "gpu_rabitq_search.cuh"
-#include "gpu_sophia_search.cuh"
 
 using json = nlohmann::json;
 
@@ -268,38 +267,6 @@ static void run_warp(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
     run_warp_impl<NY, SharedBitonicTopK<32, REG>, REG, Filter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
 }
 
-static void run_sophia(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
-                       int nq, int dim, int K,
-                       const float* d_queries, vid_t* d_results)
-{
-    SophiaSearchCfg scfg;
-    scfg.topk_size      = cfg.topk_size;
-    scfg.bitlen         = cfg.bitlen;
-    scfg.entry_point    = cfg.entry_point;
-    scfg.max_iterations = cfg.max_iterations;
-    scfg.reset_interval = cfg.reset_interval;
-
-    size_t smem = sophia_shared_mem_bytes(scfg.bitlen, dim);
-    int num_blocks = nq;
-
-    CUDA_CHECK(cudaFuncSetAttribute(kernel_sophia_search,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         static_cast<int>(smem)));
-
-    constexpr int NRUNS = 5;
-    auto start = std::chrono::high_resolution_clock::now();
-    for (int r = 0; r < NRUNS; r++) {
-        kernel_sophia_search<<<num_blocks, SOPHIA_BLOCK_SIZE, smem>>>(
-            gpu_graph.view(), scfg, nq, dim, d_queries, d_results, K);
-        CUDA_CHECK(cudaGetLastError());
-    }
-    CUDA_CHECK(cudaDeviceSynchronize());
-    auto end = std::chrono::high_resolution_clock::now();
-
-    double elapsed = std::chrono::duration<double>(end - start).count() / NRUNS;
-    std::cout << "  time: " << elapsed * 1000.0 << " ms"
-              << "  qps: " << nq / elapsed << std::endl;
-}
 
 static void run_rabitq(const GPUGraph& gpu_graph, const GPURabitq& gpu_rabitq,
                        const GPURabitqSearchCfg& cfg,
@@ -462,8 +429,6 @@ int main() {
             run_warp<4, 2, BloomFilter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
         } else if (mode == "bwarp82") {
             run_warp<8, 2, BloomFilter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
-        } else if (mode == "sophia") {
-            run_sophia(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
         } else {
             std::cerr << "Unknown mode: " << mode << std::endl;
             return 1;
