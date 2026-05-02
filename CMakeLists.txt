@@ -78,6 +78,11 @@ target_include_directories(test_reg_topk_merge PRIVATE ${CMAKE_SOURCE_DIR}/inclu
 target_compile_options(test_reg_topk_merge PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
 add_test(NAME test_reg_topk_merge COMMAND test_reg_topk_merge)
 
+add_executable(test_reg_topk_pick_order unittest/test_reg_topk_pick_order.cu)
+target_include_directories(test_reg_topk_pick_order PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_compile_options(test_reg_topk_pick_order PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
+add_test(NAME test_reg_topk_pick_order COMMAND test_reg_topk_pick_order)
+
 add_executable(test_reg_topk_no_dup unittest/test_reg_topk_no_dup.cu)
 target_include_directories(test_reg_topk_no_dup PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_compile_options(test_reg_topk_no_dup PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)

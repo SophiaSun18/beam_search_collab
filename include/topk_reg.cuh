@@ -147,30 +147,60 @@ __device__ unsigned RegBitonicTopK<REGX, REGY>::pick(
     uint32_t (&out)[REGY], unsigned n)
 {
     constexpr uint32_t MSB = 0x80000000;
+    constexpr unsigned TOTAL = 32 * REGX;
     const unsigned lane = threadIdx.x & 31;
     unsigned found = 0;
 
-    // Scan from smallest (register REGX-1, lane 31) to largest
-    for (int r = static_cast<int>(REGX) - 1; r >= 0 && found < n; r--) {
-        uint32_t val = topk_i_[r];
+    // Scan 32-position windows from the tail (smallest distances).
+    // Each thread reads one position per window via shuffle.
+    for (unsigned base = TOTAL - 32; found < n; base -= 32) {
+        // Thread tid checks position base + tid (tid=0 → largest in window)
+        unsigned pos = base + lane;
+        unsigned src_lane = pos / REGX;
+        unsigned src_reg  = pos % REGX;
+
+        // Read topk_i_[src_reg] from thread src_lane
+        uint32_t val = 0xFFFFFFFF;
+        #pragma unroll
+        for (unsigned r = 0; r < REGX; r++) {
+            uint32_t tmp = __shfl_sync(0xffffffff, topk_i_[r], src_lane);
+            if (r == src_reg) val = tmp;
+        }
+
         bool unmarked = ((val & MSB) == 0) && (val != 0xFFFFFFFF);
         uint32_t ballot = __ballot_sync(0xffffffff, unmarked);
-        if (ballot == 0) continue;
+
+        if (ballot == 0) {
+            if (base == 0) break;
+            continue;
+        }
 
         while (ballot && found < n) {
-            // Highest set bit = highest lane = smallest distance
-            int src_lane = 31 - __clz(ballot);
-            uint32_t picked = __shfl_sync(0xffffffff, val, src_lane);
+            // Highest set bit = highest lane = smallest position in window
+            int pick_tid = 31 - __clz(ballot);
 
-            if (lane == static_cast<unsigned>(src_lane))
-                topk_i_[r] = val | MSB;
+            // Broadcast picked info to all threads
+            uint32_t picked_val = __shfl_sync(0xffffffff, val, pick_tid);
+            unsigned picked_src_lane = __shfl_sync(0xffffffff, src_lane, pick_tid);
+            unsigned picked_src_reg  = __shfl_sync(0xffffffff, src_reg, pick_tid);
+
+            // Mark: only the owning thread sets MSB on the correct register
+            if (lane == picked_src_lane) {
+                #pragma unroll
+                for (unsigned r = 0; r < REGX; r++) {
+                    if (r == picked_src_reg)
+                        topk_i_[r] |= MSB;
+                }
+            }
 
             if (lane == 0)
-                out[found] = picked;
+                out[found] = picked_val & ~MSB;
             found++;
 
-            ballot &= ~(1u << src_lane);
+            ballot &= ~(1u << pick_tid);
         }
+
+        if (base == 0) break;
     }
 
     return (found < n) ? found : n;
@@ -185,20 +215,26 @@ __device__ void RegBitonicTopK<REGX, REGY>::flush(
     const unsigned lane = threadIdx.x & 31;
     const unsigned total = 32 * REGX;
     const unsigned start = total - n;
+    // Round up so all 32 threads iterate the same number of times,
+    // ensuring every __shfl_sync has full warp participation.
+    const unsigned n_rounded = (n + 31) & ~31u;
 
-    for (unsigned i = lane; i < n; i += 32) {
+    for (unsigned i = lane; i < n_rounded; i += 32) {
         unsigned pos = start + i;
         unsigned src_lane = pos / REGX;
         unsigned src_reg  = pos % REGX;
         float    d = 0;
         uint32_t x = 0;
+        #pragma unroll
         for (unsigned r = 0; r < REGX; r++) {
             float    td = __shfl_sync(0xffffffff, topk_d_[r], src_lane);
             uint32_t tx = __shfl_sync(0xffffffff, topk_i_[r], src_lane);
             if (r == src_reg) { d = td; x = tx; }
         }
-        dist[i] = d;
-        idx[i]  = x & ~0x80000000u;
+        if (i < n) {
+            dist[i] = d;
+            idx[i]  = x & ~0x80000000u;
+        }
     }
 }
 
