@@ -11,7 +11,6 @@
 #include "cpu_graph.hpp"
 #include "gpu_graph.cuh"
 #include "gpu_base_search.cuh"
-#include "gpu_reg_search.cuh"
 #include "gpu_warp_search.cuh"
 #include "gpu_rabitq_search.cuh"
 
@@ -116,24 +115,6 @@ __global__ void kernel_warp_search(
 
 
 
-static constexpr unsigned REG_BLOCK_SIZE = 32;
-
-__global__ void kernel_reg_search(
-    GPUGraphView graph, GPUBaseSearchCfg cfg,
-    int nq, int dim,
-    const float* __restrict__ d_queries,
-    vid_t* __restrict__ d_results, int K)
-{
-    int qid = blockIdx.x;
-    if (qid >= nq) return;
-
-    extern __shared__ char smem[];
-    char* ptr = smem;
-    GPURegSearch<REG_BLOCK_SIZE> searcher(ptr, cfg, graph);
-    __syncwarp();
-    searcher.search(d_queries + qid * dim, d_results + qid * K, K);
-}
-
 
 __global__ void kernel_rabitq_search(
     GPUGraphView graph, GPURabitqView rabitq, GPURabitqSearchCfg cfg,
@@ -180,31 +161,6 @@ static void run_base(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
 }
 
 
-static void run_reg(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
-                    int nq, int dim, int K,
-                    const float* d_queries, vid_t* d_results)
-{
-    size_t smem = GPURegSearch<REG_BLOCK_SIZE>::shared_mem_bytes(cfg, dim, gpu_graph.degree());
-    int num_blocks = nq;
-
-    CUDA_CHECK(cudaFuncSetAttribute(kernel_reg_search,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         static_cast<int>(smem)));
-
-    constexpr int NRUNS = 5;
-    auto start = std::chrono::high_resolution_clock::now();
-    for (int r = 0; r < NRUNS; r++) {
-        kernel_reg_search<<<num_blocks, REG_BLOCK_SIZE, smem>>>(
-            gpu_graph.view(), cfg, nq, dim, d_queries, d_results, K);
-        CUDA_CHECK(cudaGetLastError());
-    }
-    CUDA_CHECK(cudaDeviceSynchronize());
-    auto end = std::chrono::high_resolution_clock::now();
-
-    double elapsed = std::chrono::duration<double>(end - start).count() / NRUNS;
-    std::cout << "  time: " << elapsed * 1000.0 << " ms"
-              << "  qps: " << nq / elapsed << std::endl;
-}
 
 template <unsigned NY, typename TopK, unsigned REG, typename Filter = HashFilter>
 static void run_warp_impl(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
@@ -395,8 +351,6 @@ int main() {
 
         if (mode == "base") {
             run_base(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
-        } else if (mode == "reg") {
-            run_reg(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
         } else if (mode == "warp11") {
             run_warp<1, 1>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
         } else if (mode == "warp12") {
