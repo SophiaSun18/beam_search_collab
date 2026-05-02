@@ -29,6 +29,21 @@ public:
     __device__ RegBitonicTopK();
 
     /**
+     * @brief Construct from shared memory pointer and topk size.
+     *
+     * Validates topk == 32*REGX. Does not consume smem (all storage is
+     * in registers). Provided for interface compatibility with SharedBitonicTopK.
+     */
+    __device__ RegBitonicTopK(char*& smem, unsigned topk);
+
+    /**
+     * @brief Shared memory bytes per instance (always 0 — register-only).
+     */
+    __host__ __device__ static size_t shared_mem_bytes_per_instance(unsigned /*topk*/) {
+        return 0;
+    }
+
+    /**
      * @brief Merge incoming candidates into the descending internal buffer.
      *
      * Input may be unsorted. REGX must be divisible by REGY. The merge
@@ -44,7 +59,8 @@ public:
      * 0xFFFFFFFF. Found nodes are marked (MSB set). Lane 0 receives
      * the picked node IDs in out[0..found-1].
      */
-    __device__ unsigned pick(uint32_t (&out)[REGY], unsigned n);
+    template <unsigned N>
+    __device__ unsigned pick(uint32_t (&out)[N], unsigned n);
 
     /**
      * @brief Flush the n smallest elements to memory.
@@ -87,6 +103,15 @@ __device__ RegBitonicTopK<REGX, REGY>::RegBitonicTopK() {
         topk_d_[j] = FLT_MAX;
         topk_i_[j] = 0xFFFFFFFF;
     }
+}
+
+template <unsigned REGX, unsigned REGY>
+__device__ RegBitonicTopK<REGX, REGY>::RegBitonicTopK(char*& /*smem*/, unsigned topk)
+    : RegBitonicTopK()
+{
+    // Register-only: assert size matches, don't touch smem.
+    (void)topk;
+    // assert(topk == 32 * REGX);
 }
 
 template <unsigned REGX, unsigned REGY>
@@ -143,8 +168,9 @@ __device__ void RegBitonicTopK<REGX, REGY>::merge(
 // ── pick ────────────────────────────────────────────────────────────────────
 
 template <unsigned REGX, unsigned REGY>
+template <unsigned N>
 __device__ unsigned RegBitonicTopK<REGX, REGY>::pick(
-    uint32_t (&out)[REGY], unsigned n)
+    uint32_t (&out)[N], unsigned n)
 {
     constexpr uint32_t MSB = 0x80000000;
     constexpr unsigned TOTAL = 32 * REGX;

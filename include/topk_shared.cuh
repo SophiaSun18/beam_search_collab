@@ -132,7 +132,8 @@ class SharedBitonicTopK : private BitonicScratchBase<(BX > 32)> {
      * @param n     Maximum number of nodes to pick.
      * @return      Actual number of nodes picked (<= n).
      */
-    __device__ unsigned pick(uint32_t (&idx)[N], unsigned n);
+    template <unsigned PICK_N>
+    __device__ unsigned pick(uint32_t (&idx)[PICK_N], unsigned n);
     /**
      * @brief Flush the n smallest elements to global memory.
      *
@@ -292,7 +293,8 @@ __device__ void SharedBitonicTopK<BX, REG>::merge(float (&dist)[REG], uint32_t (
 // ── pick ────────────────────────────────────────────────────────────────────
 
 template <unsigned BX, unsigned REG>
-__device__ unsigned SharedBitonicTopK<BX, REG>::pick(uint32_t (&out)[N], unsigned n) {
+template <unsigned PICK_N>
+__device__ unsigned SharedBitonicTopK<BX, REG>::pick(uint32_t (&out)[PICK_N], unsigned n) {
     constexpr uint32_t MSB = 0x80000000;
     const unsigned tid = threadIdx.x;
 
