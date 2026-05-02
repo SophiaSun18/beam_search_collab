@@ -215,14 +215,19 @@ __device__ void GPURabitqSearch<BX>::search(
 
     // ── shared flags for loop control ─────────��─────────────────────
     __shared__ uint32_t keep_expanding;
-    __shared__ uint32_t current_expanded;
 
     // ── main loop ───────────────────────────────────────────────────
     for (int iter = 0; iter < cfg_.max_iterations; iter++) {
 
-        // forgettable hash table reset
-        if ((iter + 1) % cfg_.reset_interval == 0)
+        // forgettable hash table reset + re-populate from frontier
+        if ((iter + 1) % cfg_.reset_interval == 0) {
             hf_.init();
+            __syncthreads();
+            for (unsigned i = tid; i < topk_.capacity(); i += BX) {
+                uint32_t node = topk_.id(i);
+                if (node != MAX_INDEX) hf_.insert(node);
+            }
+        }
         __syncthreads();
 
         // merge candidates into topk
@@ -255,12 +260,9 @@ __device__ void GPURabitqSearch<BX>::search(
         __syncthreads();
         if (!keep_expanding) break;
 
-        // ── try to insert picked node into hash ─────────────────────
         vid_t current_node = parent_buf_[0];
-        if (tid == 0)
-            current_expanded = hf_.insert(current_node);
+        hf_.insert(current_node);
         __syncthreads();
-        if (!current_expanded) continue;
 
         // ── stage codes and factors (async, overlaps with L2) ───────
         stage_begin(staged_codes_,

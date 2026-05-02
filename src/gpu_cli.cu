@@ -20,8 +20,8 @@ using json = nlohmann::json;
     cudaError_t err_ = (call);                                          \
     if (err_ != cudaSuccess)                                            \
         throw std::runtime_error(std::string(__FILE__) + ":" +          \
-            std::to_string(__LINE__) + " " + #call + " failed: " +     \
-            cudaGetErrorString(err_));                                   \
+            std::to_string(__LINE__) + " " + #call + " failed: " +      \
+            cudaGetErrorString(err_));                                  \
 } while (0)
 
 static float compute_recall(const vid_t* predicted, const int* groundtruth,
@@ -167,10 +167,12 @@ static void run_warp_regx(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg
                           const float* d_queries, vid_t* d_results)
 {
     if constexpr (REGX >= REG && REGX % REG == 0) {
-        run_warp_impl<NY, RegBitonicTopK<REGX, REG>, REG, Filter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
+        run_warp_impl<NY, RegBitonicTopK<REGX, REG>, REG, Filter>(
+                gpu_graph, cfg, nq, dim, K, d_queries, d_results);
     } else {
         // REGX too small for this REG — fall back to shared memory.
-        run_warp_impl<NY, SharedBitonicTopK<32, REG>, REG, Filter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
+        run_warp_impl<NY, SharedBitonicTopK<32, REG>, REG, Filter>(
+                gpu_graph, cfg, nq, dim, K, d_queries, d_results);
     }
 }
 
@@ -183,10 +185,18 @@ static void run_warp_reg(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
     unsigned regx = cfg.topk_size / 32;
     if (regx * 32 == cfg.topk_size) {
         switch (regx) {
-            case  2: run_warp_regx<NY, REG,  2, Filter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); return;
-            case  4: run_warp_regx<NY, REG,  4, Filter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); return;
-            case  8: run_warp_regx<NY, REG,  8, Filter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); return;
-            case 16: run_warp_regx<NY, REG, 16, Filter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); return;
+            case  2: 
+                run_warp_regx<NY, REG,  2, Filter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); 
+                return;
+            case  4: 
+                run_warp_regx<NY, REG,  4, Filter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); 
+                return;
+            case  8: 
+                run_warp_regx<NY, REG,  8, Filter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); 
+                return;
+            case 16: 
+                run_warp_regx<NY, REG, 16, Filter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); 
+                return;
             default: break;
         }
     }
@@ -203,10 +213,18 @@ static void run_warp(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
     unsigned reg = 1;
     while (32 * reg < degree) reg *= 2;
     switch (reg) {
-        case  1: run_warp_reg<NY,  1, Filter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); break;
-        case  2: run_warp_reg<NY,  2, Filter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); break;
-        case  4: run_warp_reg<NY,  4, Filter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); break;
-        case  8: run_warp_reg<NY,  8, Filter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); break;
+        case  1: 
+            run_warp_reg<NY,  1, Filter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); 
+            break;
+        case  2: 
+            run_warp_reg<NY,  2, Filter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); 
+            break;
+        case  4: 
+            run_warp_reg<NY,  4, Filter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); 
+            break;
+        case  8: 
+            run_warp_reg<NY,  8, Filter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); 
+            break;
         default:
             std::cerr << "degree " << degree << " too large (max 256)" << std::endl;
             exit(1);
@@ -248,10 +266,18 @@ static void run_base(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
     unsigned bx = 32;
     while (bx * 2 <= cfg.topk_size && bx < 256) bx *= 2;
     switch (bx) {
-        case  32: run_base_impl< 32>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); break;
-        case  64: run_base_impl< 64>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); break;
-        case 128: run_base_impl<128>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); break;
-        case 256: run_base_impl<256>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); break;
+        case  32: 
+            run_base_impl< 32>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); 
+            break;
+        case  64: 
+            run_base_impl< 64>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); 
+            break;
+        case 128: 
+            run_base_impl<128>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); 
+            break;
+        case 256: 
+            run_base_impl<256>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); 
+            break;
     }
 }
 
