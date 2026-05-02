@@ -113,9 +113,6 @@ __global__ void kernel_warp_search(
     searcher.search(d_queries + qid * dim, d_results + qid * K, K);
 }
 
-
-
-
 __global__ void kernel_rabitq_search(
     GPUGraphView graph, GPURabitqView rabitq, GPURabitqSearchCfg cfg,
     int nq, int dim,
@@ -159,8 +156,6 @@ static void run_base(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
     std::cout << "  time: " << elapsed * 1000.0 << " ms"
               << "  qps: " << nq / elapsed << std::endl;
 }
-
-
 
 template <unsigned NY, typename TopK, unsigned REG, typename Filter = HashFilter>
 static void run_warp_impl(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
@@ -222,7 +217,6 @@ static void run_warp(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
     // Fallback: shared memory topk.
     run_warp_impl<NY, SharedBitonicTopK<32, REG>, REG, Filter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
 }
-
 
 static void run_rabitq(const GPUGraph& gpu_graph, const GPURabitq& gpu_rabitq,
                        const GPURabitqSearchCfg& cfg,
