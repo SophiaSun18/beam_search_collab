@@ -1,5 +1,5 @@
 #pragma once
-#include "gpu_base_search.cuh"
+#include "gpu_search_base.cuh"
 #include <cuda_runtime.h>
 
 /**

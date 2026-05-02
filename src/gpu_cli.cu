@@ -10,9 +10,9 @@
 #include "data_loader.hpp"
 #include "cpu_graph.hpp"
 #include "gpu_graph.cuh"
-#include "gpu_base_search.cuh"
-#include "gpu_warp_search.cuh"
-#include "gpu_rabitq_search.cuh"
+#include "gpu_search_base.cuh"
+#include "gpu_search_warp.cuh"
+#include "gpu_search_rabitq.cuh"
 
 using json = nlohmann::json;
 

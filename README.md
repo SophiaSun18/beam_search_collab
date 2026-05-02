@@ -107,10 +107,10 @@ EOF
 | Mode | Description |
 |------|-------------|
 | `base` | Block-level L2 search. 256 threads per query. |
-| `warp1` | Warp-level L2 search. 1 query per block. |
-| `warp2` | Warp-level L2 search. 2 queries per block. |
-| `warp4` | Warp-level L2 search. 4 queries per block. |
-| `warp8` | Warp-level L2 search. 8 queries per block. |
+| `warp1` | 1 queries per block. 32 threads per query |
+| `warp2` | 2 queries per block. 32 threads per query |
+| `warp4` | 4 queries per block. 32 threads per query |
+| `warp8` | 8 queries per block. 32 threads per query |
 | `bwarp1`..`bwarp8` | Same as `warp*` but with Bloom filter instead of hash filter. |
 | `rabitq` | Block-level RAbitQ search with fastscan. Requires `codebook` in data config. |
 
@@ -179,13 +179,13 @@ cd build && ctest
 | `src/cpu_cli.cpp` | CPU search CLI |
 | `src/replicate_queries.cpp` | Query replication utility |
 | `include/cpu_graph.hpp` | `CPUGraph` — host-side graph with file I/O |
-| `include/cpu_base_search.hpp` | `CPUBaseSearch` — CPU beam search with exact L2 |
-| `include/cpu_rabitq_search.hpp` | `CPURabitqSearch` — CPU beam search with RAbitQ estimation |
+| `include/cpu_search_base.hpp` | `CPUBaseSearch` — CPU beam search with exact L2 |
+| `include/cpu_search_rabitq.hpp` | `CPURabitqSearch` — CPU beam search with RAbitQ estimation |
 | `include/data_loader.hpp` | fvecs/ivecs read/write utilities |
 | `include/gpu_graph.cuh` | `GPUGraph` (owning) + `GPUGraphView` (kernel-safe) |
-| `include/gpu_base_search.cuh` | `GPUBaseSearch` — block-level L2 beam search |
-| `include/gpu_warp_search.cuh` | `GPUWarpSearch` — warp-level L2 beam search |
-| `include/gpu_rabitq_search.cuh` | `GPURabitqSearch` — block-level RAbitQ beam search with fastscan |
+| `include/gpu_search_base.cuh` | `GPUBaseSearch` — block-level L2 beam search |
+| `include/gpu_search_warp.cuh` | `GPUWarpSearch` — warp-level L2 beam search |
+| `include/gpu_search_rabitq.cuh` | `GPURabitqSearch` — block-level RAbitQ beam search with fastscan |
 | `include/rabitq.hpp` | `CPURabitqData` — host-side RAbitQ codebook loader |
 | `include/rabitq.cuh` | `GPURabitq` (owning) + `GPURabitqView` (kernel-safe) + `RabitqQuery` |
 | `include/l2.cuh` | L2 distance primitives |

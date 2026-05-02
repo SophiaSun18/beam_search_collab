@@ -10,8 +10,8 @@
 #include <nlohmann/json.hpp>
 
 #include "data_loader.hpp"
-#include "cpu_base_search.hpp"
-#include "cpu_rabitq_search.hpp"
+#include "cpu_search_base.hpp"
+#include "cpu_search_rabitq.hpp"
 
 using json = nlohmann::json;
 
