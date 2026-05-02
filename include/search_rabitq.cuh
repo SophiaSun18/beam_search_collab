@@ -198,13 +198,17 @@ void QuantizedBeamSearch(
         RESULT_POOL_INDEX[i] = MAX_INDEX;
         RESULT_POOL_DISTANCE[i] = FLT_MAX;
     }
+    __syncthreads();
 
     // only the first slot in candidate list is actually initialized with valid entry point
     if (warp_id == 0) {
         gpu_long_t l2_start = 0;
         if (GPU_DISTANCE_TIMING && lane_id == 0) l2_start = gpu_globaltimer();
-        CANDIDATE_INDEX[0] = entry_point;
-        CANDIDATE_DISTANCE[0] = warp_l2_distance(dim, query, d_qg_data + static_cast<size_t>(entry_point) * row_offset);
+        DISTANCE_T entry_dist = warp_l2_distance(dim, query, d_qg_data + static_cast<size_t>(entry_point) * row_offset);
+        if (lane_id == 0) {
+            CANDIDATE_INDEX[0] = entry_point;
+            CANDIDATE_DISTANCE[0] = entry_dist;
+        }
         if (GPU_DISTANCE_TIMING && lane_id == 0) {
             atomicAdd(&timing[GPU_TIMING_L2_CALLS], gpu_long_t(1));
             atomicAdd(&timing[GPU_TIMING_L2_CYCLES], gpu_globaltimer() - l2_start);
