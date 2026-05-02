@@ -83,10 +83,6 @@ target_include_directories(test_reg_topk_no_dup PRIVATE ${CMAKE_SOURCE_DIR}/incl
 target_compile_options(test_reg_topk_no_dup PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
 add_test(NAME test_reg_topk_no_dup COMMAND test_reg_topk_no_dup)
 
-add_executable(perf_sophia_topk unittest/perf_sophia_topk.cu)
-target_include_directories(perf_sophia_topk PRIVATE ${CMAKE_SOURCE_DIR}/include)
-target_compile_options(perf_sophia_topk PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
-
 # ── Profiling ───────────────────────────────────────────────────────────────
 
 add_executable(prof_hash_filter unittest/prof_hash_filter.cu)
@@ -100,3 +96,10 @@ target_compile_options(prof_l2 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
 add_executable(prof_topk unittest/prof_topk.cu)
 target_include_directories(prof_topk PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_compile_options(prof_topk PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
+
+add_executable(prof_sophia_topk unittest/prof_sophia_topk.cu)
+target_compile_options(prof_sophia_topk PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
+
+add_executable(prof_reg_topk unittest/prof_reg_topk.cu)
+target_include_directories(prof_reg_topk PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_compile_options(prof_reg_topk PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)

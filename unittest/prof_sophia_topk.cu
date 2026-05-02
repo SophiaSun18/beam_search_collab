@@ -1,16 +1,10 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
-#include <algorithm>
 #include <random>
-#include <string>
 #include <vector>
 #include <cfloat>
 #include <climits>
-
-#include "topk_shared.cuh"
-#include "topk_reg.cuh"
-#include "topk_reg.cuh"
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Sophia's sort/merge/pick — extracted from her utils.cuh / search_bitonic.cuh
@@ -175,8 +169,6 @@ __device__ uint32_t pick_expanders(int N, uint32_t* output_list, int M, uint32_t
 }  // namespace sophia
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Timing kernels — merge+pick N_ITERS times
-// ═══════════════════════════════════════════════════════════════════════════
 
 __global__ void kernel_sophia_bench(
     float* g_cand_dist, uint32_t* g_cand_idx,
@@ -211,114 +203,6 @@ __global__ void kernel_sophia_bench(
     }
 }
 
-__global__ void kernel_ours_bench(
-    float* g_cand_dist, uint32_t* g_cand_idx,
-    unsigned topk_size, unsigned cand_size, unsigned n_iters)
-{
-    constexpr unsigned BX = 32;
-    constexpr unsigned REG = 2;
-    constexpr unsigned N = BX * REG;
-    const unsigned tid = threadIdx.x;
-
-    extern __shared__ char smem[];
-    char* ptr = smem;
-    SharedBitonicTopK<BX, REG> buf(ptr, topk_size);
-    __syncwarp();
-
-    for (unsigned it = 0; it < n_iters; it++) {
-        float d[REG]; uint32_t x[REG];
-        #pragma unroll
-        for (unsigned j = 0; j < REG; j++) {
-            unsigned pos = tid * REG + j;
-            d[j] = (pos < cand_size) ? g_cand_dist[it * cand_size + pos] : FLT_MAX;
-            x[j] = (pos < cand_size) ? g_cand_idx[it * cand_size + pos]  : 0xFFFFFFFF;
-        }
-        buf.merge(d, x);
-
-        uint32_t pbuf[N];
-        #pragma unroll
-        for (unsigned i = 0; i < N; i++) pbuf[i] = 0xFFFFFFFF;
-        unsigned found = buf.pick(pbuf, 1);
-        uint32_t picked = 0xFFFFFFFF;
-        const bool has = found > 0 && pbuf[0] != 0xFFFFFFFF;
-        const uint32_t ballot = __ballot_sync(0xffffffff, has);
-        if (ballot != 0) picked = __shfl_sync(0xffffffff, pbuf[0], __ffs(ballot) - 1);
-        (void)picked;
-        __syncwarp();
-    }
-}
-
-// Ours REG=8: chunks=1
-__global__ void kernel_ours_bench_r8(
-    float* g_cand_dist, uint32_t* g_cand_idx,
-    unsigned topk_size, unsigned cand_size, unsigned n_iters)
-{
-    constexpr unsigned BX = 32;
-    constexpr unsigned REG = 8;
-    constexpr unsigned N = BX * REG;
-    const unsigned tid = threadIdx.x;
-
-    extern __shared__ char smem[];
-    char* ptr = smem;
-    SharedBitonicTopK<BX, REG> buf(ptr, topk_size);
-    __syncwarp();
-
-    for (unsigned it = 0; it < n_iters; it++) {
-        float d[REG]; uint32_t x[REG];
-        #pragma unroll
-        for (unsigned j = 0; j < REG; j++) {
-            unsigned pos = tid * REG + j;
-            d[j] = (pos < cand_size) ? g_cand_dist[it * cand_size + pos] : FLT_MAX;
-            x[j] = (pos < cand_size) ? g_cand_idx[it * cand_size + pos]  : 0xFFFFFFFF;
-        }
-        buf.merge(d, x);
-
-        uint32_t pbuf[N];
-        #pragma unroll
-        for (unsigned i = 0; i < N; i++) pbuf[i] = 0xFFFFFFFF;
-        unsigned found = buf.pick(pbuf, 1);
-        uint32_t picked = 0xFFFFFFFF;
-        const bool has = found > 0 && pbuf[0] != 0xFFFFFFFF;
-        const uint32_t ballot = __ballot_sync(0xffffffff, has);
-        if (ballot != 0) picked = __shfl_sync(0xffffffff, pbuf[0], __ffs(ballot) - 1);
-        (void)picked;
-        __syncwarp();
-    }
-}
-
-// RegBitonicTopK<8,2>: 32 threads, buffer=256, cand=64, pure register
-template <unsigned REGX, unsigned REGY>
-__global__ void kernel_reg_bench(
-    float* g_cand_dist, uint32_t* g_cand_idx,
-    unsigned topk_size, unsigned cand_size, unsigned n_iters)
-{
-    const unsigned tid = threadIdx.x;
-
-    RegBitonicTopK<REGX, REGY> buf;
-
-    for (unsigned it = 0; it < n_iters; it++) {
-        float d[REGY]; uint32_t x[REGY];
-        #pragma unroll
-        for (unsigned j = 0; j < REGY; j++) {
-            unsigned pos = tid * REGY + j;
-            d[j] = (pos < cand_size) ? g_cand_dist[it * cand_size + pos] : FLT_MAX;
-            x[j] = (pos < cand_size) ? g_cand_idx[it * cand_size + pos]  : 0xFFFFFFFF;
-        }
-        buf.merge(d, x);
-
-        uint32_t pbuf[REGY];
-        #pragma unroll
-        for (unsigned i = 0; i < REGY; i++) pbuf[i] = 0xFFFFFFFF;
-        unsigned found = buf.pick(pbuf, 1);
-        uint32_t picked = 0xFFFFFFFF;
-        const bool has = found > 0 && pbuf[0] != 0xFFFFFFFF;
-        const uint32_t ballot = __ballot_sync(0xffffffff, has);
-        if (ballot != 0) picked = __shfl_sync(0xffffffff, pbuf[0], __ffs(ballot) - 1);
-        (void)picked;
-        __syncwarp();
-    }
-}
-
 // ═══════════════════════════════════════════════════════════════════════════
 
 #define CUDA_CHECK(call) do { \
@@ -348,113 +232,22 @@ int main() {
     CUDA_CHECK(cudaMemcpy(d_dist, h_dist.data(), TOTAL * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_idx,  h_idx.data(),  TOTAL * sizeof(uint32_t), cudaMemcpyHostToDevice));
 
-    // Sophia: 256 threads, warp 0 sorts
-    {
-        size_t smem = (TOPK + CAND) * (sizeof(uint32_t) + sizeof(float)) + sizeof(uint32_t);
-        CUDA_CHECK(cudaFuncSetAttribute(kernel_sophia_bench,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)));
+    size_t smem = (TOPK + CAND) * (sizeof(uint32_t) + sizeof(float)) + sizeof(uint32_t);
+    CUDA_CHECK(cudaFuncSetAttribute(kernel_sophia_bench,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)));
 
+    kernel_sophia_bench<<<NBLOCKS, 256, smem>>>(d_dist, d_idx, TOPK, CAND, ITERS);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    auto start = std::chrono::high_resolution_clock::now();
+    for (int r = 0; r < NRUNS; r++) {
         kernel_sophia_bench<<<NBLOCKS, 256, smem>>>(d_dist, d_idx, TOPK, CAND, ITERS);
-        CUDA_CHECK(cudaDeviceSynchronize());
-
-        auto start = std::chrono::high_resolution_clock::now();
-        for (int r = 0; r < NRUNS; r++) {
-            kernel_sophia_bench<<<NBLOCKS, 256, smem>>>(d_dist, d_idx, TOPK, CAND, ITERS);
-            CUDA_CHECK(cudaGetLastError());
-        }
-        CUDA_CHECK(cudaDeviceSynchronize());
-        auto end = std::chrono::high_resolution_clock::now();
-        double us = std::chrono::duration<double, std::micro>(end - start).count() / NRUNS;
-        printf("sophia merge+pick: %.1f us  (%d blocks x %d iters)\n", us, NBLOCKS, ITERS);
+        CUDA_CHECK(cudaGetLastError());
     }
-
-    // Ours REG=2: 32 threads, chunks=4
-    {
-        size_t smem = SharedBitonicTopK<32, 2>::shared_mem_bytes(TOPK);
-        CUDA_CHECK(cudaFuncSetAttribute(kernel_ours_bench,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)));
-
-        kernel_ours_bench<<<NBLOCKS, 32, smem>>>(d_dist, d_idx, TOPK, CAND, ITERS);
-        CUDA_CHECK(cudaDeviceSynchronize());
-
-        auto start = std::chrono::high_resolution_clock::now();
-        for (int r = 0; r < NRUNS; r++) {
-            kernel_ours_bench<<<NBLOCKS, 32, smem>>>(d_dist, d_idx, TOPK, CAND, ITERS);
-            CUDA_CHECK(cudaGetLastError());
-        }
-        CUDA_CHECK(cudaDeviceSynchronize());
-        auto end = std::chrono::high_resolution_clock::now();
-        double us = std::chrono::duration<double, std::micro>(end - start).count() / NRUNS;
-        printf("ours REG=2:        %.1f us  (%d blocks x %d iters, chunks=4)\n", us, NBLOCKS, ITERS);
-    }
-
-    // Ours REG=8: 32 threads, chunks=1
-    {
-        size_t smem = SharedBitonicTopK<32, 8>::shared_mem_bytes(TOPK);
-        CUDA_CHECK(cudaFuncSetAttribute(kernel_ours_bench_r8,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem)));
-
-        kernel_ours_bench_r8<<<NBLOCKS, 32, smem>>>(d_dist, d_idx, TOPK, CAND, ITERS);
-        CUDA_CHECK(cudaDeviceSynchronize());
-
-        auto start = std::chrono::high_resolution_clock::now();
-        for (int r = 0; r < NRUNS; r++) {
-            kernel_ours_bench_r8<<<NBLOCKS, 32, smem>>>(d_dist, d_idx, TOPK, CAND, ITERS);
-            CUDA_CHECK(cudaGetLastError());
-        }
-        CUDA_CHECK(cudaDeviceSynchronize());
-        auto end = std::chrono::high_resolution_clock::now();
-        double us = std::chrono::duration<double, std::micro>(end - start).count() / NRUNS;
-        printf("ours REG=8:        %.1f us  (%d blocks x %d iters, chunks=1)\n", us, NBLOCKS, ITERS);
-    }
-
-    // Reg<8,2>: 32 threads, buffer=256, cand=64, pure register
-    {
-        kernel_reg_bench<8, 2><<<NBLOCKS, 32>>>(d_dist, d_idx, TOPK, CAND, ITERS);
-        CUDA_CHECK(cudaDeviceSynchronize());
-
-        auto start = std::chrono::high_resolution_clock::now();
-        for (int r = 0; r < NRUNS; r++) {
-            kernel_reg_bench<8, 2><<<NBLOCKS, 32>>>(d_dist, d_idx, TOPK, CAND, ITERS);
-            CUDA_CHECK(cudaGetLastError());
-        }
-        CUDA_CHECK(cudaDeviceSynchronize());
-        auto end = std::chrono::high_resolution_clock::now();
-        double us = std::chrono::duration<double, std::micro>(end - start).count() / NRUNS;
-        printf("reg<8,2>:          %.1f us  (%d blocks x %d iters)\n", us, NBLOCKS, ITERS);
-    }
-
-    // Reg<8,4>: 32 threads, buffer=256, cand=128
-    {
-        kernel_reg_bench<8, 4><<<NBLOCKS, 32>>>(d_dist, d_idx, TOPK, CAND, ITERS);
-        CUDA_CHECK(cudaDeviceSynchronize());
-
-        auto start = std::chrono::high_resolution_clock::now();
-        for (int r = 0; r < NRUNS; r++) {
-            kernel_reg_bench<8, 4><<<NBLOCKS, 32>>>(d_dist, d_idx, TOPK, CAND, ITERS);
-            CUDA_CHECK(cudaGetLastError());
-        }
-        CUDA_CHECK(cudaDeviceSynchronize());
-        auto end = std::chrono::high_resolution_clock::now();
-        double us = std::chrono::duration<double, std::micro>(end - start).count() / NRUNS;
-        printf("reg<8,4>:          %.1f us  (%d blocks x %d iters)\n", us, NBLOCKS, ITERS);
-    }
-
-    // Reg<8,8>: 32 threads, buffer=256, cand=256 (chunks=1)
-    {
-        kernel_reg_bench<8, 8><<<NBLOCKS, 32>>>(d_dist, d_idx, TOPK, CAND, ITERS);
-        CUDA_CHECK(cudaDeviceSynchronize());
-
-        auto start = std::chrono::high_resolution_clock::now();
-        for (int r = 0; r < NRUNS; r++) {
-            kernel_reg_bench<8, 8><<<NBLOCKS, 32>>>(d_dist, d_idx, TOPK, CAND, ITERS);
-            CUDA_CHECK(cudaGetLastError());
-        }
-        CUDA_CHECK(cudaDeviceSynchronize());
-        auto end = std::chrono::high_resolution_clock::now();
-        double us = std::chrono::duration<double, std::micro>(end - start).count() / NRUNS;
-        printf("reg<8,8>:          %.1f us  (%d blocks x %d iters)\n", us, NBLOCKS, ITERS);
-    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    auto end = std::chrono::high_resolution_clock::now();
+    double us = std::chrono::duration<double, std::micro>(end - start).count() / NRUNS;
+    printf("sophia merge+pick: %.1f us  (%d blocks x %d iters)\n", us, NBLOCKS, ITERS);
 
     CUDA_CHECK(cudaFree(d_dist));
     CUDA_CHECK(cudaFree(d_idx));
