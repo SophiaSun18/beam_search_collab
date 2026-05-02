@@ -13,15 +13,17 @@
  * filter) handle threadIdx.y offsets internally. Remaining plain-pointer
  * buffers are offset in the constructor body.
  *
- * @tparam NY   Number of warps (queries) per block.
- * @tparam REG  Registers per thread for topk merge. topk_size must be >= 32*REG.
+ * @tparam NY     Number of warps (queries) per block.
+ * @tparam TopK   TopK buffer type (SharedBitonicTopK or RegBitonicTopK).
+ * @tparam REG    Registers per thread for merge batch.
+ * @tparam Filter Visited-node filter type (HashFilter or BloomFilter).
  */
-template <unsigned NY, unsigned REG = 2>
+template <unsigned NY, typename TopK, unsigned REG, typename Filter = HashFilter>
 class GPUWarpSearch {
     static constexpr unsigned BX   = WARP_SIZE;    // 32
 
-    SharedBitonicTopK<BX, REG> topk_;
-    HashFilter                 hf_;
+    TopK   topk_;
+    Filter hf_;
     float*                     query_buf_;    // dim floats
     INDEX_T*                   parent_buf_;   // 1 element
     INDEX_T*                   cand_idx_;     // max_degree_ elements
@@ -62,8 +64,8 @@ public:
 
 // ── constructor ─────────────────────────────────────────────────────────────
 
-template <unsigned NY, unsigned REG>
-__device__ GPUWarpSearch<NY, REG>::GPUWarpSearch(
+template <unsigned NY, typename TopK, unsigned REG, typename Filter>
+__device__ GPUWarpSearch<NY, TopK, REG, Filter>::GPUWarpSearch(
     char*& smem, const GPUBaseSearchCfg& cfg, GPUGraphView graph)
     : topk_(smem, cfg.topk_size),     // offsets by threadIdx.y internally
       hf_(smem, cfg.bitlen),          // offsets by threadIdx.y internally
@@ -72,6 +74,11 @@ __device__ GPUWarpSearch<NY, REG>::GPUWarpSearch(
       dim_(graph.dim()),
       max_degree_(graph.degree())
 {
+    // Align for float/uint32_t before plain-pointer buffers.
+    smem = reinterpret_cast<char*>(
+        (reinterpret_cast<uintptr_t>(smem) + alignof(float) - 1)
+            & ~(static_cast<uintptr_t>(alignof(float)) - 1));
+
     // Plain-pointer buffers: manual per-warp offset within remaining smem.
     const size_t rest = graph.dim() * sizeof(float)       // query_buf_
                       + sizeof(INDEX_T)                   // parent_buf_
@@ -90,12 +97,13 @@ __device__ GPUWarpSearch<NY, REG>::GPUWarpSearch(
 
 // ── shared memory size ──────────────────────────────────────────────────────
 
-template <unsigned NY, unsigned REG>
-__host__ __device__ size_t GPUWarpSearch<NY, REG>::shared_mem_bytes_per_warp(
+template <unsigned NY, typename TopK, unsigned REG, typename Filter>
+__host__ __device__ size_t GPUWarpSearch<NY, TopK, REG, Filter>::shared_mem_bytes_per_warp(
     const GPUBaseSearchCfg& cfg, unsigned dim, unsigned degree) {
     size_t size = 0;
-    size += SharedBitonicTopK<BX, REG>::shared_mem_bytes_per_instance(cfg.topk_size);
-    size += (1u << cfg.bitlen) * sizeof(uint32_t);   // hash filter
+    size += TopK::shared_mem_bytes_per_instance(cfg.topk_size);
+    size += Filter::shared_mem_bytes(cfg.bitlen);
+    size = (size + alignof(float) - 1) & ~(alignof(float) - 1);
     size += dim * sizeof(float);                     // query_buf_
     size += sizeof(INDEX_T);                         // parent_buf_
     size += degree * sizeof(INDEX_T);                // cand_idx_
@@ -103,16 +111,16 @@ __host__ __device__ size_t GPUWarpSearch<NY, REG>::shared_mem_bytes_per_warp(
     return size;
 }
 
-template <unsigned NY, unsigned REG>
-__host__ __device__ size_t GPUWarpSearch<NY, REG>::shared_mem_bytes(
+template <unsigned NY, typename TopK, unsigned REG, typename Filter>
+__host__ __device__ size_t GPUWarpSearch<NY, TopK, REG, Filter>::shared_mem_bytes(
     const GPUBaseSearchCfg& cfg, unsigned dim, unsigned degree) {
     return NY * shared_mem_bytes_per_warp(cfg, dim, degree);
 }
 
 // ── search ──────────────────────────────────────────────────────────────────
 
-template <unsigned NY, unsigned REG>
-__device__ void GPUWarpSearch<NY, REG>::search(
+template <unsigned NY, typename TopK, unsigned REG, typename Filter>
+__device__ void GPUWarpSearch<NY, TopK, REG, Filter>::search(
     const float* query, vid_t* results, int K)
 {
     const unsigned lane = threadIdx.x;  // 0..31
@@ -171,10 +179,9 @@ __device__ void GPUWarpSearch<NY, REG>::search(
         }
 
         // ── pick next node to expand ────────────────────────────────────
-        uint32_t pbuf[BX * REG];
-        #pragma unroll
-        for (unsigned i = 0; i < BX * REG; ++i) pbuf[i] = MAX_INDEX;
-        unsigned found = topk_.pick(pbuf, 1);
+        uint32_t pbuf[1];
+        pbuf[0] = MAX_INDEX;
+        unsigned found = topk_.template pick<1>(pbuf, 1);
         uint32_t picked = MAX_INDEX;
         const bool has_pick = found > 0 && pbuf[0] != MAX_INDEX;
         const uint32_t ballot = __ballot_sync(0xffffffff, has_pick);

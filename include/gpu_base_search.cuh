@@ -1,7 +1,7 @@
 #pragma once
 #include "l2.cuh"
 #include "topk.cuh"
-#include "hash_filter.cuh"
+#include "visit_filter.cuh"
 #include "gpu_graph.cuh"
 #include <cuda_runtime.h>
 #include <climits>
@@ -31,10 +31,10 @@ struct GPUBaseSearchCfg {
  *
  * @tparam BX  Block size (number of threads).
  */
-template <unsigned BX>
+template <unsigned BX, typename TopK, unsigned REG, typename Filter>
 class GPUBaseSearch {
-    SharedBitonicTopK<BX, 1> topk_;
-    HashFilter               hf_;
+    TopK    topk_;
+    Filter  hf_;
     float*                   query_buf_;    // dim floats in shared memory
     INDEX_T*                 parent_buf_;   // 1 element in shared memory
     INDEX_T*                 cand_idx_;     // max_degree_ elements
@@ -73,8 +73,8 @@ public:
 
 // ── implementation ──────────────────────────────────────────────────────────
 
-template <unsigned BX>
-__device__ GPUBaseSearch<BX>::GPUBaseSearch(
+template <unsigned BX, typename TopK, unsigned REG, typename Filter>
+__device__ GPUBaseSearch<BX, TopK, REG, Filter>::GPUBaseSearch(
     char*& smem, const GPUBaseSearchCfg& cfg, GPUGraphView graph)
     : topk_(smem, cfg.topk_size),
       hf_(smem, cfg.bitlen),
@@ -101,12 +101,12 @@ __device__ GPUBaseSearch<BX>::GPUBaseSearch(
     smem += max_degree_ * sizeof(DISTANCE_T);
 }
 
-template <unsigned BX>
-__host__ __device__ size_t GPUBaseSearch<BX>::shared_mem_bytes(
+template <unsigned BX, typename TopK, unsigned REG, typename Filter>
+__host__ __device__ size_t GPUBaseSearch<BX, TopK, REG, Filter>::shared_mem_bytes(
     const GPUBaseSearchCfg& cfg, unsigned dim, unsigned degree) {
     size_t size = 0;
-    size += SharedBitonicTopK<BX, 1>::shared_mem_bytes(cfg.topk_size);
-    size += HashFilter::shared_mem_bytes(cfg.bitlen);
+    size += TopK::shared_mem_bytes_per_instance(cfg.topk_size);
+    size += Filter::shared_mem_bytes(cfg.bitlen);
     size = (size + alignof(float) - 1) & ~(alignof(float) - 1);
     size += dim * sizeof(float);                     // query_buf_
     size += sizeof(INDEX_T);                         // parent_buf_
@@ -117,8 +117,8 @@ __host__ __device__ size_t GPUBaseSearch<BX>::shared_mem_bytes(
 
 // ── search ──────────────────────────────────────────────────────────────────
 
-template <unsigned BX>
-__device__ void GPUBaseSearch<BX>::search(
+template <unsigned BX, typename TopK, unsigned REG, typename Filter>
+__device__ void GPUBaseSearch<BX, TopK, REG, Filter>::search(
     const float* query, vid_t* results, int K)
 {
     const unsigned tid = threadIdx.x;
@@ -170,19 +170,22 @@ __device__ void GPUBaseSearch<BX>::search(
 
         // ── merge candidates into topk ──────────────────────────────────
         {
-            float    d[1];
-            uint32_t x[1];
-            d[0] = (tid < max_degree_) ? cand_dist_[tid] : FLT_MAX;
-            x[0] = (tid < max_degree_) ? cand_idx_[tid]  : MAX_INDEX;
+            float    d[REG];
+            uint32_t x[REG];
+            #pragma unroll
+            for (unsigned j = 0; j < REG; j++) {
+                unsigned pos = tid * REG + j;
+                d[j] = (pos < max_degree_) ? cand_dist_[pos] : FLT_MAX;
+                x[j] = (pos < max_degree_) ? cand_idx_[pos]  : MAX_INDEX;
+            }
             topk_.merge(d, x);
         }
 
         // ── pick next node to expand ────────────────────────────────────
         {
-            uint32_t pbuf[BX];
-            #pragma unroll
-            for (unsigned i = 0; i < BX; ++i) pbuf[i] = MAX_INDEX;
-            unsigned found = topk_.pick(pbuf, 1);
+            uint32_t pbuf[1];
+            pbuf[0] = MAX_INDEX;
+            unsigned found = topk_.template pick<1>(pbuf, 1);
             uint32_t picked = MAX_INDEX;
             if (warp_id == 0) {
                 const bool has_pick = found > 0 && pbuf[0] != MAX_INDEX;
@@ -228,10 +231,14 @@ __device__ void GPUBaseSearch<BX>::search(
 
     // ── final merge (catch unmerged candidates from last iteration) ─────
     {
-        float    d[1];
-        uint32_t x[1];
-        d[0] = (tid < max_degree_) ? cand_dist_[tid] : FLT_MAX;
-        x[0] = (tid < max_degree_) ? cand_idx_[tid]  : MAX_INDEX;
+        float    d[REG];
+        uint32_t x[REG];
+        #pragma unroll
+        for (unsigned j = 0; j < REG; j++) {
+            unsigned pos = tid * REG + j;
+            d[j] = (pos < max_degree_) ? cand_dist_[pos] : FLT_MAX;
+            x[j] = (pos < max_degree_) ? cand_idx_[pos]  : MAX_INDEX;
+        }
         topk_.merge(d, x);
     }
 

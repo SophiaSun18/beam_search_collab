@@ -11,13 +11,8 @@
 #include "cpu_graph.hpp"
 #include "gpu_graph.cuh"
 #include "gpu_base_search.cuh"
-#include "gpu_col_search.cuh"
-#include "gpu_pipe_search.cuh"
 #include "gpu_reg_search.cuh"
-#include "gpu_split_search.cuh"
 #include "gpu_warp_search.cuh"
-#include "gpu_reg_warp_search.cuh"
-#include "bloom_filter.cuh"
 #include "gpu_rabitq_search.cuh"
 #include "gpu_sophia_search.cuh"
 
@@ -98,12 +93,12 @@ __global__ void kernel_base_search(
 
     extern __shared__ char smem[];
     char* ptr = smem;
-    GPUBaseSearch<CLI_BLOCK_SIZE> searcher(ptr, cfg, graph);
+    GPUBaseSearch<CLI_BLOCK_SIZE, SharedBitonicTopK<CLI_BLOCK_SIZE, 1>, 1, HashFilter> searcher(ptr, cfg, graph);
     __syncthreads();
     searcher.search(d_queries + qid * dim, d_results + qid * K, K);
 }
 
-template <unsigned NY, unsigned REG = 2>
+template <unsigned NY, typename TopK, unsigned REG, typename Filter = HashFilter>
 __global__ void kernel_warp_search(
     GPUGraphView graph, GPUBaseSearchCfg cfg,
     int nq, int dim,
@@ -115,59 +110,12 @@ __global__ void kernel_warp_search(
 
     extern __shared__ char smem[];
     char* ptr = smem;
-    GPUWarpSearch<NY, REG> searcher(ptr, cfg, graph);
+    GPUWarpSearch<NY, TopK, REG, Filter> searcher(ptr, cfg, graph);
     __syncwarp();
     searcher.search(d_queries + qid * dim, d_results + qid * K, K);
 }
 
-__global__ void kernel_col_search(
-    GPUGraphView graph, GPUBaseSearchCfg cfg,
-    int nq, int dim,
-    const float* __restrict__ d_queries,
-    vid_t* __restrict__ d_results, int K)
-{
-    int qid = blockIdx.x;
-    if (qid >= nq) return;
 
-    extern __shared__ char smem[];
-    char* ptr = smem;
-    GPUColSearch<CLI_BLOCK_SIZE> searcher(ptr, cfg, graph);
-    __syncthreads();
-    searcher.search(d_queries + qid * dim, d_results + qid * K, K);
-}
-
-template <unsigned NY>
-__global__ void kernel_pipe_search(
-    GPUGraphView graph, GPUBaseSearchCfg cfg,
-    int nq, int dim,
-    const float* __restrict__ d_queries,
-    vid_t* __restrict__ d_results, int K)
-{
-    int qid = blockIdx.x * NY + threadIdx.y;
-    if (qid >= nq) return;
-
-    extern __shared__ char smem[];
-    char* ptr = smem;
-    GPUPipeSearch<NY> searcher(ptr, cfg, graph);
-    __syncwarp();
-    searcher.search(d_queries + qid * dim, d_results + qid * K, K);
-}
-
-__global__ void kernel_split_search(
-    GPUGraphView graph, GPUBaseSearchCfg cfg,
-    int nq, int dim,
-    const float* __restrict__ d_queries,
-    vid_t* __restrict__ d_results, int K)
-{
-    int qid = blockIdx.x;
-    if (qid >= nq) return;
-
-    extern __shared__ char smem[];
-    char* ptr = smem;
-    GPUSplitSearch<CLI_BLOCK_SIZE> searcher(ptr, cfg, graph);
-    __syncthreads();
-    searcher.search(d_queries + qid * dim, d_results + qid * K, K);
-}
 
 static constexpr unsigned REG_BLOCK_SIZE = 32;
 
@@ -187,22 +135,6 @@ __global__ void kernel_reg_search(
     searcher.search(d_queries + qid * dim, d_results + qid * K, K);
 }
 
-template <unsigned NY, unsigned REGX = 8, unsigned REGY = 2, typename Filter = HashFilter>
-__global__ void kernel_reg_warp_search(
-    GPUGraphView graph, GPUBaseSearchCfg cfg,
-    int nq, int dim,
-    const float* __restrict__ d_queries,
-    vid_t* __restrict__ d_results, int K)
-{
-    int qid = blockIdx.x * NY + threadIdx.y;
-    if (qid >= nq) return;
-
-    extern __shared__ char smem[];
-    char* ptr = smem;
-    GPURegWarpSearch<NY, REGX, REGY, Filter> searcher(ptr, cfg, graph);
-    __syncwarp();
-    searcher.search(d_queries + qid * dim, d_results + qid * K, K);
-}
 
 __global__ void kernel_rabitq_search(
     GPUGraphView graph, GPURabitqView rabitq, GPURabitqSearchCfg cfg,
@@ -226,7 +158,7 @@ static void run_base(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
                      int nq, int dim, int K,
                      const float* d_queries, vid_t* d_results)
 {
-    size_t smem = GPUBaseSearch<CLI_BLOCK_SIZE>::shared_mem_bytes(cfg, dim, gpu_graph.degree());
+    size_t smem = GPUBaseSearch<CLI_BLOCK_SIZE, SharedBitonicTopK<CLI_BLOCK_SIZE, 1>, 1, HashFilter>::shared_mem_bytes(cfg, dim, gpu_graph.degree());
     int num_blocks = nq;
 
     CUDA_CHECK(cudaFuncSetAttribute(kernel_base_search,
@@ -248,85 +180,6 @@ static void run_base(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
               << "  qps: " << nq / elapsed << std::endl;
 }
 
-static void run_col(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
-                    int nq, int dim, int K,
-                    const float* d_queries, vid_t* d_results)
-{
-    size_t smem = GPUColSearch<CLI_BLOCK_SIZE>::shared_mem_bytes(cfg, dim);
-    int num_blocks = nq;
-
-    CUDA_CHECK(cudaFuncSetAttribute(kernel_col_search,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         static_cast<int>(smem)));
-
-    constexpr int NRUNS = 5;
-    auto start = std::chrono::high_resolution_clock::now();
-    for (int r = 0; r < NRUNS; r++) {
-        kernel_col_search<<<num_blocks, CLI_BLOCK_SIZE, smem>>>(
-            gpu_graph.view(), cfg, nq, dim, d_queries, d_results, K);
-        CUDA_CHECK(cudaGetLastError());
-    }
-    CUDA_CHECK(cudaDeviceSynchronize());
-    auto end = std::chrono::high_resolution_clock::now();
-
-    double elapsed = std::chrono::duration<double>(end - start).count() / NRUNS;
-    std::cout << "  time: " << elapsed * 1000.0 << " ms"
-              << "  qps: " << nq / elapsed << std::endl;
-}
-
-template <unsigned NY>
-static void run_pipe(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
-                     int nq, int dim, int K,
-                     const float* d_queries, vid_t* d_results)
-{
-    size_t smem = GPUPipeSearch<NY>::shared_mem_bytes(cfg, dim, gpu_graph.degree());
-    int num_blocks = (nq + NY - 1) / NY;
-    dim3 block(WARP_SIZE, NY);
-
-    CUDA_CHECK(cudaFuncSetAttribute(kernel_pipe_search<NY>,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         static_cast<int>(smem)));
-
-    constexpr int NRUNS = 5;
-    auto start = std::chrono::high_resolution_clock::now();
-    for (int r = 0; r < NRUNS; r++) {
-        kernel_pipe_search<NY><<<num_blocks, block, smem>>>(
-            gpu_graph.view(), cfg, nq, dim, d_queries, d_results, K);
-        CUDA_CHECK(cudaGetLastError());
-    }
-    CUDA_CHECK(cudaDeviceSynchronize());
-    auto end = std::chrono::high_resolution_clock::now();
-
-    double elapsed = std::chrono::duration<double>(end - start).count() / NRUNS;
-    std::cout << "  time: " << elapsed * 1000.0 << " ms"
-              << "  qps: " << nq / elapsed << std::endl;
-}
-
-static void run_split(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
-                      int nq, int dim, int K,
-                      const float* d_queries, vid_t* d_results)
-{
-    size_t smem = GPUSplitSearch<CLI_BLOCK_SIZE>::shared_mem_bytes(cfg, dim, gpu_graph.degree());
-    int num_blocks = nq;
-
-    CUDA_CHECK(cudaFuncSetAttribute(kernel_split_search,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         static_cast<int>(smem)));
-
-    constexpr int NRUNS = 5;
-    auto start = std::chrono::high_resolution_clock::now();
-    for (int r = 0; r < NRUNS; r++) {
-        kernel_split_search<<<num_blocks, CLI_BLOCK_SIZE, smem>>>(
-            gpu_graph.view(), cfg, nq, dim, d_queries, d_results, K);
-        CUDA_CHECK(cudaGetLastError());
-    }
-    CUDA_CHECK(cudaDeviceSynchronize());
-    auto end = std::chrono::high_resolution_clock::now();
-
-    double elapsed = std::chrono::duration<double>(end - start).count() / NRUNS;
-    std::cout << "  time: " << elapsed * 1000.0 << " ms"
-              << "  qps: " << nq / elapsed << std::endl;
-}
 
 static void run_reg(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
                     int nq, int dim, int K,
@@ -354,92 +207,65 @@ static void run_reg(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
               << "  qps: " << nq / elapsed << std::endl;
 }
 
-template <unsigned NY, unsigned REG = 2>
+template <unsigned NY, typename TopK, unsigned REG, typename Filter = HashFilter>
+static void run_warp_impl(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
+                          int nq, int dim, int K,
+                          const float* d_queries, vid_t* d_results)
+{
+    size_t smem = GPUWarpSearch<NY, TopK, REG, Filter>::shared_mem_bytes(cfg, dim, gpu_graph.degree());
+    int num_blocks = (nq + NY - 1) / NY;
+    dim3 block(WARP_SIZE, NY);
+
+    CUDA_CHECK(cudaFuncSetAttribute((kernel_warp_search<NY, TopK, REG, Filter>),
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         static_cast<int>(smem)));
+
+    constexpr int NRUNS = 5;
+    auto start = std::chrono::high_resolution_clock::now();
+    for (int r = 0; r < NRUNS; r++) {
+        kernel_warp_search<NY, TopK, REG, Filter><<<num_blocks, block, smem>>>(
+            gpu_graph.view(), cfg, nq, dim, d_queries, d_results, K);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    auto end = std::chrono::high_resolution_clock::now();
+
+    double elapsed = std::chrono::duration<double>(end - start).count() / NRUNS;
+    std::cout << "  time: " << elapsed * 1000.0 << " ms"
+              << "  qps: " << nq / elapsed << std::endl;
+}
+
+// Auto-dispatch: register topk if topk_size fits (64/128/256/512), else shared memory.
+template <unsigned NY, unsigned REG, unsigned REGX, typename Filter>
+static void run_warp_regx(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
+                          int nq, int dim, int K,
+                          const float* d_queries, vid_t* d_results)
+{
+    if constexpr (REGX >= REG && REGX % REG == 0) {
+        run_warp_impl<NY, RegBitonicTopK<REGX, REG>, REG, Filter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
+    } else {
+        // REGX too small for this REG — fall back to shared memory.
+        run_warp_impl<NY, SharedBitonicTopK<32, REG>, REG, Filter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
+    }
+}
+
+template <unsigned NY, unsigned REG = 2, typename Filter = HashFilter>
 static void run_warp(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
                      int nq, int dim, int K,
                      const float* d_queries, vid_t* d_results)
 {
-    size_t smem = GPUWarpSearch<NY, REG>::shared_mem_bytes(cfg, dim, gpu_graph.degree());
-    int num_blocks = (nq + NY - 1) / NY;
-    dim3 block(WARP_SIZE, NY);
-
-    CUDA_CHECK(cudaFuncSetAttribute((kernel_warp_search<NY, REG>),
-                         cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         static_cast<int>(smem)));
-
-    constexpr int NRUNS = 5;
-    auto start = std::chrono::high_resolution_clock::now();
-    for (int r = 0; r < NRUNS; r++) {
-        kernel_warp_search<NY, REG><<<num_blocks, block, smem>>>(
-            gpu_graph.view(), cfg, nq, dim, d_queries, d_results, K);
-        CUDA_CHECK(cudaGetLastError());
-    }
-    CUDA_CHECK(cudaDeviceSynchronize());
-    auto end = std::chrono::high_resolution_clock::now();
-
-    double elapsed = std::chrono::duration<double>(end - start).count() / NRUNS;
-    std::cout << "  time: " << elapsed * 1000.0 << " ms"
-              << "  qps: " << nq / elapsed << std::endl;
-}
-
-template <unsigned NY, unsigned REGX, unsigned REGY, typename Filter>
-static void run_reg_warp_impl(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
-                              int nq, int dim, int K,
-                              const float* d_queries, vid_t* d_results)
-{
-    size_t smem = GPURegWarpSearch<NY, REGX, REGY, Filter>::shared_mem_bytes(cfg, dim, gpu_graph.degree());
-    int num_blocks = (nq + NY - 1) / NY;
-    dim3 block(WARP_SIZE, NY);
-
-    CUDA_CHECK(cudaFuncSetAttribute((kernel_reg_warp_search<NY, REGX, REGY, Filter>),
-                         cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         static_cast<int>(smem)));
-
-    constexpr int NRUNS = 5;
-    auto start = std::chrono::high_resolution_clock::now();
-    for (int r = 0; r < NRUNS; r++) {
-        kernel_reg_warp_search<NY, REGX, REGY, Filter><<<num_blocks, block, smem>>>(
-            gpu_graph.view(), cfg, nq, dim, d_queries, d_results, K);
-        CUDA_CHECK(cudaGetLastError());
-    }
-    CUDA_CHECK(cudaDeviceSynchronize());
-    auto end = std::chrono::high_resolution_clock::now();
-
-    double elapsed = std::chrono::duration<double>(end - start).count() / NRUNS;
-    std::cout << "  time: " << elapsed * 1000.0 << " ms"
-              << "  qps: " << nq / elapsed << std::endl;
-}
-
-template <unsigned NY, unsigned REGY, unsigned REGX, typename Filter>
-static void run_reg_warp_dispatch(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
-                                  int nq, int dim, int K,
-                                  const float* d_queries, vid_t* d_results)
-{
-    if constexpr (REGX >= REGY && REGX % REGY == 0) {
-        run_reg_warp_impl<NY, REGX, REGY, Filter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
-    } else {
-        std::cerr << "topk_size=" << cfg.topk_size
-                  << " too small for REGY=" << REGY << std::endl;
-        exit(1);
-    }
-}
-
-template <unsigned NY, unsigned REGY = 2, typename Filter = HashFilter>
-static void run_reg_warp(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
-                         int nq, int dim, int K,
-                         const float* d_queries, vid_t* d_results)
-{
     unsigned regx = cfg.topk_size / 32;
-    switch (regx) {
-        case  2: run_reg_warp_dispatch<NY, REGY,  2, Filter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); break;
-        case  4: run_reg_warp_dispatch<NY, REGY,  4, Filter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); break;
-        case  8: run_reg_warp_dispatch<NY, REGY,  8, Filter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); break;
-        case 16: run_reg_warp_dispatch<NY, REGY, 16, Filter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); break;
-        default:
-            std::cerr << "topk_size must be 64, 128, 256, or 512 for rwarp (got "
-                      << cfg.topk_size << ")" << std::endl;
-            exit(1);
+    if (regx * 32 == cfg.topk_size) {
+        switch (regx) {
+            case  2: run_warp_regx<NY, REG,  2, Filter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); return;
+            case  4: run_warp_regx<NY, REG,  4, Filter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); return;
+            case  8: run_warp_regx<NY, REG,  8, Filter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); return;
+            case 16: run_warp_regx<NY, REG, 16, Filter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); return;
+            default: break;
+        }
     }
+    // Fallback: shared memory topk.
+    run_warp_impl<NY, SharedBitonicTopK<32, REG>, REG, Filter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
 }
 
 static void run_sophia(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
@@ -602,16 +428,8 @@ int main() {
 
         if (mode == "base") {
             run_base(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
-        } else if (mode == "col") {
-            run_col(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
-        } else if (mode == "split") {
-            run_split(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
         } else if (mode == "reg") {
             run_reg(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
-        } else if (mode == "pipe4") {
-            run_pipe<4>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
-        } else if (mode == "pipe8") {
-            run_pipe<8>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
         } else if (mode == "warp11") {
             run_warp<1, 1>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
         } else if (mode == "warp12") {
@@ -636,30 +454,14 @@ int main() {
             run_warp<8, 4>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
         } else if (mode == "warp88") {
             run_warp<8, 8>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
-        } else if (mode == "rwarp12") {
-            run_reg_warp<1, 2>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
-        } else if (mode == "rwarp14") {
-            run_reg_warp<1, 4>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
-        } else if (mode == "rwarp22") {
-            run_reg_warp<2, 2>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
-        } else if (mode == "rwarp24") {
-            run_reg_warp<2, 4>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
-        } else if (mode == "rwarp42") {
-            run_reg_warp<4, 2>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
-        } else if (mode == "rwarp44") {
-            run_reg_warp<4, 4>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
-        } else if (mode == "rwarp82") {
-            run_reg_warp<8, 2>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
-        } else if (mode == "rwarp84") {
-            run_reg_warp<8, 4>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
-        } else if (mode == "brwarp12") {
-            run_reg_warp<1, 2, BloomFilter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
-        } else if (mode == "brwarp22") {
-            run_reg_warp<2, 2, BloomFilter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
-        } else if (mode == "brwarp42") {
-            run_reg_warp<4, 2, BloomFilter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
-        } else if (mode == "brwarp82") {
-            run_reg_warp<8, 2, BloomFilter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
+        } else if (mode == "bwarp12") {
+            run_warp<1, 2, BloomFilter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
+        } else if (mode == "bwarp22") {
+            run_warp<2, 2, BloomFilter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
+        } else if (mode == "bwarp42") {
+            run_warp<4, 2, BloomFilter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
+        } else if (mode == "bwarp82") {
+            run_warp<8, 2, BloomFilter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
         } else if (mode == "sophia") {
             run_sophia(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
         } else {
