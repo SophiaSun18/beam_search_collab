@@ -3,7 +3,7 @@
 #include "rabitq.cuh"
 #include "l2.cuh"
 #include "topk.cuh"
-#include "hash_filter.cuh"
+#include "filter_hash.cuh"
 #include <cuda_runtime.h>
 #if defined(__CUDA_ARCH__) || defined(__CUDACC__)
 #include <cuda_pipeline_primitives.h>

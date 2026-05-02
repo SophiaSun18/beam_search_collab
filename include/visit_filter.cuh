@@ -29,5 +29,5 @@ concept VisitFilter = requires(
     { F::shared_mem_bytes(0u, 1u) } -> std::convertible_to<uint32_t>;
 };
 
-#include "hash_filter.cuh"
-#include "bloom_filter.cuh"
+#include "filter_hash.cuh"
+#include "filter_bloom.cuh"

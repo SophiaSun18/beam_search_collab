@@ -5,7 +5,7 @@
 #include <string>
 #include <vector>
 
-#include "hash_filter.cuh"
+#include "filter_hash.cuh"
 
 #define CUDA_CHECK(call) do {                                           \
     cudaError_t err_ = (call);                                          \

@@ -6,7 +6,7 @@
 #include <unordered_set>
 #include <vector>
 
-#include "hash_filter.cuh"
+#include "filter_hash.cuh"
 
 template <unsigned BX, unsigned BY>
 __global__ void kernel_test_hash_filter(
