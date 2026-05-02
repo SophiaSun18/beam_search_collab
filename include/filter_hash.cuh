@@ -13,14 +13,22 @@ class HashFilter {
     unsigned  bitlen_;
     uint32_t  size_;
     uint32_t  mask_;
+
+    __host__ __device__ static unsigned log2_ceil(unsigned n) {
+        if (n <= 1) return 0;
+        unsigned p = 1, b = 0;
+        while (p < n) { p <<= 1; b++; }
+        return b;
+    }
+
 public:
     /**
      * @brief Construct a hash filter backed by shared memory.
      *
-     * @param table   Shared memory array, size >= (1 << bitlen) elements.
-     * @param bitlen  log2 of table size.
+     * @param table     Shared memory array, size >= capacity elements.
+     * @param capacity  Minimum number of slots (rounded up to power of 2).
      */
-    __device__ HashFilter(uint32_t* table, unsigned bitlen);
+    __device__ HashFilter(uint32_t* table, unsigned capacity);
 
     /**
      * @brief Self-allocating constructor. Carves table from smem.
@@ -28,55 +36,36 @@ public:
      * When blockDim.y > 1, each instance (threadIdx.y) gets its own table.
      * Advances smem past all blockDim.y instances.
      */
-    __device__ HashFilter(char*& smem, unsigned bitlen);
+    __device__ HashFilter(char*& smem, unsigned capacity);
 
     /**
      * @brief Shared memory bytes for ny instances.
      *
-     * @param bitlen  log2 of table size per instance.
-     * @param ny      Number of instances (blockDim.y). Default 1.
+     * @param capacity  Minimum number of slots per instance (rounded up to power of 2).
+     * @param ny        Number of instances (blockDim.y). Default 1.
      */
-    __host__ __device__ static uint32_t shared_mem_bytes(unsigned bitlen, unsigned ny = 1) {
+    __host__ __device__ static uint32_t shared_mem_bytes(unsigned capacity, unsigned ny = 1) {
+        unsigned bitlen = log2_ceil(capacity);
         return (alignof(uint32_t) - 1) + ny * (1u << bitlen) * sizeof(uint32_t);
     }
 
-    /**
-     * @brief Fill all slots with 0xFFFFFFFF. All threads participate.
-     *
-     * @param first_tid  Threads with threadIdx.x < first_tid are skipped.
-     */
     __device__ void init(unsigned first_tid = 0);
-
-    /**
-     * @brief Insert key via atomicCAS with linear probing.
-     *
-     * @return 1 if key was newly inserted, 0 if already present.
-     */
     __device__ uint32_t insert(uint32_t key);
-
-    /**
-     * @brief Check membership without modifying the table.
-     *
-     * @return 1 if key is present, 0 otherwise.
-     */
     __device__ uint32_t contains(uint32_t key);
 };
 
-__device__ inline HashFilter::HashFilter(uint32_t* table, unsigned bitlen)
-    : table_(table), bitlen_(bitlen),
-      size_(1u << bitlen), mask_((1u << bitlen) - 1) {}
+__device__ inline HashFilter::HashFilter(uint32_t* table, unsigned capacity)
+    : table_(table), bitlen_(log2_ceil(capacity)),
+      size_(1u << bitlen_), mask_(size_ - 1) {}
 
-__device__ inline HashFilter::HashFilter(char*& smem, unsigned bitlen)
-    : bitlen_(bitlen), size_(1u << bitlen), mask_((1u << bitlen) - 1)
+__device__ inline HashFilter::HashFilter(char*& smem, unsigned capacity)
+    : bitlen_(log2_ceil(capacity)), size_(1u << bitlen_), mask_(size_ - 1)
 {
-    // Align for uint32_t.
     smem = reinterpret_cast<char*>(
         (reinterpret_cast<uintptr_t>(smem) + alignof(uint32_t) - 1)
             & ~(static_cast<uintptr_t>(alignof(uint32_t)) - 1));
-    // Each instance (threadIdx.y) gets its own table within block-wide smem.
     size_t per_inst = size_ * sizeof(uint32_t);
     table_ = reinterpret_cast<uint32_t*>(smem + threadIdx.y * per_inst);
-    // Advance past ALL instances.
     smem += blockDim.y * per_inst;
 }
 

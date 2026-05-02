@@ -25,7 +25,7 @@ concept VisitFilter = requires(
     // Returns 1 if present, 0 otherwise.
     { filter.contains(key) } -> std::convertible_to<uint32_t>;
 
-    // Shared memory bytes for ny instances at the given bitlen.
+    // Shared memory bytes for ny instances at the given capacity.
     { F::shared_mem_bytes(0u, 1u) } -> std::convertible_to<uint32_t>;
 };
 

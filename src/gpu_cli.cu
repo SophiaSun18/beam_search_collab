@@ -392,7 +392,7 @@ int main() {
 
         GPURabitqSearchCfg rq_cfg;
         rq_cfg.topk_size      = js.value("topk_size", 256u);
-        rq_cfg.bitlen         = js.value("bitlen", 10u);
+        rq_cfg.filter_capacity = js.value("filter_capacity", 1024u);
         rq_cfg.entry_point    = rq_entry;
         rq_cfg.max_iterations = js.value("max_iterations", 1024);
         rq_cfg.reset_interval = js.value("reset_interval", 16);
@@ -401,7 +401,7 @@ int main() {
     } else {
         GPUBaseSearchCfg cfg;
         cfg.topk_size      = js.value("topk_size", 256u);
-        cfg.bitlen         = js.value("bitlen", 10u);
+        cfg.filter_capacity = js.value("filter_capacity", 1024u);
         cfg.entry_point    = entry_point;
         cfg.max_iterations = js.value("max_iterations", 1024);
         cfg.reset_interval = js.value("reset_interval", 16);

@@ -16,7 +16,7 @@ typedef float    DISTANCE_T;
 
 struct GPUBaseSearchCfg {
     unsigned topk_size;
-    unsigned bitlen;
+    unsigned filter_capacity;
     vid_t    entry_point;
     int      max_iterations;
     int      reset_interval;
@@ -77,7 +77,7 @@ template <unsigned BX, typename TopK, unsigned REG, typename Filter>
 __device__ GPUBaseSearch<BX, TopK, REG, Filter>::GPUBaseSearch(
     char*& smem, const GPUBaseSearchCfg& cfg, GPUGraphView graph)
     : topk_(smem, cfg.topk_size),
-      hf_(smem, cfg.bitlen),
+      hf_(smem, cfg.filter_capacity),
       graph_(graph),
       cfg_(cfg),
       dim_(graph.dim()),
@@ -106,7 +106,7 @@ __host__ __device__ size_t GPUBaseSearch<BX, TopK, REG, Filter>::shared_mem_byte
     const GPUBaseSearchCfg& cfg, unsigned dim, unsigned degree) {
     size_t size = 0;
     size += TopK::shared_mem_bytes_per_instance(cfg.topk_size);
-    size += Filter::shared_mem_bytes(cfg.bitlen);
+    size += Filter::shared_mem_bytes(cfg.filter_capacity);
     size = (size + alignof(float) - 1) & ~(alignof(float) - 1);
     size += dim * sizeof(float);                     // query_buf_
     size += sizeof(INDEX_T);                         // parent_buf_

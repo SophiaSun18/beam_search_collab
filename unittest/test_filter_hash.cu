@@ -14,13 +14,13 @@ __global__ void kernel_test_hash_filter(
     const uint32_t* g_query_keys,
     unsigned num_insert,
     unsigned num_query,
-    unsigned bitlen,
+    unsigned capacity,
     uint32_t* g_insert_results,
     uint32_t* g_query_results)
 {
     extern __shared__ char smem[];
     char* ptr = smem;
-    HashFilter filter(ptr, bitlen);
+    HashFilter filter(ptr, capacity);
 
     filter.init();
     __syncthreads();
@@ -43,9 +43,9 @@ __global__ void kernel_test_hash_filter(
 }
 
 template <unsigned BX, unsigned BY>
-bool run_hash_filter_test(unsigned bitlen, unsigned seed) {
+bool run_hash_filter_test(unsigned capacity, unsigned seed) {
     constexpr unsigned INSTANCES = BY;
-    const unsigned num_insert = (1u << bitlen) / 2;
+    const unsigned num_insert = capacity / 2;
     const unsigned num_query = num_insert * 2;
 
     std::mt19937 rng(seed);
@@ -101,9 +101,9 @@ bool run_hash_filter_test(unsigned bitlen, unsigned seed) {
     cudaMemset(d_query_results, 0, expected_query.size() * sizeof(uint32_t));
 
     const dim3 block(BX, BY);
-    const size_t smem_size = HashFilter::shared_mem_bytes(bitlen, BY);
+    const size_t smem_size = HashFilter::shared_mem_bytes(capacity, BY);
     kernel_test_hash_filter<BX, BY><<<1, block, smem_size>>>(
-        d_insert_keys, d_query_keys, num_insert, num_query, bitlen,
+        d_insert_keys, d_query_keys, num_insert, num_query, capacity,
         d_insert_results, d_query_results);
     cudaDeviceSynchronize();
 
@@ -160,15 +160,15 @@ int main() {
     struct TestCase {
         const char* name;
         bool (*fn)(unsigned, unsigned);
-        unsigned bitlen;
+        unsigned capacity;
     } tests[] = {
-        {"hash_filter<256,1> bitlen=10", run_hash_filter_test<256, 1>, 10},
-        {"hash_filter<32,4> bitlen=10", run_hash_filter_test<32, 4>, 10},
-        {"hash_filter<32,8> bitlen=10", run_hash_filter_test<32, 8>, 10},
+        {"hash_filter<256,1> cap=1024", run_hash_filter_test<256, 1>, 1024},
+        {"hash_filter<32,4> cap=1024",  run_hash_filter_test<32, 4>,  1024},
+        {"hash_filter<32,8> cap=1024",  run_hash_filter_test<32, 8>,  1024},
     };
 
     for (const auto& test : tests) {
-        const bool pass = test.fn(test.bitlen, seed++);
+        const bool pass = test.fn(test.capacity, seed++);
         printf("[%s] %s\n", pass ? "PASS" : "FAIL", test.name);
         if (!pass) all_pass = false;
     }

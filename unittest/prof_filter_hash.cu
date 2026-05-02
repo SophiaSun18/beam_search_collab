@@ -23,7 +23,7 @@
 
 template <unsigned BX>
 __global__ void kernel_prof_hash_base(
-    unsigned bitlen,
+    unsigned capacity,
     const uint32_t* __restrict__ g_keys,
     unsigned degree,
     unsigned topk_size,
@@ -32,7 +32,7 @@ __global__ void kernel_prof_hash_base(
 {
     extern __shared__ char smem[];
     char* ptr = smem;
-    HashFilter hf(ptr, bitlen);
+    HashFilter hf(ptr, capacity);
     hf.init();
     __syncthreads();
 
@@ -63,7 +63,7 @@ __global__ void kernel_prof_hash_base(
 
 template <unsigned NY>
 __global__ void kernel_prof_hash_warp(
-    unsigned bitlen,
+    unsigned capacity,
     const uint32_t* __restrict__ g_keys,
     unsigned degree,
     unsigned topk_size,
@@ -73,7 +73,7 @@ __global__ void kernel_prof_hash_warp(
     extern __shared__ char smem[];
     char* ptr = smem;
     // Each warp gets its own hash filter via threadIdx.y offset
-    HashFilter hf(ptr, bitlen);
+    HashFilter hf(ptr, capacity);
     hf.init();
 
     // Warp-level sync
@@ -105,7 +105,7 @@ struct ProfResult {
 };
 
 int main() {
-    constexpr unsigned BITLEN       = 10;
+    constexpr unsigned CAPACITY     = 1024;
     constexpr unsigned DEGREE       = 32;
     constexpr unsigned TOPK_SIZE    = 256;
     constexpr unsigned ITERS        = 128;
@@ -130,20 +130,20 @@ int main() {
     // ── base: BX=256, 1 block ──────────────────────────────────────────────
     {
         constexpr unsigned BX = 256;
-        size_t smem = HashFilter::shared_mem_bytes(BITLEN);
+        size_t smem = HashFilter::shared_mem_bytes(CAPACITY);
         CUDA_CHECK(cudaFuncSetAttribute(kernel_prof_hash_base<BX>,
                      cudaFuncAttributeMaxDynamicSharedMemorySize,
                      static_cast<int>(smem)));
 
         // warmup
         kernel_prof_hash_base<BX><<<NBLOCKS, BX, smem>>>(
-            BITLEN, d_keys, DEGREE, TOPK_SIZE, ITERS, RESET_INT);
+            CAPACITY, d_keys, DEGREE, TOPK_SIZE, ITERS, RESET_INT);
         CUDA_CHECK(cudaDeviceSynchronize());
 
         auto start = std::chrono::high_resolution_clock::now();
         for (int r = 0; r < NRUNS; r++) {
             kernel_prof_hash_base<BX><<<NBLOCKS, BX, smem>>>(
-                BITLEN, d_keys, DEGREE, TOPK_SIZE, ITERS, RESET_INT);
+                CAPACITY, d_keys, DEGREE, TOPK_SIZE, ITERS, RESET_INT);
             CUDA_CHECK(cudaGetLastError());
         }
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -155,7 +155,7 @@ int main() {
     // ── warp4: NY=4, dim3(32,4) ────────────────────────────────────────────
     {
         constexpr unsigned NY = 4;
-        size_t smem = HashFilter::shared_mem_bytes(BITLEN, NY);
+        size_t smem = HashFilter::shared_mem_bytes(CAPACITY, NY);
         dim3 block(32, NY);
         int nblocks = (NBLOCKS + NY - 1) / NY;
         CUDA_CHECK(cudaFuncSetAttribute(kernel_prof_hash_warp<NY>,
@@ -163,13 +163,13 @@ int main() {
                      static_cast<int>(smem)));
 
         kernel_prof_hash_warp<NY><<<nblocks, block, smem>>>(
-            BITLEN, d_keys, DEGREE, TOPK_SIZE, ITERS, RESET_INT);
+            CAPACITY, d_keys, DEGREE, TOPK_SIZE, ITERS, RESET_INT);
         CUDA_CHECK(cudaDeviceSynchronize());
 
         auto start = std::chrono::high_resolution_clock::now();
         for (int r = 0; r < NRUNS; r++) {
             kernel_prof_hash_warp<NY><<<nblocks, block, smem>>>(
-                BITLEN, d_keys, DEGREE, TOPK_SIZE, ITERS, RESET_INT);
+                CAPACITY, d_keys, DEGREE, TOPK_SIZE, ITERS, RESET_INT);
             CUDA_CHECK(cudaGetLastError());
         }
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -181,7 +181,7 @@ int main() {
     // ── warp8: NY=8, dim3(32,8) ────────────────────────────────────────────
     {
         constexpr unsigned NY = 8;
-        size_t smem = HashFilter::shared_mem_bytes(BITLEN, NY);
+        size_t smem = HashFilter::shared_mem_bytes(CAPACITY, NY);
         dim3 block(32, NY);
         int nblocks = (NBLOCKS + NY - 1) / NY;
         CUDA_CHECK(cudaFuncSetAttribute(kernel_prof_hash_warp<NY>,
@@ -189,13 +189,13 @@ int main() {
                      static_cast<int>(smem)));
 
         kernel_prof_hash_warp<NY><<<nblocks, block, smem>>>(
-            BITLEN, d_keys, DEGREE, TOPK_SIZE, ITERS, RESET_INT);
+            CAPACITY, d_keys, DEGREE, TOPK_SIZE, ITERS, RESET_INT);
         CUDA_CHECK(cudaDeviceSynchronize());
 
         auto start = std::chrono::high_resolution_clock::now();
         for (int r = 0; r < NRUNS; r++) {
             kernel_prof_hash_warp<NY><<<nblocks, block, smem>>>(
-                BITLEN, d_keys, DEGREE, TOPK_SIZE, ITERS, RESET_INT);
+                CAPACITY, d_keys, DEGREE, TOPK_SIZE, ITERS, RESET_INT);
             CUDA_CHECK(cudaGetLastError());
         }
         CUDA_CHECK(cudaDeviceSynchronize());
@@ -207,7 +207,7 @@ int main() {
     // ── report ─────────────────────────────────────────────────────────────
     FILE* fp = fopen("report.txt", "a");
     std::string report;
-    report += "prof_hash_filter (bitlen=" + std::to_string(BITLEN)
+    report += "prof_hash_filter (capacity=" + std::to_string(CAPACITY)
             + " degree=" + std::to_string(DEGREE)
             + " topk=" + std::to_string(TOPK_SIZE)
             + " iters=" + std::to_string(ITERS)

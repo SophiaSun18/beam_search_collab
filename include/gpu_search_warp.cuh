@@ -68,7 +68,7 @@ template <unsigned NY, typename TopK, unsigned REG, typename Filter>
 __device__ GPUWarpSearch<NY, TopK, REG, Filter>::GPUWarpSearch(
     char*& smem, const GPUBaseSearchCfg& cfg, GPUGraphView graph)
     : topk_(smem, cfg.topk_size),     // offsets by threadIdx.y internally
-      hf_(smem, cfg.bitlen),          // offsets by threadIdx.y internally
+      hf_(smem, cfg.filter_capacity),          // offsets by threadIdx.y internally
       graph_(graph),
       cfg_(cfg),
       dim_(graph.dim()),
@@ -102,7 +102,7 @@ __host__ __device__ size_t GPUWarpSearch<NY, TopK, REG, Filter>::shared_mem_byte
     const GPUBaseSearchCfg& cfg, unsigned dim, unsigned degree) {
     size_t size = 0;
     size += TopK::shared_mem_bytes_per_instance(cfg.topk_size);
-    size += Filter::shared_mem_bytes(cfg.bitlen);
+    size += Filter::shared_mem_bytes(cfg.filter_capacity);
     size = (size + alignof(float) - 1) & ~(alignof(float) - 1);
     size += dim * sizeof(float);                     // query_buf_
     size += sizeof(INDEX_T);                         // parent_buf_

@@ -22,7 +22,7 @@ typedef float    DISTANCE_T;
 
 struct GPURabitqSearchCfg {
     unsigned topk_size;
-    unsigned bitlen;
+    unsigned filter_capacity;
     vid_t    entry_point;
     int      max_iterations;
     int      reset_interval;
@@ -100,7 +100,7 @@ __device__ GPURabitqSearch<BX>::GPURabitqSearch(
     char*& smem, const GPURabitqSearchCfg& cfg,
     GPUGraphView graph, GPURabitqView rabitq)
     : topk_(smem, cfg.topk_size),
-      hf_(smem, cfg.bitlen),
+      hf_(smem, cfg.filter_capacity),
       graph_(graph),
       rabitq_(rabitq),
       cfg_(cfg),
@@ -157,7 +157,7 @@ __host__ __device__ size_t GPURabitqSearch<BX>::shared_mem_bytes(
 
     size_t size = 0;
     size += SharedBitonicTopK<BX, 1>::shared_mem_bytes(cfg.topk_size);
-    size += HashFilter::shared_mem_bytes(cfg.bitlen);
+    size += HashFilter::shared_mem_bytes(cfg.filter_capacity);
     size = (size + alignof(float) - 1) & ~(alignof(float) - 1);
     size += dim * sizeof(float);                     // query_buf
     size += sizeof(INDEX_T);                         // parent_buf

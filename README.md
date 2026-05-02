@@ -84,7 +84,7 @@ Both `gpu_cli` and `cpu_cli` read a single JSON object from stdin with `"data"` 
         "mode": "base",
         "K": 100,
         "topk_size": 256,
-        "bitlen": 10,
+        "filter_capacity": 1024,
         "max_iterations": 1024,
         "reset_interval": 16
     }
@@ -138,7 +138,7 @@ EOF
 | `mode` | `"base"` | Search mode (see tables above) |
 | `K` | `100` | Number of nearest neighbors to return |
 | `topk_size` | `256` | Beam buffer size |
-| `bitlen` | `10` | Hash/Bloom filter size = 2^bitlen entries (gpu_cli only) |
+| `filter_capacity` | `1024` | Hash/Bloom filter capacity, rounded up to power of 2 (gpu_cli only) |
 | `max_iterations` | `1024` | Maximum beam search iterations |
 | `reset_interval` | `16` | Forgettable hash table reset interval (gpu_cli only) |
 
