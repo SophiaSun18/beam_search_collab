@@ -12,7 +12,11 @@
  */
 namespace sophia {
 
-// ── sort/merge primitives ──────────────────────────────────────────────────
+// --- copied from (include/utils.cuh 628b125) lines 176-257 ---
+// changed: merged warp_merge_core into warp_merge body (inlined N==2 and N==4 branches)
+// changed: replaced `if (_N == 2)` runtime check with `if constexpr (N == 2)` for template dispatch
+// changed: added `static_assert(N == 2 || N == 4)` (original used runtime assert for unsupported N)
+// changed: template parameter K,V used directly (original hardcoded `float, uint32_t` in swap calls)
 
 template <class K, class V>
 __device__ inline void swap_if_needed(K& k0, V& v0, const unsigned lane_offset, const bool asc) {
@@ -84,7 +88,12 @@ __device__ void warp_sort(K k[N], V v[N], const bool asc = true) {
         warp_merge<K, V, N, warp_size>(k, v, range, asc);
 }
 
-// ── topk merge (warp 0 only) ──────────────────────────────────────────────
+// --- end (include/utils.cuh 628b125) ---
+
+// --- copied from (include/utils.cuh 628b125) lines 354-451 (topk_128_by_bitonic_sort) ---
+// changed: renamed to topk_by_bitonic_sort
+// changed: parameter names (result_indices_ptr -> result_indices, etc.)
+// changed: MAX_INDEX -> UINT_MAX, S_MAX_INDEX -> UINT_MAX
 
 template <unsigned N_1, unsigned N_2>
 __device__ void topk_by_bitonic_sort(
@@ -145,7 +154,11 @@ __device__ void topk_by_bitonic_sort(
     }
 }
 
-// ── pick expanders (warp 0 only) ──────────────────────────────────────────
+// --- end (include/utils.cuh 628b125) ---
+
+// --- copied from (include/utils.cuh 628b125) lines 663-691 ---
+// changed: INDEX_T -> uint32_t, index_msb_1_mask -> msb, MAX_INDEX -> UINT_MAX
+// changed: removed `static` storage class (original was file-scope static __device__)
 
 __device__ uint32_t pick_expanders(int N, uint32_t* output_list, int M, uint32_t* pri_queue) {
     uint32_t num_exp = 0;
@@ -169,7 +182,14 @@ __device__ uint32_t pick_expanders(int N, uint32_t* output_list, int M, uint32_t
     return num_exp;
 }
 
-// ── hash table ─────────────────────────────────────────────────────────────
+// --- end (include/utils.cuh 628b125) ---
+
+// --- copied from (include/utils.cuh 628b125) lines 586-641 ---
+// changed: renamed hashtable_init -> hash_init, hashtable_insert -> hash_insert,
+//          hashtable_restore -> hash_restore
+// changed: INDEX_T -> uint32_t, removed FIRST_TID parameter from hash_init
+// changed: hash_init uses blockDim.x stride (original subtracted FIRST_TID)
+// changed: hash_restore iterates with blockDim.x stride (original used blockDim.x - first_tid)
 
 __device__ inline void hash_init(uint32_t* table, unsigned bitlen) {
     uint32_t size = 1u << bitlen;
@@ -198,6 +218,8 @@ __device__ inline void hash_restore(uint32_t* table, unsigned bitlen,
     }
 }
 
+// --- end (include/utils.cuh 628b125) ---
+
 }  // namespace sophia
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -218,6 +240,25 @@ __host__ __device__ inline size_t sophia_shared_mem_bytes(unsigned bitlen, unsig
     size += dim * sizeof(float);                        // query buf
     return size;
 }
+
+// --- adapted from (include/search_bitonic.cuh 628b125) lines 46-279 (BeamSearch kernel) ---
+// changed: kernel signature uses GPUGraphView, GPUBaseSearchCfg instead of raw pointers + GraphGPU
+// changed: graph access via graph.nbrs() / graph.vect() instead of gg.N() / d_data pointer arithmetic
+// changed: L2 distance via l2_warp() (our include/l2.cuh) instead of warp_l2_distance()
+// changed: shared memory layout manually carved (original used #define offsets)
+// changed: removed debug_mode printing, stats/timing counters, seed map, sign_bit, counter/hops
+// changed: removed GPU_SEARCH_STATS / GPU_DISTANCE_TIMING instrumentation
+// changed: removed GPU_LAUNCH_BOUNDS attribute
+// changed: removed initial candidate seeding loop (original loaded CANDIDATE_BUFFER_SIZE starting
+//          points with multi-warp L2); replaced with single entry_point seed matching our convention
+// changed: topk_by_sort_candidates_and_merge<2, INTERNAL_TOPK/WARP_SIZE> -> topk_by_bitonic_sort<2, 4>
+//          (INTERNAL_TOPK=128, WARP_SIZE=32 -> N_2=4; original dispatched through wrapper)
+// changed: hash reset uses cfg.reset_interval (original used SMALL_HASH_RESET_INTERVAL=16 #define)
+// changed: iteration limit from MAX_ITERATIONS #define to cfg.max_iterations
+// changed: expand reads parent via topk_idx[parent[0]] (original used TOP_K_INDEX[PARENT_LIST[0]])
+// changed: removed exact_dist recomputation of expanding node before neighbor L2 (original computed
+//          it but only used it in rabitq path)
+// --- end (include/search_bitonic.cuh 628b125) ---
 
 __global__ void kernel_sophia_search(
     GPUGraphView graph, GPUBaseSearchCfg cfg,
