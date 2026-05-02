@@ -18,6 +18,7 @@
 #include "gpu_warp_search.cuh"
 #include "gpu_reg_warp_search.cuh"
 #include "gpu_rabitq_search.cuh"
+#include "gpu_sophia_search.cuh"
 
 using json = nlohmann::json;
 
@@ -380,10 +381,10 @@ static void run_warp(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
               << "  qps: " << nq / elapsed << std::endl;
 }
 
-template <unsigned NY, unsigned REGX = 8, unsigned REGY = 2>
-static void run_reg_warp(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
-                         int nq, int dim, int K,
-                         const float* d_queries, vid_t* d_results)
+template <unsigned NY, unsigned REGX, unsigned REGY>
+static void run_reg_warp_impl(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
+                              int nq, int dim, int K,
+                              const float* d_queries, vid_t* d_results)
 {
     size_t smem = GPURegWarpSearch<NY, REGX, REGY>::shared_mem_bytes(cfg, dim, gpu_graph.degree());
     int num_blocks = (nq + NY - 1) / NY;
@@ -397,6 +398,64 @@ static void run_reg_warp(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
     auto start = std::chrono::high_resolution_clock::now();
     for (int r = 0; r < NRUNS; r++) {
         kernel_reg_warp_search<NY, REGX, REGY><<<num_blocks, block, smem>>>(
+            gpu_graph.view(), cfg, nq, dim, d_queries, d_results, K);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    auto end = std::chrono::high_resolution_clock::now();
+
+    double elapsed = std::chrono::duration<double>(end - start).count() / NRUNS;
+    std::cout << "  time: " << elapsed * 1000.0 << " ms"
+              << "  qps: " << nq / elapsed << std::endl;
+}
+
+template <unsigned NY, unsigned REGY, unsigned REGX>
+static void run_reg_warp_dispatch(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
+                                  int nq, int dim, int K,
+                                  const float* d_queries, vid_t* d_results)
+{
+    if constexpr (REGX >= REGY && REGX % REGY == 0) {
+        run_reg_warp_impl<NY, REGX, REGY>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
+    } else {
+        std::cerr << "topk_size=" << cfg.topk_size
+                  << " too small for REGY=" << REGY << std::endl;
+        exit(1);
+    }
+}
+
+template <unsigned NY, unsigned REGY = 2>
+static void run_reg_warp(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
+                         int nq, int dim, int K,
+                         const float* d_queries, vid_t* d_results)
+{
+    unsigned regx = cfg.topk_size / 32;
+    switch (regx) {
+        case  2: run_reg_warp_dispatch<NY, REGY,  2>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); break;
+        case  4: run_reg_warp_dispatch<NY, REGY,  4>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); break;
+        case  8: run_reg_warp_dispatch<NY, REGY,  8>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); break;
+        case 16: run_reg_warp_dispatch<NY, REGY, 16>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); break;
+        default:
+            std::cerr << "topk_size must be 64, 128, 256, or 512 for rwarp (got "
+                      << cfg.topk_size << ")" << std::endl;
+            exit(1);
+    }
+}
+
+static void run_sophia(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
+                       int nq, int dim, int K,
+                       const float* d_queries, vid_t* d_results)
+{
+    size_t smem = sophia_shared_mem_bytes(cfg.bitlen, dim);
+    int num_blocks = nq;
+
+    CUDA_CHECK(cudaFuncSetAttribute(kernel_sophia_search,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         static_cast<int>(smem)));
+
+    constexpr int NRUNS = 5;
+    auto start = std::chrono::high_resolution_clock::now();
+    for (int r = 0; r < NRUNS; r++) {
+        kernel_sophia_search<<<num_blocks, SOPHIA_BLOCK, smem>>>(
             gpu_graph.view(), cfg, nq, dim, d_queries, d_results, K);
         CUDA_CHECK(cudaGetLastError());
     }
@@ -570,21 +629,23 @@ int main() {
         } else if (mode == "warp88") {
             run_warp<8, 8>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
         } else if (mode == "rwarp12") {
-            run_reg_warp<1, 8, 2>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
+            run_reg_warp<1, 2>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
         } else if (mode == "rwarp14") {
-            run_reg_warp<1, 8, 4>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
+            run_reg_warp<1, 4>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
         } else if (mode == "rwarp22") {
-            run_reg_warp<2, 8, 2>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
+            run_reg_warp<2, 2>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
         } else if (mode == "rwarp24") {
-            run_reg_warp<2, 8, 4>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
+            run_reg_warp<2, 4>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
         } else if (mode == "rwarp42") {
-            run_reg_warp<4, 8, 2>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
+            run_reg_warp<4, 2>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
         } else if (mode == "rwarp44") {
-            run_reg_warp<4, 8, 4>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
+            run_reg_warp<4, 4>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
         } else if (mode == "rwarp82") {
-            run_reg_warp<8, 8, 2>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
+            run_reg_warp<8, 2>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
         } else if (mode == "rwarp84") {
-            run_reg_warp<8, 8, 4>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
+            run_reg_warp<8, 4>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
+        } else if (mode == "sophia") {
+            run_sophia(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
         } else {
             std::cerr << "Unknown mode: " << mode << std::endl;
             return 1;
