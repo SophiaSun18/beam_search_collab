@@ -112,51 +112,32 @@ template <unsigned REGX, unsigned REGY>
 __device__ void RegBitonicTopK<REGX, REGY>::merge(
     float (&dist)[REGY], uint32_t (&idx)[REGY])
 {
+    const unsigned tid = threadIdx.x & 31;
     constexpr unsigned chunks = REGX / REGY;
+    constexpr unsigned CAND = 32 * REGY;
 
-    // [1] Sort incoming ascending
+    // [1] Sort incoming candidates ascending
     sort_warp_full<REGY>(dist, idx);
 
-    for (unsigned c = 0; c < chunks; c++) {
-        // [2] Extract chunk c from topk into local array
-        float    chunk_d[REGY];
-        uint32_t chunk_i[REGY];
-        #pragma unroll
-        for (unsigned j = 0; j < REGY; j++) {
-            chunk_d[j] = topk_d_[c * REGY + j];
-            chunk_i[j] = topk_i_[c * REGY + j];
-        }
-
-        // [3] Butterfly: dist gets min, chunk gets max
-        butterfly<REGY>(dist, idx, chunk_d, chunk_i);
-
-        // [4] If not first chunk, sort chunk descending and store to previous
-        if (c > 0) {
-            sort_warp<false, REGY>(chunk_d, chunk_i);
-            #pragma unroll
-            for (unsigned j = 0; j < REGY; j++) {
-                topk_d_[(c - 1) * REGY + j] = chunk_d[j];
-                topk_i_[(c - 1) * REGY + j] = chunk_i[j];
-            }
-        }
-
-        // [5] Sort incoming ascending for next chunk
-        sort_warp<true, REGY>(dist, idx);
-    }
-
-    // [6] Store final incoming as last chunk, sorted descending
-    sort_warp<false, REGY>(dist, idx);
+    // [2] Compare buffer[j] with candidate[j] for j = 0..CAND-1.
+    //     Buffer is descending, candidates ascending → result is bitonic.
+    //     Candidate at position j = tid*REGX+r is in REGY-layout:
+    //       lane  = tid*chunks + r/REGY
+    //       reg   = r % REGY
     #pragma unroll
-    for (unsigned j = 0; j < REGY; j++) {
-        topk_d_[(chunks - 1) * REGY + j] = dist[j];
-        topk_i_[(chunks - 1) * REGY + j] = idx[j];
+    for (unsigned r = 0; r < REGX; r++) {
+        unsigned j = tid * REGX + r;
+        unsigned src_lane = tid * chunks + r / REGY;
+        float    cd = __shfl_sync(0xffffffff, dist[r % REGY], src_lane);
+        uint32_t ci = __shfl_sync(0xffffffff, idx[r % REGY], src_lane);
+        if (j < CAND && topk_d_[r] > cd) {
+            topk_d_[r] = cd;
+            topk_i_[r] = ci;
+        }
     }
 
-    // [7] Re-sort full topk descending to restore correct position order
-    //     for pick/flush. Only needed when chunks > 1 (REGY < REGX).
-    if constexpr (chunks > 1) {
-        sort_warp<false, REGX>(topk_d_, topk_i_);
-    }
+    // [3] Buffer is now bitonic — single merge pass to fix
+    merge_warp<false, REGX>(topk_d_, topk_i_);
 }
 
 // ── pick ────────────────────────────────────────────────────────────────────

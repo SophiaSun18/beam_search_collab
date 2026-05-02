@@ -10,6 +10,7 @@
 
 #include "topk_shared.cuh"
 #include "topk_reg.cuh"
+#include "topk_reg.cuh"
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Sophia's sort/merge/pick — extracted from her utils.cuh / search_bitonic.cuh
@@ -285,6 +286,39 @@ __global__ void kernel_ours_bench_r8(
     }
 }
 
+// RegBitonicTopK<8,2>: 32 threads, buffer=256, cand=64, pure register
+template <unsigned REGX, unsigned REGY>
+__global__ void kernel_reg_bench(
+    float* g_cand_dist, uint32_t* g_cand_idx,
+    unsigned topk_size, unsigned cand_size, unsigned n_iters)
+{
+    const unsigned tid = threadIdx.x;
+
+    RegBitonicTopK<REGX, REGY> buf;
+
+    for (unsigned it = 0; it < n_iters; it++) {
+        float d[REGY]; uint32_t x[REGY];
+        #pragma unroll
+        for (unsigned j = 0; j < REGY; j++) {
+            unsigned pos = tid * REGY + j;
+            d[j] = (pos < cand_size) ? g_cand_dist[it * cand_size + pos] : FLT_MAX;
+            x[j] = (pos < cand_size) ? g_cand_idx[it * cand_size + pos]  : 0xFFFFFFFF;
+        }
+        buf.merge(d, x);
+
+        uint32_t pbuf[REGY];
+        #pragma unroll
+        for (unsigned i = 0; i < REGY; i++) pbuf[i] = 0xFFFFFFFF;
+        unsigned found = buf.pick(pbuf, 1);
+        uint32_t picked = 0xFFFFFFFF;
+        const bool has = found > 0 && pbuf[0] != 0xFFFFFFFF;
+        const uint32_t ballot = __ballot_sync(0xffffffff, has);
+        if (ballot != 0) picked = __shfl_sync(0xffffffff, pbuf[0], __ffs(ballot) - 1);
+        (void)picked;
+        __syncwarp();
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 
 #define CUDA_CHECK(call) do { \
@@ -372,6 +406,54 @@ int main() {
         auto end = std::chrono::high_resolution_clock::now();
         double us = std::chrono::duration<double, std::micro>(end - start).count() / NRUNS;
         printf("ours REG=8:        %.1f us  (%d blocks x %d iters, chunks=1)\n", us, NBLOCKS, ITERS);
+    }
+
+    // Reg<8,2>: 32 threads, buffer=256, cand=64, pure register
+    {
+        kernel_reg_bench<8, 2><<<NBLOCKS, 32>>>(d_dist, d_idx, TOPK, CAND, ITERS);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        auto start = std::chrono::high_resolution_clock::now();
+        for (int r = 0; r < NRUNS; r++) {
+            kernel_reg_bench<8, 2><<<NBLOCKS, 32>>>(d_dist, d_idx, TOPK, CAND, ITERS);
+            CUDA_CHECK(cudaGetLastError());
+        }
+        CUDA_CHECK(cudaDeviceSynchronize());
+        auto end = std::chrono::high_resolution_clock::now();
+        double us = std::chrono::duration<double, std::micro>(end - start).count() / NRUNS;
+        printf("reg<8,2>:          %.1f us  (%d blocks x %d iters)\n", us, NBLOCKS, ITERS);
+    }
+
+    // Reg<8,4>: 32 threads, buffer=256, cand=128
+    {
+        kernel_reg_bench<8, 4><<<NBLOCKS, 32>>>(d_dist, d_idx, TOPK, CAND, ITERS);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        auto start = std::chrono::high_resolution_clock::now();
+        for (int r = 0; r < NRUNS; r++) {
+            kernel_reg_bench<8, 4><<<NBLOCKS, 32>>>(d_dist, d_idx, TOPK, CAND, ITERS);
+            CUDA_CHECK(cudaGetLastError());
+        }
+        CUDA_CHECK(cudaDeviceSynchronize());
+        auto end = std::chrono::high_resolution_clock::now();
+        double us = std::chrono::duration<double, std::micro>(end - start).count() / NRUNS;
+        printf("reg<8,4>:          %.1f us  (%d blocks x %d iters)\n", us, NBLOCKS, ITERS);
+    }
+
+    // Reg<8,8>: 32 threads, buffer=256, cand=256 (chunks=1)
+    {
+        kernel_reg_bench<8, 8><<<NBLOCKS, 32>>>(d_dist, d_idx, TOPK, CAND, ITERS);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        auto start = std::chrono::high_resolution_clock::now();
+        for (int r = 0; r < NRUNS; r++) {
+            kernel_reg_bench<8, 8><<<NBLOCKS, 32>>>(d_dist, d_idx, TOPK, CAND, ITERS);
+            CUDA_CHECK(cudaGetLastError());
+        }
+        CUDA_CHECK(cudaDeviceSynchronize());
+        auto end = std::chrono::high_resolution_clock::now();
+        double us = std::chrono::duration<double, std::micro>(end - start).count() / NRUNS;
+        printf("reg<8,8>:          %.1f us  (%d blocks x %d iters)\n", us, NBLOCKS, ITERS);
     }
 
     CUDA_CHECK(cudaFree(d_dist));
