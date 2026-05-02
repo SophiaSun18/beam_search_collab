@@ -11,6 +11,7 @@
 
 #include "data_loader.hpp"
 #include "cpu_base_search.hpp"
+#include "cpu_rabitq_search.hpp"
 
 using json = nlohmann::json;
 
@@ -98,6 +99,8 @@ int main() {
               << ", queries=" << nq
               << ", entry=" << entry_point << std::endl;
 
+    std::string codebook_file = jd.value("codebook", "");
+
     if (!j.contains("search")) {
         std::cerr << "Missing \"search\" key" << std::endl;
         return 1;
@@ -105,24 +108,47 @@ int main() {
     auto& js = j["search"];
     std::string mode = js.value("mode", "base");
     int K = js.value("K", 100);
-    if (mode != "base") {
-        std::cerr << "Unknown mode: " << mode << std::endl;
-        return 1;
-    }
 
-    CPUBaseSearchCfg cfg;
-    cfg.topk_size = js.value("topk_size", 256u);
-    cfg.entry_point = entry_point;
-    cfg.max_iterations = js.value("max_iterations", 1024);
-    CPUBaseSearch searcher(cpu_graph, cfg);
     std::vector<vid_t> h_results(nq * static_cast<size_t>(K));
 
     std::cout << "search: mode=" << mode << " K=" << K << std::endl;
     auto start = std::chrono::high_resolution_clock::now();
-    for (size_t qid = 0; qid < nq; ++qid) {
-        searcher.search(h_queries + qid * static_cast<size_t>(dim),
-                        h_results.data() + qid * static_cast<size_t>(K), K);
+
+    if (mode == "rabitq") {
+        if (codebook_file.empty()) {
+            std::cerr << "rabitq mode requires \"codebook\" in data config" << std::endl;
+            return 1;
+        }
+        CPURabitqData cpu_rq = load_rabitq_codebook(
+            codebook_file, npoints, dim, cpu_graph.degree);
+        vid_t rq_entry = (cpu_rq.entry_point != UINT32_MAX)
+                       ? cpu_rq.entry_point : entry_point;
+
+        CPURabitqSearchCfg rq_cfg;
+        rq_cfg.topk_size      = js.value("topk_size", 256u);
+        rq_cfg.entry_point    = rq_entry;
+        rq_cfg.max_iterations = js.value("max_iterations", 1024);
+
+        CPURabitqSearch searcher(cpu_graph, cpu_rq, rq_cfg);
+        for (size_t qid = 0; qid < nq; ++qid) {
+            searcher.search(h_queries + qid * static_cast<size_t>(dim),
+                            h_results.data() + qid * static_cast<size_t>(K), K);
+        }
+    } else if (mode == "base") {
+        CPUBaseSearchCfg cfg;
+        cfg.topk_size = js.value("topk_size", 256u);
+        cfg.entry_point = entry_point;
+        cfg.max_iterations = js.value("max_iterations", 1024);
+        CPUBaseSearch searcher(cpu_graph, cfg);
+        for (size_t qid = 0; qid < nq; ++qid) {
+            searcher.search(h_queries + qid * static_cast<size_t>(dim),
+                            h_results.data() + qid * static_cast<size_t>(K), K);
+        }
+    } else {
+        std::cerr << "Unknown mode: " << mode << std::endl;
+        return 1;
     }
+
     auto end = std::chrono::high_resolution_clock::now();
 
     double elapsed = std::chrono::duration<double>(end - start).count();
