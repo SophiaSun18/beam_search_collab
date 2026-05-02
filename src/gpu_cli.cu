@@ -445,7 +445,14 @@ static void run_sophia(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
                        int nq, int dim, int K,
                        const float* d_queries, vid_t* d_results)
 {
-    size_t smem = sophia_shared_mem_bytes(cfg.bitlen, dim);
+    SophiaSearchCfg scfg;
+    scfg.topk_size      = cfg.topk_size;
+    scfg.bitlen         = cfg.bitlen;
+    scfg.entry_point    = cfg.entry_point;
+    scfg.max_iterations = cfg.max_iterations;
+    scfg.reset_interval = cfg.reset_interval;
+
+    size_t smem = sophia_shared_mem_bytes(scfg.bitlen, dim);
     int num_blocks = nq;
 
     CUDA_CHECK(cudaFuncSetAttribute(kernel_sophia_search,
@@ -455,8 +462,8 @@ static void run_sophia(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
     constexpr int NRUNS = 5;
     auto start = std::chrono::high_resolution_clock::now();
     for (int r = 0; r < NRUNS; r++) {
-        kernel_sophia_search<<<num_blocks, SOPHIA_BLOCK, smem>>>(
-            gpu_graph.view(), cfg, nq, dim, d_queries, d_results, K);
+        kernel_sophia_search<<<num_blocks, SOPHIA_BLOCK_SIZE, smem>>>(
+            gpu_graph.view(), scfg, nq, dim, d_queries, d_results, K);
         CUDA_CHECK(cudaGetLastError());
     }
     CUDA_CHECK(cudaDeviceSynchronize());
