@@ -17,6 +17,7 @@
 #include "gpu_split_search.cuh"
 #include "gpu_warp_search.cuh"
 #include "gpu_reg_warp_search.cuh"
+#include "bloom_filter.cuh"
 #include "gpu_rabitq_search.cuh"
 #include "gpu_sophia_search.cuh"
 
@@ -186,7 +187,7 @@ __global__ void kernel_reg_search(
     searcher.search(d_queries + qid * dim, d_results + qid * K, K);
 }
 
-template <unsigned NY, unsigned REGX = 8, unsigned REGY = 2>
+template <unsigned NY, unsigned REGX = 8, unsigned REGY = 2, typename Filter = HashFilter>
 __global__ void kernel_reg_warp_search(
     GPUGraphView graph, GPUBaseSearchCfg cfg,
     int nq, int dim,
@@ -198,7 +199,7 @@ __global__ void kernel_reg_warp_search(
 
     extern __shared__ char smem[];
     char* ptr = smem;
-    GPURegWarpSearch<NY, REGX, REGY> searcher(ptr, cfg, graph);
+    GPURegWarpSearch<NY, REGX, REGY, Filter> searcher(ptr, cfg, graph);
     __syncwarp();
     searcher.search(d_queries + qid * dim, d_results + qid * K, K);
 }
@@ -381,23 +382,23 @@ static void run_warp(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
               << "  qps: " << nq / elapsed << std::endl;
 }
 
-template <unsigned NY, unsigned REGX, unsigned REGY>
+template <unsigned NY, unsigned REGX, unsigned REGY, typename Filter>
 static void run_reg_warp_impl(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
                               int nq, int dim, int K,
                               const float* d_queries, vid_t* d_results)
 {
-    size_t smem = GPURegWarpSearch<NY, REGX, REGY>::shared_mem_bytes(cfg, dim, gpu_graph.degree());
+    size_t smem = GPURegWarpSearch<NY, REGX, REGY, Filter>::shared_mem_bytes(cfg, dim, gpu_graph.degree());
     int num_blocks = (nq + NY - 1) / NY;
     dim3 block(WARP_SIZE, NY);
 
-    CUDA_CHECK(cudaFuncSetAttribute((kernel_reg_warp_search<NY, REGX, REGY>),
+    CUDA_CHECK(cudaFuncSetAttribute((kernel_reg_warp_search<NY, REGX, REGY, Filter>),
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
                          static_cast<int>(smem)));
 
     constexpr int NRUNS = 5;
     auto start = std::chrono::high_resolution_clock::now();
     for (int r = 0; r < NRUNS; r++) {
-        kernel_reg_warp_search<NY, REGX, REGY><<<num_blocks, block, smem>>>(
+        kernel_reg_warp_search<NY, REGX, REGY, Filter><<<num_blocks, block, smem>>>(
             gpu_graph.view(), cfg, nq, dim, d_queries, d_results, K);
         CUDA_CHECK(cudaGetLastError());
     }
@@ -409,13 +410,13 @@ static void run_reg_warp_impl(const GPUGraph& gpu_graph, const GPUBaseSearchCfg&
               << "  qps: " << nq / elapsed << std::endl;
 }
 
-template <unsigned NY, unsigned REGY, unsigned REGX>
+template <unsigned NY, unsigned REGY, unsigned REGX, typename Filter>
 static void run_reg_warp_dispatch(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
                                   int nq, int dim, int K,
                                   const float* d_queries, vid_t* d_results)
 {
     if constexpr (REGX >= REGY && REGX % REGY == 0) {
-        run_reg_warp_impl<NY, REGX, REGY>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
+        run_reg_warp_impl<NY, REGX, REGY, Filter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
     } else {
         std::cerr << "topk_size=" << cfg.topk_size
                   << " too small for REGY=" << REGY << std::endl;
@@ -423,17 +424,17 @@ static void run_reg_warp_dispatch(const GPUGraph& gpu_graph, const GPUBaseSearch
     }
 }
 
-template <unsigned NY, unsigned REGY = 2>
+template <unsigned NY, unsigned REGY = 2, typename Filter = HashFilter>
 static void run_reg_warp(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
                          int nq, int dim, int K,
                          const float* d_queries, vid_t* d_results)
 {
     unsigned regx = cfg.topk_size / 32;
     switch (regx) {
-        case  2: run_reg_warp_dispatch<NY, REGY,  2>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); break;
-        case  4: run_reg_warp_dispatch<NY, REGY,  4>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); break;
-        case  8: run_reg_warp_dispatch<NY, REGY,  8>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); break;
-        case 16: run_reg_warp_dispatch<NY, REGY, 16>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); break;
+        case  2: run_reg_warp_dispatch<NY, REGY,  2, Filter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); break;
+        case  4: run_reg_warp_dispatch<NY, REGY,  4, Filter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); break;
+        case  8: run_reg_warp_dispatch<NY, REGY,  8, Filter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); break;
+        case 16: run_reg_warp_dispatch<NY, REGY, 16, Filter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); break;
         default:
             std::cerr << "topk_size must be 64, 128, 256, or 512 for rwarp (got "
                       << cfg.topk_size << ")" << std::endl;
@@ -651,6 +652,14 @@ int main() {
             run_reg_warp<8, 2>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
         } else if (mode == "rwarp84") {
             run_reg_warp<8, 4>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
+        } else if (mode == "brwarp12") {
+            run_reg_warp<1, 2, BloomFilter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
+        } else if (mode == "brwarp22") {
+            run_reg_warp<2, 2, BloomFilter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
+        } else if (mode == "brwarp42") {
+            run_reg_warp<4, 2, BloomFilter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
+        } else if (mode == "brwarp82") {
+            run_reg_warp<8, 2, BloomFilter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
         } else if (mode == "sophia") {
             run_sophia(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
         } else {

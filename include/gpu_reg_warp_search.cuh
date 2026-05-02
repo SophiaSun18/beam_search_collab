@@ -1,6 +1,7 @@
 #pragma once
 #include "gpu_base_search.cuh"
-#include "topk_reg.cuh"
+#include "topk.cuh"
+#include "visit_filter.cuh"
 #include <cuda_runtime.h>
 
 /**
@@ -15,13 +16,14 @@
  * @tparam NY    Number of warps (queries) per block.
  * @tparam REGX  Registers per thread for topk buffer. Buffer = 32 * REGX.
  * @tparam REGY  Registers per thread for merge batch. Batch = 32 * REGY.
+ * @tparam Filter  Visited-node filter type (HashFilter or BloomFilter).
  */
-template <unsigned NY, unsigned REGX = 8, unsigned REGY = 2>
+template <unsigned NY, unsigned REGX = 8, unsigned REGY = 2, typename Filter = HashFilter>
 class GPURegWarpSearch {
     static constexpr unsigned BX = WARP_SIZE;  // 32
 
     RegBitonicTopK<REGX, REGY> topk_;
-    HashFilter                 hf_;
+    Filter                     hf_;
     float*                     query_buf_;
     INDEX_T*                   parent_buf_;
     INDEX_T*                   cand_idx_;
@@ -47,8 +49,8 @@ public:
 
 // ── constructor ─────────────────────────────────────────────────────────────
 
-template <unsigned NY, unsigned REGX, unsigned REGY>
-__device__ GPURegWarpSearch<NY, REGX, REGY>::GPURegWarpSearch(
+template <unsigned NY, unsigned REGX, unsigned REGY, typename Filter>
+__device__ GPURegWarpSearch<NY, REGX, REGY, Filter>::GPURegWarpSearch(
     char*& smem, const GPUBaseSearchCfg& cfg, GPUGraphView graph)
     : topk_(),
       hf_(smem, cfg.bitlen),
@@ -79,12 +81,12 @@ __device__ GPURegWarpSearch<NY, REGX, REGY>::GPURegWarpSearch(
 
 // ── shared memory size ──────────────────────────────────────────────────────
 
-template <unsigned NY, unsigned REGX, unsigned REGY>
-__host__ __device__ size_t GPURegWarpSearch<NY, REGX, REGY>::shared_mem_bytes_per_warp(
+template <unsigned NY, unsigned REGX, unsigned REGY, typename Filter>
+__host__ __device__ size_t GPURegWarpSearch<NY, REGX, REGY, Filter>::shared_mem_bytes_per_warp(
     const GPUBaseSearchCfg& cfg, unsigned dim, unsigned degree) {
     size_t size = 0;
     // No topk shared memory — it's in registers.
-    size += (1u << cfg.bitlen) * sizeof(uint32_t);   // hash filter
+    size += Filter::shared_mem_bytes(cfg.bitlen);     // visited-node filter
     size = (size + alignof(float) - 1) & ~(alignof(float) - 1);
     size += dim * sizeof(float);                     // query_buf_
     size += sizeof(INDEX_T);                         // parent_buf_
@@ -93,16 +95,16 @@ __host__ __device__ size_t GPURegWarpSearch<NY, REGX, REGY>::shared_mem_bytes_pe
     return size;
 }
 
-template <unsigned NY, unsigned REGX, unsigned REGY>
-__host__ __device__ size_t GPURegWarpSearch<NY, REGX, REGY>::shared_mem_bytes(
+template <unsigned NY, unsigned REGX, unsigned REGY, typename Filter>
+__host__ __device__ size_t GPURegWarpSearch<NY, REGX, REGY, Filter>::shared_mem_bytes(
     const GPUBaseSearchCfg& cfg, unsigned dim, unsigned degree) {
     return NY * shared_mem_bytes_per_warp(cfg, dim, degree);
 }
 
 // ── search ──────────────────────────────────────────────────────────────────
 
-template <unsigned NY, unsigned REGX, unsigned REGY>
-__device__ void GPURegWarpSearch<NY, REGX, REGY>::search(
+template <unsigned NY, unsigned REGX, unsigned REGY, typename Filter>
+__device__ void GPURegWarpSearch<NY, REGX, REGY, Filter>::search(
     const float* query, vid_t* results, int K)
 {
     const unsigned lane = threadIdx.x;
