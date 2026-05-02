@@ -63,6 +63,16 @@ target_include_directories(test_bitonic_sort_full PRIVATE ${CMAKE_SOURCE_DIR}/in
 target_compile_options(test_bitonic_sort_full PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
 add_test(NAME test_bitonic_sort_full COMMAND test_bitonic_sort_full)
 
+add_executable(test_bitonic_sort_reg unittest/test_bitonic_sort_reg.cu)
+target_include_directories(test_bitonic_sort_reg PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_compile_options(test_bitonic_sort_reg PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
+add_test(NAME test_bitonic_sort_reg COMMAND test_bitonic_sort_reg)
+
+add_executable(test_bitonic_sort_full_reg unittest/test_bitonic_sort_full_reg.cu)
+target_include_directories(test_bitonic_sort_full_reg PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_compile_options(test_bitonic_sort_full_reg PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
+add_test(NAME test_bitonic_sort_full_reg COMMAND test_bitonic_sort_full_reg)
+
 add_executable(test_reg_topk_merge unittest/test_reg_topk_merge.cu)
 target_include_directories(test_reg_topk_merge PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_compile_options(test_reg_topk_merge PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
@@ -72,6 +82,10 @@ add_executable(test_reg_topk_no_dup unittest/test_reg_topk_no_dup.cu)
 target_include_directories(test_reg_topk_no_dup PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_compile_options(test_reg_topk_no_dup PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
 add_test(NAME test_reg_topk_no_dup COMMAND test_reg_topk_no_dup)
+
+add_executable(perf_sophia_topk unittest/perf_sophia_topk.cu)
+target_include_directories(perf_sophia_topk PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_compile_options(perf_sophia_topk PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
 
 # ── Profiling ───────────────────────────────────────────────────────────────
 

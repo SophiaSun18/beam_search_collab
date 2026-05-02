@@ -59,12 +59,15 @@ public:
     /** @brief Node ID at position pos (MSB cleared). 0xFFFFFFFF for empty. */
     __device__ uint32_t id(unsigned pos) const;
 
-private:
+    // -- helpers
     template <bool asc, unsigned N>
     __device__ static void sort_local(float (&d)[N], uint32_t (&i)[N]);
 
     template <bool asc, unsigned N>
     __device__ static void sort_warp(float (&d)[N], uint32_t (&i)[N]);
+
+    template <bool asc, unsigned N>
+    __device__ static void merge_warp(float (&d)[N], uint32_t (&i)[N]);
 
     template <unsigned N>
     __device__ static void sort_warp_full(float (&d)[N], uint32_t (&i)[N]);
@@ -291,6 +294,51 @@ __device__ void RegBitonicTopK<REGX, REGY>::sort_warp(
                             float    td = d[k]; d[k] = d[j]; d[j] = td;
                             uint32_t ti = i[k]; i[k] = i[j]; i[j] = ti;
                         }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * @brief Single merge pass on a bitonic sequence of 32*N elements.
+ *
+ * After butterfly between ascending and descending sequences, both output
+ * halves are bitonic. This resolves a bitonic sequence into sorted order
+ * using O(log n) comparator stages instead of the O(log² n) of sort_warp.
+ */
+template <unsigned REGX, unsigned REGY>
+template <bool asc, unsigned N>
+__device__ void RegBitonicTopK<REGX, REGY>::merge_warp(
+    float (&d)[N], uint32_t (&i)[N])
+{
+    const unsigned tid = threadIdx.x & 31;
+    constexpr unsigned TOTAL = 32 * N;
+    // Single pass: len = TOTAL. Since gp < TOTAL, direction is uniform.
+    for (unsigned stride = TOTAL >> 1; stride >= 1; stride >>= 1) {
+        if (stride >= N) {
+            unsigned thread_stride = stride / N;
+            unsigned partner = tid ^ thread_stride;
+            #pragma unroll
+            for (unsigned j = 0; j < N; j++) {
+                float    pd = __shfl_xor_sync(0xffffffff, d[j], thread_stride);
+                uint32_t pi = __shfl_xor_sync(0xffffffff, i[j], thread_stride);
+                bool is_lower = (tid < partner);
+                bool want_smaller = (asc == is_lower);
+                if (want_smaller ? (d[j] > pd) : (d[j] < pd)) {
+                    d[j] = pd;
+                    i[j] = pi;
+                }
+            }
+        } else {
+            #pragma unroll
+            for (unsigned k = 0; k < N; k++) {
+                unsigned j = k ^ stride;
+                if (j > k) {
+                    if ((d[k] > d[j]) == asc) {
+                        float    td = d[k]; d[k] = d[j]; d[j] = td;
+                        uint32_t ti = i[k]; i[k] = i[j]; i[j] = ti;
                     }
                 }
             }

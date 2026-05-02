@@ -159,6 +159,9 @@ class SharedBitonicTopK : private BitonicScratchBase<(BX > 32)> {
     template <bool asc = true>
     __device__ static inline void bitonic_sort_block(
             float (&d)[REG], uint32_t (&i)[REG], float* scratch_d, uint32_t* scratch_i);
+    template <bool asc = true>
+    __device__ static inline void bitonic_merge_block(
+            float (&d)[REG], uint32_t (&i)[REG], float* scratch_d, uint32_t* scratch_i);
     __device__ static inline void bitonic_sort_full(
             float (&d)[REG], uint32_t (&i)[REG], float* scratch_d, uint32_t* scratch_i);
     __device__ static inline void butterfly(
@@ -245,9 +248,9 @@ __device__ void SharedBitonicTopK<BX, REG>::merge(float (&dist)[REG], uint32_t (
         }
         // [3] Butterfly: dist gets min (lower half), dist_ gets max (upper half)
         butterfly(dist, idx, dist_, idx_);
-        // [5] If not first chunk, sort upper half descending and flush to previous chunk
+        // [5] If not first chunk, merge upper half descending and flush to previous chunk
         if (c > 0) {
-            bitonic_sort_block<false>(dist_, idx_, sd, si);
+            bitonic_merge_block<false>(dist_, idx_, sd, si);
             #pragma unroll
             for (unsigned j = 0; j < REG; j++) {
                 unsigned pos = (c - 1) * N + tid * REG + j;
@@ -259,11 +262,11 @@ __device__ void SharedBitonicTopK<BX, REG>::merge(float (&dist)[REG], uint32_t (
             }
             sync();
         }
-        // [6] Sort lower half ascending, ready for next chunk
-        bitonic_sort_block<true>(dist, idx, sd, si);
+        // [6] Merge lower half ascending, ready for next chunk
+        bitonic_merge_block<true>(dist, idx, sd, si);
     }
-    // [7] Flush last chunk descending
-    bitonic_sort_block<false>(dist, idx, sd, si);
+    // [7] Merge last chunk descending
+    bitonic_merge_block<false>(dist, idx, sd, si);
     unsigned best = next_expand;
     #pragma unroll
     for (unsigned j = 0; j < REG; j++) {
@@ -547,6 +550,79 @@ __device__ inline void SharedBitonicTopK<BX, REG>::bitonic_sort_block(
                             float    td = d[k]; d[k] = d[j]; d[j] = td;
                             uint32_t ti = i[k]; i[k] = i[j]; i[j] = ti;
                         }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ── bitonic_merge_block ────────────────────────────────────────────────────
+
+/**
+ * @brief Single merge pass on a bitonic sequence of BX*REG elements.
+ *
+ * After butterfly between ascending and descending sequences, both output
+ * halves are bitonic. This function resolves a bitonic sequence into sorted
+ * order using O(log n) comparator stages instead of the O(log² n) stages
+ * that a full sort requires.
+ */
+template <unsigned BX, unsigned REG>
+template <bool asc>
+__device__ inline void SharedBitonicTopK<BX, REG>::bitonic_merge_block(
+    float (&d)[REG], uint32_t (&i)[REG],
+    float* scratch_d, uint32_t* scratch_i)
+{
+    const unsigned tid = threadIdx.x;
+    constexpr unsigned TOTAL = BX * REG;
+    // Single pass: len = TOTAL. Since global_pos < TOTAL, direction is uniform.
+    for (unsigned stride = TOTAL >> 1; stride >= 1; stride >>= 1) {
+        if (stride >= REG) {
+            unsigned thread_stride = stride / REG;
+            if (thread_stride < 32) {
+                // Intra-warp: use shfl
+                unsigned partner = tid ^ thread_stride;
+                #pragma unroll
+                for (unsigned j = 0; j < REG; j++) {
+                    float    pd = __shfl_xor_sync(0xffffffff, d[j], thread_stride);
+                    uint32_t pi = __shfl_xor_sync(0xffffffff, i[j], thread_stride);
+                    bool is_lower = (tid < partner);
+                    bool want_smaller = (asc == is_lower);
+                    if (want_smaller ? (d[j] > pd) : (d[j] < pd)) {
+                        d[j] = pd;
+                        i[j] = pi;
+                    }
+                }
+            } else {
+                // Cross-warp: use scratch (only reached when BX > 32)
+                #pragma unroll
+                for (unsigned j = 0; j < REG; j++) {
+                    scratch_d[tid * REG + j] = d[j];
+                    scratch_i[tid * REG + j] = i[j];
+                }
+                __syncthreads();
+                unsigned partner = tid ^ thread_stride;
+                #pragma unroll
+                for (unsigned j = 0; j < REG; j++) {
+                    float    pd = scratch_d[partner * REG + j];
+                    uint32_t pi = scratch_i[partner * REG + j];
+                    bool is_lower = (tid < partner);
+                    bool want_smaller = (asc == is_lower);
+                    if (want_smaller ? (d[j] > pd) : (d[j] < pd)) {
+                        d[j] = pd;
+                        i[j] = pi;
+                    }
+                }
+                __syncthreads();
+            }
+        } else {
+            #pragma unroll
+            for (unsigned k = 0; k < REG; k++) {
+                unsigned j = k ^ stride;
+                if (j > k) {
+                    if ((d[k] > d[j]) == asc) {
+                        float    td = d[k]; d[k] = d[j]; d[j] = td;
+                        uint32_t ti = i[k]; i[k] = i[j]; i[j] = ti;
                     }
                 }
             }
