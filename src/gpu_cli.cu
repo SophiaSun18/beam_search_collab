@@ -114,19 +114,20 @@ __global__ void kernel_warp_search(
     searcher.search(d_queries + qid * dim, d_results + qid * K, K);
 }
 
+template <unsigned NY, typename TopK, unsigned REG, typename Filter = HashFilter>
 __global__ void kernel_rabitq_search(
     GPUGraphView graph, GPURabitqView rabitq, GPURabitqSearchCfg cfg,
     int nq, int dim,
     const float* __restrict__ d_queries,
     vid_t* __restrict__ d_results, int K)
 {
-    int qid = blockIdx.x;
+    int qid = blockIdx.x * NY + threadIdx.y;
     if (qid >= nq) return;
 
     extern __shared__ char smem[];
     char* ptr = smem;
-    GPURabitqSearch<CLI_BLOCK_SIZE> searcher(ptr, cfg, graph, rabitq);
-    __syncthreads();
+    GPURabitqSearch<NY, TopK, REG, Filter> searcher(ptr, cfg, graph, rabitq);
+    __syncwarp();
     searcher.search(d_queries + qid * dim, d_results + qid * K, K);
 }
 
@@ -281,23 +282,26 @@ static void run_base(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
     }
 }
 
-static void run_rabitq(const GPUGraph& gpu_graph, const GPURabitq& gpu_rabitq,
-                       const GPURabitqSearchCfg& cfg,
-                       int nq, int dim, int K,
-                       const float* d_queries, vid_t* d_results)
+template <unsigned NY, typename TopK, unsigned REG, typename Filter = HashFilter>
+static void run_rabitq_impl(const GPUGraph& gpu_graph, const GPURabitq& gpu_rabitq,
+                            const GPURabitqSearchCfg& cfg,
+                            int nq, int dim, int K,
+                            const float* d_queries, vid_t* d_results)
 {
-    size_t smem = GPURabitqSearch<CLI_BLOCK_SIZE>::shared_mem_bytes(
+    size_t smem = GPURabitqSearch<NY, TopK, REG, Filter>::shared_mem_bytes(
         cfg, dim, gpu_graph.degree());
-    int num_blocks = nq;
+    int num_blocks = (nq + NY - 1) / NY;
+    dim3 block(WARP_SIZE, NY);
 
-    CUDA_CHECK(cudaFuncSetAttribute(kernel_rabitq_search,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         static_cast<int>(smem)));
+    CUDA_CHECK(cudaFuncSetAttribute(
+        (kernel_rabitq_search<NY, TopK, REG, Filter>),
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(smem)));
 
     constexpr int NRUNS = 5;
     auto start = std::chrono::high_resolution_clock::now();
     for (int r = 0; r < NRUNS; r++) {
-        kernel_rabitq_search<<<num_blocks, CLI_BLOCK_SIZE, smem>>>(
+        kernel_rabitq_search<NY, TopK, REG, Filter><<<num_blocks, block, smem>>>(
             gpu_graph.view(), gpu_rabitq.view(), cfg, nq, dim,
             d_queries, d_results, K);
         CUDA_CHECK(cudaGetLastError());
@@ -308,6 +312,39 @@ static void run_rabitq(const GPUGraph& gpu_graph, const GPURabitq& gpu_rabitq,
     double elapsed = std::chrono::duration<double>(end - start).count() / NRUNS;
     std::cout << "  time: " << elapsed * 1000.0 << " ms"
               << "  qps: " << nq / elapsed << std::endl;
+}
+
+// Auto-dispatch REG from graph degree (same logic as warp search).
+template <unsigned NY, typename Filter = HashFilter>
+static void run_rabitq(const GPUGraph& gpu_graph, const GPURabitq& gpu_rabitq,
+                       const GPURabitqSearchCfg& cfg,
+                       int nq, int dim, int K,
+                       const float* d_queries, vid_t* d_results)
+{
+    unsigned degree = gpu_graph.degree();
+    unsigned reg = 1;
+    while (32 * reg < degree) reg *= 2;
+    switch (reg) {
+        case 1:
+            run_rabitq_impl<NY, SharedBitonicTopK<32, 1>, 1, Filter>(
+                gpu_graph, gpu_rabitq, cfg, nq, dim, K, d_queries, d_results);
+            break;
+        case 2:
+            run_rabitq_impl<NY, SharedBitonicTopK<32, 2>, 2, Filter>(
+                gpu_graph, gpu_rabitq, cfg, nq, dim, K, d_queries, d_results);
+            break;
+        case 4:
+            run_rabitq_impl<NY, SharedBitonicTopK<32, 4>, 4, Filter>(
+                gpu_graph, gpu_rabitq, cfg, nq, dim, K, d_queries, d_results);
+            break;
+        case 8:
+            run_rabitq_impl<NY, SharedBitonicTopK<32, 8>, 8, Filter>(
+                gpu_graph, gpu_rabitq, cfg, nq, dim, K, d_queries, d_results);
+            break;
+        default:
+            fprintf(stderr, "degree %u too large (max 256)\n", degree);
+            exit(1);
+    }
 }
 
 // ── main ────────────────────────────────────────────────────────────────────
@@ -397,7 +434,7 @@ int main() {
         rq_cfg.max_iterations = js.value("max_iterations", 1024);
         rq_cfg.reset_interval = js.value("reset_interval", 16);
 
-        run_rabitq(gpu_graph, gpu_rq, rq_cfg, nq, dim, K, d_queries, d_results);
+        run_rabitq<1>(gpu_graph, gpu_rq, rq_cfg, nq, dim, K, d_queries, d_results);
     } else {
         GPUBaseSearchCfg cfg;
         cfg.topk_size      = js.value("topk_size", 256u);

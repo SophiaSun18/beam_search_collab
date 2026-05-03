@@ -201,7 +201,7 @@ __device__ void RabitqQuery<BX>::rotate_and_transform(
         rotated_query_[i] = src[i] * signs[i];
     for (int i = dim + tid; i < pdim; i += static_cast<int>(BX))
         rotated_query_[i] = 0.0f;
-    __syncthreads();
+    if constexpr (BX <= 32) __syncwarp(); else __syncthreads();
 
     // Fast Walsh-Hadamard Transform (in-place, power-of-2)
     for (int len = 1; len < pdim; len <<= 1) {
@@ -217,22 +217,18 @@ __device__ void RabitqQuery<BX>::rotate_and_transform(
             rotated_query_[i1] = u + v;
             rotated_query_[i2] = u - v;
         }
-        __syncthreads();
+        if constexpr (BX <= 32) __syncwarp(); else __syncthreads();
     }
 }
 
 template <unsigned BX>
 __device__ void RabitqQuery<BX>::find_range_and_quantize()
 {
-    constexpr unsigned WARPS = BX / 32;
     int tid     = threadIdx.x;
     int lane_id = tid & 31;
-    int warp_id = tid >> 5;
     int pdim    = padded_dim_;
 
-    // ── block-wide min/max ──────────────────────────────────────────
-    __shared__ float s_warp_min[WARPS];
-    __shared__ float s_warp_max[WARPS];
+    // ── min/max reduction ───────────────────────────────────────────
     float local_min =  FLT_MAX;
     float local_max = -FLT_MAX;
 
@@ -245,31 +241,37 @@ __device__ void RabitqQuery<BX>::find_range_and_quantize()
         local_min = fminf(local_min, __shfl_down_sync(0xffffffff, local_min, off));
         local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, off));
     }
-    if (lane_id == 0) {
-        s_warp_min[warp_id] = local_min;
-        s_warp_max[warp_id] = local_max;
-    }
-    __syncthreads();
 
-    if (warp_id == 0) {
-        local_min = (lane_id < static_cast<int>(WARPS)) ? s_warp_min[lane_id] :  FLT_MAX;
-        local_max = (lane_id < static_cast<int>(WARPS)) ? s_warp_max[lane_id] : -FLT_MAX;
-        for (int off = 16; off > 0; off >>= 1) {
-            local_min = fminf(local_min, __shfl_down_sync(0xffffffff, local_min, off));
-            local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, off));
-        }
+    if constexpr (BX > 32) {
+        constexpr unsigned WARPS = BX / 32;
+        int warp_id = tid >> 5;
+        __shared__ float s_warp_min[WARPS];
+        __shared__ float s_warp_max[WARPS];
         if (lane_id == 0) {
-            *low_val_ = local_min;
-            *width_   = (local_max - local_min) / ((1 << RABITQ_BQUERY) - 1);
+            s_warp_min[warp_id] = local_min;
+            s_warp_max[warp_id] = local_max;
+        }
+        __syncthreads();
+        if (warp_id == 0) {
+            local_min = (lane_id < static_cast<int>(WARPS)) ? s_warp_min[lane_id] :  FLT_MAX;
+            local_max = (lane_id < static_cast<int>(WARPS)) ? s_warp_max[lane_id] : -FLT_MAX;
+            for (int off = 16; off > 0; off >>= 1) {
+                local_min = fminf(local_min, __shfl_down_sync(0xffffffff, local_min, off));
+                local_max = fmaxf(local_max, __shfl_down_sync(0xffffffff, local_max, off));
+            }
         }
     }
-    __syncthreads();
+
+    if (lane_id == 0) {
+        *low_val_ = local_min;
+        *width_   = (local_max - local_min) / ((1 << RABITQ_BQUERY) - 1);
+    }
+    if constexpr (BX <= 32) __syncwarp(); else __syncthreads();
 
     // ── quantize ────────────────────────────────────────────────────
     float low = *low_val_;
     float inv_width = 1.0f / (*width_);
 
-    __shared__ int32_t s_warp_sum[WARPS];
     int32_t local_sum = 0;
     for (int i = tid; i < pdim; i += static_cast<int>(BX)) {
         uint8_t q = static_cast<uint8_t>(
@@ -279,18 +281,24 @@ __device__ void RabitqQuery<BX>::find_range_and_quantize()
     }
     for (int off = 16; off > 0; off >>= 1)
         local_sum += __shfl_down_sync(0xffffffff, local_sum, off);
-    if (lane_id == 0)
-        s_warp_sum[warp_id] = local_sum;
-    __syncthreads();
 
-    if (warp_id == 0) {
-        local_sum = (lane_id < static_cast<int>(WARPS)) ? s_warp_sum[lane_id] : 0;
-        for (int off = 16; off > 0; off >>= 1)
-            local_sum += __shfl_down_sync(0xffffffff, local_sum, off);
+    if constexpr (BX > 32) {
+        constexpr unsigned WARPS = BX / 32;
+        int warp_id = tid >> 5;
+        __shared__ int32_t s_warp_sum[WARPS];
         if (lane_id == 0)
-            *sum_q_ = local_sum;
+            s_warp_sum[warp_id] = local_sum;
+        __syncthreads();
+        if (warp_id == 0) {
+            local_sum = (lane_id < static_cast<int>(WARPS)) ? s_warp_sum[lane_id] : 0;
+            for (int off = 16; off > 0; off >>= 1)
+                local_sum += __shfl_down_sync(0xffffffff, local_sum, off);
+        }
     }
-    __syncthreads();
+
+    if (lane_id == 0)
+        *sum_q_ = local_sum;
+    if constexpr (BX <= 32) __syncwarp(); else __syncthreads();
 }
 
 template <unsigned BX>
@@ -367,7 +375,7 @@ __device__ RabitqQuery<BX>::RabitqQuery(
     rotate_and_transform(query_smem, signs, dim);
     find_range_and_quantize();
     build_lut();
-    __syncthreads();
+    if constexpr (BX <= 32) __syncwarp(); else __syncthreads();
 }
 
 // ── shared_mem_bytes ────────────────────────────────────────────────────

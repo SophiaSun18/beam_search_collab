@@ -110,3 +110,11 @@ target_compile_options(prof_topk_shared PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
 add_executable(prof_topk_reg unittest/prof_topk_reg.cu)
 target_include_directories(prof_topk_reg PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_compile_options(prof_topk_reg PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
+
+add_executable(test_rabitq_search_trace unittest/test_rabitq_search_trace.cu)
+target_include_directories(test_rabitq_search_trace PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_compile_options(test_rabitq_search_trace PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3 -lineinfo>)
+
+add_executable(test_rabitq_dedup_cpu unittest/test_rabitq_dedup_cpu.cpp)
+target_include_directories(test_rabitq_dedup_cpu PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_compile_options(test_rabitq_dedup_cpu PRIVATE -O3)

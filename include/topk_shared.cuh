@@ -326,8 +326,11 @@ __device__ unsigned SharedBitonicTopK<BX, REG>::pick(uint32_t (&out)[PICK_N], un
         if (unmarked && found + lane_prefix < n) {
             out[found + lane_prefix] = val;  // node ID (MSB clear)
             topk_idx[pos] = val | MSB;
-            if (found + lane_prefix == 0)
-                next_expand = pos;  // advance cursor
+        }
+        // broadcast winner's pos to all threads so next_expand stays uniform
+        if (found == 0) {
+            int winner = __ffs(ballot) - 1;
+            next_expand = __shfl_sync(0xffffffff, pos, winner);
         }
 
         found += count;

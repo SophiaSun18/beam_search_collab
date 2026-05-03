@@ -5,9 +5,6 @@
 #include "topk.cuh"
 #include "filter_hash.cuh"
 #include <cuda_runtime.h>
-#if defined(__CUDA_ARCH__) || defined(__CUDACC__)
-#include <cuda_pipeline_primitives.h>
-#endif
 #include <climits>
 
 #ifndef WARP_SIZE
@@ -29,37 +26,36 @@ struct GPURabitqSearchCfg {
 };
 
 /**
- *  @class GPURabitqSearch — self-contained RAbitQ beam search visitor.
+ *  @class GPURabitqSearch — warp-level RAbitQ beam search visitor.
  *
- *  Owns mutable search state (beam, hash filter, candidate buffer, staged
- *  code/factor buffers) in shared memory.  Immutable external data (graph
- *  view, rabitq view) are bound at construction; the RabitqQuery is
- *  created inside search() once the query is loaded.
+ *  One warp (32 threads) handles one query. Block shape is 2D:
+ *    threadIdx.x = lane within warp (0..31)
+ *    threadIdx.y = warp / query index (0..NY-1)
  *
- *  @tparam BX  Block size (number of threads).
+ *  @tparam NY     Number of warps (queries) per block.
+ *  @tparam TopK   TopK buffer type (SharedBitonicTopK<32,REG> or RegBitonicTopK).
+ *  @tparam REG    Registers per thread for merge batch.
+ *  @tparam Filter Visited-node filter type (HashFilter or BloomFilter).
  */
-template <unsigned BX>
+template <unsigned NY, typename TopK, unsigned REG, typename Filter = HashFilter>
 class GPURabitqSearch {
-    SharedBitonicTopK<BX, 1> topk_;
-    HashFilter               hf_;
-    float*                   query_buf_;     // dim floats
-    INDEX_T*                 parent_buf_;    // 1 element
-    INDEX_T*                 cand_idx_;      // max_degree_ elements
-    DISTANCE_T*              cand_dist_;     // max_degree_ elements
-    char*                    query_smem_;    // saved pointer for RabitqQuery
-    uint64_t*                staged_codes_;
-    float*                   staged_factors_;
+    static constexpr unsigned BX = WARP_SIZE;  // 32
 
-    GPUGraphView             graph_;
-    GPURabitqView            rabitq_;
-    GPURabitqSearchCfg       cfg_;
-    unsigned                 dim_;
-    unsigned                 max_degree_;
-    unsigned                 bitcode_words_;
+    TopK     topk_;
+    Filter   hf_;
+    float*   query_buf_;      // dim floats
+    INDEX_T* cand_idx_;       // max_degree_ elements
+    DISTANCE_T* cand_dist_;   // max_degree_ elements
+    char*    query_smem_;     // region for RabitqQuery
+    uint64_t* staged_codes_;
+    float*   staged_factors_;
 
-    template <typename T>
-    __device__ static void stage_begin(T* dst, const T* src, int count);
-    __device__ static void stage_wait();
+    GPUGraphView    graph_;
+    GPURabitqView   rabitq_;
+    GPURabitqSearchCfg cfg_;
+    unsigned        dim_;
+    unsigned        max_degree_;
+    unsigned        bitcode_words_;
 
 public:
     __device__ GPURabitqSearch(char*& smem, const GPURabitqSearchCfg& cfg,
@@ -67,36 +63,17 @@ public:
 
     __device__ void search(const float* query, vid_t* results, int K);
 
+    __host__ __device__ static size_t shared_mem_bytes_per_warp(
+        const GPURabitqSearchCfg& cfg, unsigned dim, unsigned degree);
+
     __host__ __device__ static size_t shared_mem_bytes(
         const GPURabitqSearchCfg& cfg, unsigned dim, unsigned degree);
 };
 
-// ── async staging helpers ────���─────────────────────────────────────────────
+// ── constructor ─────────────────────────────────────────────────────────────
 
-template <unsigned BX>
-template <typename T>
-__device__ void GPURabitqSearch<BX>::stage_begin(T* dst, const T* src, int count) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
-    for (int i = threadIdx.x; i < count; i += blockDim.x)
-        __pipeline_memcpy_async(dst + i, src + i, sizeof(T));
-    __pipeline_commit();
-#else
-    for (int i = threadIdx.x; i < count; i += blockDim.x)
-        dst[i] = src[i];
-#endif
-}
-
-template <unsigned BX>
-__device__ void GPURabitqSearch<BX>::stage_wait() {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
-    __pipeline_wait_prior(0);
-#endif
-}
-
-// ── constructor ───────────────���────────────────────────────��───────────────
-
-template <unsigned BX>
-__device__ GPURabitqSearch<BX>::GPURabitqSearch(
+template <unsigned NY, typename TopK, unsigned REG, typename Filter>
+__device__ GPURabitqSearch<NY, TopK, REG, Filter>::GPURabitqSearch(
     char*& smem, const GPURabitqSearchCfg& cfg,
     GPUGraphView graph, GPURabitqView rabitq)
     : topk_(smem, cfg.topk_size),
@@ -113,189 +90,174 @@ __device__ GPURabitqSearch<BX>::GPURabitqSearch(
         (reinterpret_cast<uintptr_t>(smem) + alignof(float) - 1)
             & ~(static_cast<uintptr_t>(alignof(float)) - 1));
 
-    query_buf_  = reinterpret_cast<float*>(smem);
-    smem += graph.dim() * sizeof(float);
+    // Plain-pointer buffers: manual per-warp offset
+    const size_t rest =
+          graph.dim() * sizeof(float)                                    // query_buf
+        + max_degree_ * sizeof(INDEX_T)                                  // cand_idx
+        + max_degree_ * sizeof(DISTANCE_T)                               // cand_dist
+        + RabitqQuery<BX>::shared_mem_bytes(graph.dim())                  // RabitqQuery
+        + (alignof(uint64_t) - 1)                                        // alignment
+        + static_cast<size_t>(max_degree_) * bitcode_words_ * sizeof(uint64_t) // staged_codes
+        + (alignof(float) - 1)                                           // alignment
+        + 3 * static_cast<size_t>(max_degree_) * sizeof(float);          // staged_factors
 
-    parent_buf_ = reinterpret_cast<INDEX_T*>(smem);
-    smem += sizeof(INDEX_T);
+    char* my = smem + threadIdx.y * rest;
 
-    cand_idx_   = reinterpret_cast<INDEX_T*>(smem);
-    smem += max_degree_ * sizeof(INDEX_T);
+    query_buf_  = reinterpret_cast<float*>(my);
+    my += graph.dim() * sizeof(float);
 
-    cand_dist_  = reinterpret_cast<DISTANCE_T*>(smem);
-    smem += max_degree_ * sizeof(DISTANCE_T);
+    cand_idx_   = reinterpret_cast<INDEX_T*>(my);
+    my += max_degree_ * sizeof(INDEX_T);
 
-    // reserve region for RabitqQuery (constructed later in search())
-    query_smem_ = smem;
-    smem += RabitqQuery<BX>::shared_mem_bytes(graph.dim());
+    cand_dist_  = reinterpret_cast<DISTANCE_T*>(my);
+    my += max_degree_ * sizeof(DISTANCE_T);
 
-    // align for uint64_t before staged codes
-    smem = reinterpret_cast<char*>(
-        (reinterpret_cast<uintptr_t>(smem) + alignof(uint64_t) - 1)
+    query_smem_ = my;
+    my += RabitqQuery<BX>::shared_mem_bytes(graph.dim());
+
+    // align for uint64_t
+    my = reinterpret_cast<char*>(
+        (reinterpret_cast<uintptr_t>(my) + alignof(uint64_t) - 1)
             & ~(static_cast<uintptr_t>(alignof(uint64_t)) - 1));
+    staged_codes_ = reinterpret_cast<uint64_t*>(my);
+    my += static_cast<size_t>(max_degree_) * bitcode_words_ * sizeof(uint64_t);
 
-    staged_codes_ = reinterpret_cast<uint64_t*>(smem);
-    smem += static_cast<size_t>(graph.degree()) * bitcode_words_ * sizeof(uint64_t);
-
-    // align for float before staged factors
-    smem = reinterpret_cast<char*>(
-        (reinterpret_cast<uintptr_t>(smem) + alignof(float) - 1)
+    // align for float
+    my = reinterpret_cast<char*>(
+        (reinterpret_cast<uintptr_t>(my) + alignof(float) - 1)
             & ~(static_cast<uintptr_t>(alignof(float)) - 1));
+    staged_factors_ = reinterpret_cast<float*>(my);
 
-    staged_factors_ = reinterpret_cast<float*>(smem);
-    smem += 3 * static_cast<size_t>(graph.degree()) * sizeof(float);
+    // Advance past ALL instances
+    smem += blockDim.y * rest;
 }
 
-// ── shared_mem_bytes ─────────���─────────────────────────────────────────────
+// ── shared memory size ──────────────────────────────────────────────────────
 
-template <unsigned BX>
-__host__ __device__ size_t GPURabitqSearch<BX>::shared_mem_bytes(
+template <unsigned NY, typename TopK, unsigned REG, typename Filter>
+__host__ __device__ size_t
+GPURabitqSearch<NY, TopK, REG, Filter>::shared_mem_bytes_per_warp(
     const GPURabitqSearchCfg& cfg, unsigned dim, unsigned degree)
 {
     int pdim = rabitq_padded_dim(dim);
     unsigned bitcode_words = pdim / 64;
 
     size_t size = 0;
-    size += SharedBitonicTopK<BX, 1>::shared_mem_bytes(cfg.topk_size);
-    size += HashFilter::shared_mem_bytes(cfg.filter_capacity);
+    size += TopK::shared_mem_bytes_per_instance(cfg.topk_size);
+    size += Filter::shared_mem_bytes(cfg.filter_capacity);
     size = (size + alignof(float) - 1) & ~(alignof(float) - 1);
-    size += dim * sizeof(float);                     // query_buf
-    size += sizeof(INDEX_T);                         // parent_buf
-    size += degree * sizeof(INDEX_T);                 // cand_idx
-    size += degree * sizeof(DISTANCE_T);              // cand_dist
-    size += RabitqQuery<BX>::shared_mem_bytes(dim);  // RabitqQuery region
+    size += dim * sizeof(float);                                        // query_buf
+    size += degree * sizeof(INDEX_T);                                   // cand_idx
+    size += degree * sizeof(DISTANCE_T);                                // cand_dist
+    size += RabitqQuery<BX>::shared_mem_bytes(dim);                      // RabitqQuery
     size = (size + alignof(uint64_t) - 1) & ~(alignof(uint64_t) - 1);
-    size += static_cast<size_t>(degree) * bitcode_words * sizeof(uint64_t);
+    size += static_cast<size_t>(degree) * bitcode_words * sizeof(uint64_t); // staged_codes
     size = (size + alignof(float) - 1) & ~(alignof(float) - 1);
-    size += 3 * static_cast<size_t>(degree) * sizeof(float);
+    size += 3 * static_cast<size_t>(degree) * sizeof(float);            // staged_factors
     return size;
 }
 
-// ── search ──���────────────────────────────���───────────────────────��─────────
+template <unsigned NY, typename TopK, unsigned REG, typename Filter>
+__host__ __device__ size_t
+GPURabitqSearch<NY, TopK, REG, Filter>::shared_mem_bytes(
+    const GPURabitqSearchCfg& cfg, unsigned dim, unsigned degree)
+{
+    return NY * shared_mem_bytes_per_warp(cfg, dim, degree);
+}
 
-template <unsigned BX>
-__device__ void GPURabitqSearch<BX>::search(
+// ── search ──────────────────────────────────────────────────────────────────
+
+template <unsigned NY, typename TopK, unsigned REG, typename Filter>
+__device__ void GPURabitqSearch<NY, TopK, REG, Filter>::search(
     const float* query, vid_t* results, int K)
 {
-    const unsigned tid     = threadIdx.x;
-    const unsigned warp_id = tid / WARP_SIZE;
-    const unsigned lane_id = tid % WARP_SIZE;
+    const unsigned lane = threadIdx.x;  // 0..31
     const int dim = static_cast<int>(dim_);
 
-    // ── load query into shared memory ────────��──────────────────────
-    for (unsigned i = tid; i < dim_; i += BX)
+    // load query into shared memory (per-warp, private)
+    for (unsigned i = lane; i < dim_; i += BX)
         query_buf_[i] = query[i];
-    __syncthreads();
+    __syncwarp();
 
-    // ── prepare RAbitQ query (rotate, quantize, build LUT) ──────────
+    // prepare RAbitQ query (rotate, quantize, build LUT)
     char* qp = query_smem_;
     RabitqQuery<BX> rq(qp, query_buf_, rabitq_.signs(), dim);
-    __syncthreads();
+    __syncwarp();
 
-    // ── init candidate buffer ───────────────────────────────────────
-    for (unsigned i = tid; i < max_degree_; i += BX) {
-        cand_idx_[i]  = MAX_INDEX;
-        cand_dist_[i] = FLT_MAX;
+    // compute exact dist of entry point, insert entry point into frontier
+    {
+        DISTANCE_T d = l2_warp(dim, query_buf_,
+                               graph_.vect(cfg_.entry_point).data());
+        float    fd[REG];
+        uint32_t fx[REG];
+        #pragma unroll
+        for (unsigned j = 0; j < REG; j++) {
+            unsigned pos = lane * REG + j;
+            fd[j] = (pos == 0) ? d : FLT_MAX;
+            fx[j] = (pos == 0) ? static_cast<uint32_t>(cfg_.entry_point) : MAX_INDEX;
+        }
+        topk_.merge(fd, fx);
     }
 
     hf_.init();
-    __syncthreads();
+    __syncwarp();
 
-    // ── seed entry point with L2 distance ────────────────��──────────
-    if (warp_id == 0) {
-        DISTANCE_T d = l2_warp(dim, query_buf_,
-                                         graph_.vect(cfg_.entry_point).data());
-        if (lane_id == 0) {
-            cand_idx_[0]  = cfg_.entry_point;
-            cand_dist_[0] = d;
-            hf_.insert(cfg_.entry_point);
-        }
-    }
-    __syncthreads();
-
-    // ── shared flags for loop control ─────────��─────────────────────
-    __shared__ uint32_t keep_expanding;
-
-    // ── main loop ───────────────────────────────────────────────────
+    // main loop
     for (int iter = 0; iter < cfg_.max_iterations; iter++) {
 
-        // forgettable hash table reset + re-populate from frontier
-        if ((iter + 1) % cfg_.reset_interval == 0) {
-            hf_.init();
-            __syncthreads();
-            for (unsigned i = tid; i < topk_.capacity(); i += BX) {
-                uint32_t node = topk_.id(i);
-                if (node != MAX_INDEX) hf_.insert(node);
-            }
-        }
-        __syncthreads();
-
-        // merge candidates into topk
+        // pick element from frontier
+        uint32_t pbuf[1];
+        pbuf[0] = MAX_INDEX;
+        unsigned found = topk_.template pick<1>(pbuf, 1);
+        uint32_t picked = MAX_INDEX;
         {
-            float d[1] = {(tid < max_degree_) ? cand_dist_[tid] : FLT_MAX};
-            uint32_t x[1] = {(tid < max_degree_) ? cand_idx_[tid]  : MAX_INDEX};
-            topk_.merge(d, x);
-        }
-
-        // pick next node to expand
-        {
-            uint32_t pbuf[BX];
-            #pragma unroll
-            for (unsigned i = 0; i < BX; ++i) pbuf[i] = MAX_INDEX;
-            unsigned found = topk_.pick(pbuf, 1);
-            uint32_t picked = MAX_INDEX;
-            if (warp_id == 0) {
-                const bool has_pick = found > 0 && pbuf[0] != MAX_INDEX;
-                const uint32_t ballot = __ballot_sync(0xffffffff, has_pick);
-                if (ballot != 0) {
-                    const int src_lane = __ffs(ballot) - 1;
-                    picked = __shfl_sync(0xffffffff, pbuf[0], src_lane);
-                }
-            }
-            if (warp_id == 0 && lane_id == 0) {
-                keep_expanding = found;
-                if (found > 0) parent_buf_[0] = picked;
+            const bool has_pick = found > 0 && pbuf[0] != MAX_INDEX;
+            const uint32_t ballot = __ballot_sync(0xffffffff, has_pick);
+            if (ballot != 0) {
+                const int src_lane = __ffs(ballot) - 1;
+                picked = __shfl_sync(0xffffffff, pbuf[0], src_lane);
             }
         }
-        __syncthreads();
-        if (!keep_expanding) break;
 
-        vid_t current_node = parent_buf_[0];
-        hf_.insert(current_node);
-        __syncthreads();
+        if (found == 0) break;
 
-        // ── stage codes and factors (async, overlaps with L2) ───────
-        stage_begin(staged_codes_,
-                    rabitq_.codes(current_node),
-                    static_cast<int>(max_degree_ * bitcode_words_));
-        stage_begin(staged_factors_,
-                    rabitq_.factors(current_node),
-                    static_cast<int>(3 * max_degree_));
+        vid_t current_node = picked;
 
-        // L2 distance to expanding node (all warps collaborate)
-        DISTANCE_T exact_dist = l2_warp(
-            dim, query_buf_, graph_.vect(current_node).data());
+        // try insert into hf_, if duplicate, skip to next iteration
+        uint32_t inserted = (lane == 0) ? hf_.insert(current_node) : 0;
+        inserted = __shfl_sync(0xffffffff, inserted, 0);
+        if (inserted == 0) continue;
 
-        // fill candidate buffer with neighbors, filtered by hash
+        // compute estimated distance between picked node and each neighbor
+        // load codes and factors into shared memory
+        const uint64_t* src_codes = rabitq_.codes(current_node);
+        int code_count = static_cast<int>(max_degree_ * bitcode_words_);
+        for (int i = static_cast<int>(lane); i < code_count; i += static_cast<int>(BX))
+            staged_codes_[i] = src_codes[i];
+
+        const float* src_factors = rabitq_.factors(current_node);
+        int factor_count = static_cast<int>(3 * max_degree_);
+        for (int i = static_cast<int>(lane); i < factor_count; i += static_cast<int>(BX))
+            staged_factors_[i] = src_factors[i];
+
+        // load neighbor IDs, filter by hash (skip already-expanded nodes)
         Span<const vid_t> nbrs = graph_.nbrs(current_node);
-        for (unsigned i = tid; i < max_degree_; i += BX) {
+        for (unsigned i = lane; i < max_degree_; i += BX) {
             INDEX_T child = nbrs[i];
             if (child != MAX_INDEX && hf_.contains(child))
                 child = MAX_INDEX;
-            cand_idx_[i]  = child;
-            cand_dist_[i] = FLT_MAX;
+            cand_idx_[i] = child;
         }
-        __syncthreads();
+        __syncwarp();
 
-        // wait for staged data
-        stage_wait();
-        __syncthreads();
+        // L2 distance from query to expanding node
+        DISTANCE_T exact_dist = l2_warp(
+            dim, query_buf_, graph_.vect(current_node).data());
 
-        // ── fastscan distance estimation ──────────���─────────────────
+        // fastscan distance estimation
         int pdim = rabitq_.padded_dim();
         int num_batches = (max_degree_ + WARP_SIZE - 1) / WARP_SIZE;
-        for (int batch = warp_id; batch < num_batches;
-             batch += static_cast<int>(BX / WARP_SIZE)) {
+        for (int batch = 0; batch < num_batches; batch++) {
             int batch_begin = batch * WARP_SIZE;
             int active = min(static_cast<int>(WARP_SIZE),
                              static_cast<int>(max_degree_) - batch_begin);
@@ -310,23 +272,27 @@ __device__ void GPURabitqSearch<BX>::search(
                 exact_dist, cand_dist_ + batch_begin, active);
 
             // invalidate visited candidates
-            if (lane_id < static_cast<unsigned>(active)) {
-                if (cand_idx_[batch_begin + lane_id] == MAX_INDEX)
-                    cand_dist_[batch_begin + lane_id] = FLT_MAX;
+            if (lane < static_cast<unsigned>(active)) {
+                if (cand_idx_[batch_begin + lane] == MAX_INDEX)
+                    cand_dist_[batch_begin + lane] = FLT_MAX;
             }
         }
-        __syncthreads();
+        __syncwarp();
+
+        // merge computed distance and neighbors into frontier
+        {
+            float    d[REG];
+            uint32_t x[REG];
+            #pragma unroll
+            for (unsigned j = 0; j < REG; j++) {
+                unsigned pos = lane * REG + j;
+                d[j] = (pos < max_degree_) ? cand_dist_[pos] : FLT_MAX;
+                x[j] = (pos < max_degree_) ? cand_idx_[pos]  : MAX_INDEX;
+            }
+            topk_.merge(d, x);
+        }
     }
 
-    // ── final merge ─────────────────────────────────────────────────
-    {
-        float    d[1];
-        uint32_t x[1];
-        d[0] = (tid < max_degree_) ? cand_dist_[tid] : FLT_MAX;
-        x[0] = (tid < max_degree_) ? cand_idx_[tid]  : MAX_INDEX;
-        topk_.merge(d, x);
-    }
-
-    // ── write results ───────────────────────────────────────────────
-    topk_.flush(reinterpret_cast<float*>(cand_dist_), results, K);
+    // copy results into output field
+    topk_.flush(cand_dist_, results, K);
 }
