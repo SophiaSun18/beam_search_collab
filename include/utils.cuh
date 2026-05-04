@@ -486,25 +486,16 @@ template <unsigned N_1, unsigned N_2>
 __device__ void topk_by_candidate_sort_and_merge(
     INDEX_T* result_indices_ptr,
     DISTANCE_T* result_distances_ptr,
+    INDEX_T* merged_topk_index_shared,
+    DISTANCE_T* merged_topk_dist_shared,
     uint32_t RESULT_BUFFER_SIZE,
     uint32_t CANDIDATE_BUFFER_SIZE,
     uint32_t internal_topk,
     bool first) {
-  __shared__ DISTANCE_T candidate_snapshot_dist_shared[64];
-  __shared__ INDEX_T candidate_snapshot_index_shared[64];
-  __shared__ DISTANCE_T merged_topk_dist_shared[N_2 * WARP_SIZE];
-  __shared__ INDEX_T merged_topk_index_shared[N_2 * WARP_SIZE];
-
   auto candidate_indices = result_indices_ptr + internal_topk;
   auto candidate_distances = result_distances_ptr + internal_topk;
 
   candidate_by_bitonic_sort<N_1, 0>(candidate_indices, candidate_distances, CANDIDATE_BUFFER_SIZE);
-  __syncthreads();
-
-  for (unsigned i = threadIdx.x; i < CANDIDATE_BUFFER_SIZE; i += blockDim.x) {
-    candidate_snapshot_dist_shared[i] = candidate_distances[i];
-    candidate_snapshot_index_shared[i] = candidate_indices[i];
-  }
   __syncthreads();
 
   constexpr int kItemsPerThread = 4;
@@ -520,11 +511,11 @@ __device__ void topk_by_candidate_sort_and_merge(
 
     const int top_begin = merge_path_partition(
         result_distances_ptr, static_cast<int>(internal_topk),
-        candidate_snapshot_dist_shared, static_cast<int>(CANDIDATE_BUFFER_SIZE),
+        candidate_distances, static_cast<int>(CANDIDATE_BUFFER_SIZE),
         out_begin);
     const int top_end = merge_path_partition(
         result_distances_ptr, static_cast<int>(internal_topk),
-        candidate_snapshot_dist_shared, static_cast<int>(CANDIDATE_BUFFER_SIZE),
+        candidate_distances, static_cast<int>(CANDIDATE_BUFFER_SIZE),
         out_end);
 
     int top_i = top_begin;
@@ -535,15 +526,15 @@ __device__ void topk_by_candidate_sort_and_merge(
       const bool take_topk =
           (cand_i >= cand_end) ||
           (top_i < top_end &&
-           result_distances_ptr[top_i] <= candidate_snapshot_dist_shared[cand_i]);
+           result_distances_ptr[top_i] <= candidate_distances[cand_i]);
 
       if (take_topk) {
         merged_topk_dist_shared[out_i] = result_distances_ptr[top_i];
         merged_topk_index_shared[out_i] = result_indices_ptr[top_i];
         ++top_i;
       } else {
-        merged_topk_dist_shared[out_i] = candidate_snapshot_dist_shared[cand_i];
-        merged_topk_index_shared[out_i] = candidate_snapshot_index_shared[cand_i];
+        merged_topk_dist_shared[out_i] = candidate_distances[cand_i];
+        merged_topk_index_shared[out_i] = candidate_indices[cand_i];
         ++cand_i;
       }
     }
@@ -668,6 +659,8 @@ template <unsigned N_1, unsigned N_2>
 __device__ void topk_by_sort_candidates_and_merge(
     INDEX_T* result_indices_ptr,
     DISTANCE_T* result_distances_ptr,
+    INDEX_T* merged_topk_index_shared,
+    DISTANCE_T* merged_topk_dist_shared,
     uint32_t RESULT_BUFFER_SIZE,
     uint32_t CANDIDATE_BUFFER_SIZE,
     uint32_t internal_topk,
@@ -678,11 +671,262 @@ __device__ void topk_by_sort_candidates_and_merge(
         CANDIDATE_BUFFER_SIZE, internal_topk, first);
   } else {
     topk_by_candidate_sort_and_merge<N_1, N_2>(
-        result_indices_ptr, result_distances_ptr, RESULT_BUFFER_SIZE,
+        result_indices_ptr, result_distances_ptr,
+        merged_topk_index_shared, merged_topk_dist_shared, RESULT_BUFFER_SIZE,
         CANDIDATE_BUFFER_SIZE, internal_topk, first);
     // tok_by_tail_compare_radix_sort<N_1, N_2>(
     //     result_indices_ptr, result_distances_ptr, RESULT_BUFFER_SIZE,
     //     CANDIDATE_BUFFER_SIZE, internal_topk);
+  }
+}
+
+template <unsigned N_1, unsigned N_2>
+__device__ void topk_by_sort_candidates_and_merge(
+    INDEX_T* result_indices_ptr,
+    DISTANCE_T* result_distances_ptr,
+    uint32_t RESULT_BUFFER_SIZE,
+    uint32_t CANDIDATE_BUFFER_SIZE,
+    uint32_t internal_topk,
+    bool first) {
+  if constexpr (N_2 == 2 || N_2 == 4) {
+    topk_by_sort_candidates_and_merge<N_1, N_2>(
+        result_indices_ptr, result_distances_ptr, nullptr, nullptr,
+        RESULT_BUFFER_SIZE, CANDIDATE_BUFFER_SIZE, internal_topk, first);
+  } else {
+    __shared__ DISTANCE_T merged_topk_dist_shared[N_2 * WARP_SIZE];
+    __shared__ INDEX_T merged_topk_index_shared[N_2 * WARP_SIZE];
+    topk_by_sort_candidates_and_merge<N_1, N_2>(
+        result_indices_ptr, result_distances_ptr,
+        merged_topk_index_shared, merged_topk_dist_shared,
+        RESULT_BUFFER_SIZE, CANDIDATE_BUFFER_SIZE, internal_topk, first);
+  }
+}
+
+template <unsigned N_1, unsigned N_2>
+__device__ __noinline__ void topk_by_sort_candidates_and_merge_case(
+    INDEX_T* result_indices_ptr,
+    DISTANCE_T* result_distances_ptr,
+    INDEX_T* merged_topk_index_shared,
+    DISTANCE_T* merged_topk_dist_shared,
+    uint32_t result_buffer_size,
+    uint32_t candidate_buffer_size,
+    uint32_t internal_topk,
+    bool first) {
+  topk_by_sort_candidates_and_merge<N_1, N_2>(
+      result_indices_ptr, result_distances_ptr,
+      merged_topk_index_shared, merged_topk_dist_shared, result_buffer_size,
+      candidate_buffer_size, internal_topk, first);
+}
+
+template <unsigned N_1>
+__device__ void dispatch_topk_by_sort_candidates_and_merge(
+    INDEX_T* result_indices_ptr,
+    DISTANCE_T* result_distances_ptr,
+    INDEX_T* merged_topk_index_shared,
+    DISTANCE_T* merged_topk_dist_shared,
+    uint32_t result_buffer_size,
+    uint32_t candidate_buffer_size,
+    uint32_t internal_topk,
+    bool first) {
+  switch (internal_topk / WARP_SIZE) {
+    case 1:
+      topk_by_sort_candidates_and_merge_case<N_1, 1>(
+          result_indices_ptr, result_distances_ptr,
+          merged_topk_index_shared, merged_topk_dist_shared, result_buffer_size,
+          candidate_buffer_size, internal_topk, first);
+      break;
+    case 2:
+      topk_by_sort_candidates_and_merge_case<N_1, 2>(
+          result_indices_ptr, result_distances_ptr,
+          merged_topk_index_shared, merged_topk_dist_shared, result_buffer_size,
+          candidate_buffer_size, internal_topk, first);
+      break;
+    case 3:
+      topk_by_sort_candidates_and_merge_case<N_1, 3>(
+          result_indices_ptr, result_distances_ptr,
+          merged_topk_index_shared, merged_topk_dist_shared, result_buffer_size,
+          candidate_buffer_size, internal_topk, first);
+      break;
+    case 4:
+      topk_by_sort_candidates_and_merge_case<N_1, 4>(
+          result_indices_ptr, result_distances_ptr,
+          merged_topk_index_shared, merged_topk_dist_shared, result_buffer_size,
+          candidate_buffer_size, internal_topk, first);
+      break;
+    case 5:
+      topk_by_sort_candidates_and_merge_case<N_1, 5>(
+          result_indices_ptr, result_distances_ptr,
+          merged_topk_index_shared, merged_topk_dist_shared, result_buffer_size,
+          candidate_buffer_size, internal_topk, first);
+      break;
+    case 6:
+      topk_by_sort_candidates_and_merge_case<N_1, 6>(
+          result_indices_ptr, result_distances_ptr,
+          merged_topk_index_shared, merged_topk_dist_shared, result_buffer_size,
+          candidate_buffer_size, internal_topk, first);
+      break;
+    case 7:
+      topk_by_sort_candidates_and_merge_case<N_1, 7>(
+          result_indices_ptr, result_distances_ptr,
+          merged_topk_index_shared, merged_topk_dist_shared, result_buffer_size,
+          candidate_buffer_size, internal_topk, first);
+      break;
+    case 8:
+      topk_by_sort_candidates_and_merge_case<N_1, 8>(
+          result_indices_ptr, result_distances_ptr,
+          merged_topk_index_shared, merged_topk_dist_shared, result_buffer_size,
+          candidate_buffer_size, internal_topk, first);
+      break;
+    case 9:
+      topk_by_sort_candidates_and_merge_case<N_1, 9>(
+          result_indices_ptr, result_distances_ptr,
+          merged_topk_index_shared, merged_topk_dist_shared, result_buffer_size,
+          candidate_buffer_size, internal_topk, first);
+      break;
+    case 10:
+      topk_by_sort_candidates_and_merge_case<N_1, 10>(
+          result_indices_ptr, result_distances_ptr,
+          merged_topk_index_shared, merged_topk_dist_shared, result_buffer_size,
+          candidate_buffer_size, internal_topk, first);
+      break;
+    case 11:
+      topk_by_sort_candidates_and_merge_case<N_1, 11>(
+          result_indices_ptr, result_distances_ptr,
+          merged_topk_index_shared, merged_topk_dist_shared, result_buffer_size,
+          candidate_buffer_size, internal_topk, first);
+      break;
+    case 12:
+      topk_by_sort_candidates_and_merge_case<N_1, 12>(
+          result_indices_ptr, result_distances_ptr,
+          merged_topk_index_shared, merged_topk_dist_shared, result_buffer_size,
+          candidate_buffer_size, internal_topk, first);
+      break;
+    case 13:
+      topk_by_sort_candidates_and_merge_case<N_1, 13>(
+          result_indices_ptr, result_distances_ptr,
+          merged_topk_index_shared, merged_topk_dist_shared, result_buffer_size,
+          candidate_buffer_size, internal_topk, first);
+      break;
+    case 14:
+      topk_by_sort_candidates_and_merge_case<N_1, 14>(
+          result_indices_ptr, result_distances_ptr,
+          merged_topk_index_shared, merged_topk_dist_shared, result_buffer_size,
+          candidate_buffer_size, internal_topk, first);
+      break;
+    case 15:
+      topk_by_sort_candidates_and_merge_case<N_1, 15>(
+          result_indices_ptr, result_distances_ptr,
+          merged_topk_index_shared, merged_topk_dist_shared, result_buffer_size,
+          candidate_buffer_size, internal_topk, first);
+      break;
+    case 16:
+      topk_by_sort_candidates_and_merge_case<N_1, 16>(
+          result_indices_ptr, result_distances_ptr,
+          merged_topk_index_shared, merged_topk_dist_shared, result_buffer_size,
+          candidate_buffer_size, internal_topk, first);
+      break;
+    case 17:
+      topk_by_sort_candidates_and_merge_case<N_1, 17>(
+          result_indices_ptr, result_distances_ptr,
+          merged_topk_index_shared, merged_topk_dist_shared, result_buffer_size,
+          candidate_buffer_size, internal_topk, first);
+      break;
+    case 18:
+      topk_by_sort_candidates_and_merge_case<N_1, 18>(
+          result_indices_ptr, result_distances_ptr,
+          merged_topk_index_shared, merged_topk_dist_shared, result_buffer_size,
+          candidate_buffer_size, internal_topk, first);
+      break;
+    case 19:
+      topk_by_sort_candidates_and_merge_case<N_1, 19>(
+          result_indices_ptr, result_distances_ptr,
+          merged_topk_index_shared, merged_topk_dist_shared, result_buffer_size,
+          candidate_buffer_size, internal_topk, first);
+      break;
+    case 20:
+      topk_by_sort_candidates_and_merge_case<N_1, 20>(
+          result_indices_ptr, result_distances_ptr,
+          merged_topk_index_shared, merged_topk_dist_shared, result_buffer_size,
+          candidate_buffer_size, internal_topk, first);
+      break;
+    case 21:
+      topk_by_sort_candidates_and_merge_case<N_1, 21>(
+          result_indices_ptr, result_distances_ptr,
+          merged_topk_index_shared, merged_topk_dist_shared, result_buffer_size,
+          candidate_buffer_size, internal_topk, first);
+      break;
+    case 22:
+      topk_by_sort_candidates_and_merge_case<N_1, 22>(
+          result_indices_ptr, result_distances_ptr,
+          merged_topk_index_shared, merged_topk_dist_shared, result_buffer_size,
+          candidate_buffer_size, internal_topk, first);
+      break;
+    case 23:
+      topk_by_sort_candidates_and_merge_case<N_1, 23>(
+          result_indices_ptr, result_distances_ptr,
+          merged_topk_index_shared, merged_topk_dist_shared, result_buffer_size,
+          candidate_buffer_size, internal_topk, first);
+      break;
+    case 24:
+      topk_by_sort_candidates_and_merge_case<N_1, 24>(
+          result_indices_ptr, result_distances_ptr,
+          merged_topk_index_shared, merged_topk_dist_shared, result_buffer_size,
+          candidate_buffer_size, internal_topk, first);
+      break;
+    case 25:
+      topk_by_sort_candidates_and_merge_case<N_1, 25>(
+          result_indices_ptr, result_distances_ptr,
+          merged_topk_index_shared, merged_topk_dist_shared, result_buffer_size,
+          candidate_buffer_size, internal_topk, first);
+      break;
+    case 26:
+      topk_by_sort_candidates_and_merge_case<N_1, 26>(
+          result_indices_ptr, result_distances_ptr,
+          merged_topk_index_shared, merged_topk_dist_shared, result_buffer_size,
+          candidate_buffer_size, internal_topk, first);
+      break;
+    case 27:
+      topk_by_sort_candidates_and_merge_case<N_1, 27>(
+          result_indices_ptr, result_distances_ptr,
+          merged_topk_index_shared, merged_topk_dist_shared, result_buffer_size,
+          candidate_buffer_size, internal_topk, first);
+      break;
+    case 28:
+      topk_by_sort_candidates_and_merge_case<N_1, 28>(
+          result_indices_ptr, result_distances_ptr,
+          merged_topk_index_shared, merged_topk_dist_shared, result_buffer_size,
+          candidate_buffer_size, internal_topk, first);
+      break;
+    case 29:
+      topk_by_sort_candidates_and_merge_case<N_1, 29>(
+          result_indices_ptr, result_distances_ptr,
+          merged_topk_index_shared, merged_topk_dist_shared, result_buffer_size,
+          candidate_buffer_size, internal_topk, first);
+      break;
+    case 30:
+      topk_by_sort_candidates_and_merge_case<N_1, 30>(
+          result_indices_ptr, result_distances_ptr,
+          merged_topk_index_shared, merged_topk_dist_shared, result_buffer_size,
+          candidate_buffer_size, internal_topk, first);
+      break;
+    case 31:
+      topk_by_sort_candidates_and_merge_case<N_1, 31>(
+          result_indices_ptr, result_distances_ptr,
+          merged_topk_index_shared, merged_topk_dist_shared, result_buffer_size,
+          candidate_buffer_size, internal_topk, first);
+      break;
+    case 32:
+      topk_by_sort_candidates_and_merge_case<N_1, 32>(
+          result_indices_ptr, result_distances_ptr,
+          merged_topk_index_shared, merged_topk_dist_shared, result_buffer_size,
+          candidate_buffer_size, internal_topk, first);
+      break;
+    default:
+      topk_by_sort_candidates_and_merge_case<N_1, 4>(
+          result_indices_ptr, result_distances_ptr,
+          merged_topk_index_shared, merged_topk_dist_shared, result_buffer_size,
+          candidate_buffer_size, internal_topk, first);
+      break;
   }
 }
 

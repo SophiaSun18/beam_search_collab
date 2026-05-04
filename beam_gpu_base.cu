@@ -47,6 +47,7 @@ void IndexGraph<T>::search(int nq, const T* queries, int K, T *result_vec, vid_t
   auto npoints = this->ntotal;
   auto max_degree = this->maxDeg;
   auto beam_size = beam_sz;
+  auto bitlen = GPU_HASH_BITLEN_FOR_TOPK(beam_size);
   printf("Beam search on GPU: K=%d, nq=%d, dim=%d, npoints=%ld, beam_size=%d, internal_topk=%d\n", K, nq, dim, npoints, beam_size, INTERNAL_TOPK);
 
   size_t num_threads = BLOCK_SIZE;
@@ -86,15 +87,16 @@ void IndexGraph<T>::search(int nq, const T* queries, int K, T *result_vec, vid_t
 
   GraphGPU<vid_t> gg(npoints, max_degree, this->edges.data()); // GPU graph 
 
-  vid_t *starting_points = new vid_t[beam_size];
+  const int starting_point_count = std::max(beam_size, CANDIDATE_BUFFER_SIZE);
+  vid_t *starting_points = new vid_t[starting_point_count];
   vid_t *d_starting_points;
   const vid_t entry_point = compute_gpu_base_entry_point(h_data, npoints, dim);
   printf("GPU base entry point: %u\n", entry_point);
-  for (int i = 0; i < beam_size; i++) {
+  for (int i = 0; i < starting_point_count; i++) {
     starting_points[i] = (i == 0) ? entry_point : MAX_INDEX;
   }
-  CUDA_SAFE_CALL(cudaMalloc((void **)&d_starting_points, beam_size * sizeof(vid_t)));
-  CUDA_SAFE_CALL(cudaMemcpy(d_starting_points, starting_points, beam_size * sizeof(vid_t), cudaMemcpyHostToDevice));
+  CUDA_SAFE_CALL(cudaMalloc((void **)&d_starting_points, starting_point_count * sizeof(vid_t)));
+  CUDA_SAFE_CALL(cudaMemcpy(d_starting_points, starting_points, starting_point_count * sizeof(vid_t), cudaMemcpyHostToDevice));
 
 #ifdef USE_RADIX
   //vid_t *d_filters = nullptr;
@@ -103,7 +105,7 @@ void IndexGraph<T>::search(int nq, const T* queries, int K, T *result_vec, vid_t
   BeamSearch<T><<<num_blocks, num_threads>>>(K, nq, dim, npoints, d_queries, d_data,
                                              d_results, d_total_stats, d_total_timing, d_starting_points, d_total_hops, gg);
 #else
-  uint32_t shm_size = calculate_shared_mem_size(dim, INTERNAL_TOPK, max_degree, SEARCH_WIDTH, BITLEN);
+  uint32_t shm_size = calculate_shared_mem_size(dim, beam_size, max_degree, SEARCH_WIDTH, bitlen);
   vid_t *d_seed_map = nullptr;
   if (USE_SEED) {
     size_t ghost_scale_factor = 100;
@@ -132,7 +134,7 @@ void IndexGraph<T>::search(int nq, const T* queries, int K, T *result_vec, vid_t
   // Execute the search
   printf("\nStarting GPU beam search...\n");
   auto start = std::chrono::high_resolution_clock::now();
-  BeamSearch<T><<<num_blocks, num_threads, shm_size>>>(K, nq, dim, npoints, d_queries, d_data, d_results, 
+  BeamSearch<T><<<num_blocks, num_threads, shm_size>>>(K, nq, dim, beam_size, bitlen, npoints, d_queries, d_data, d_results, 
                                                          d_total_stats, d_total_timing, d_starting_points, d_seed_map, d_sign_bit, gg, debug_mode);
   CUDA_SAFE_CALL(cudaGetLastError());
   cudaDeviceSynchronize();
@@ -150,6 +152,8 @@ void IndexGraph<T>::search(int nq, const T* queries, int K, T *result_vec, vid_t
   CUDA_SAFE_CALL(cudaFree(d_queries));
   CUDA_SAFE_CALL(cudaFree(d_data));
   CUDA_SAFE_CALL(cudaFree(d_results));
+  CUDA_SAFE_CALL(cudaFree(d_starting_points));
+  delete[] starting_points;
   if (GPU_SEARCH_STATS) {
     CUDA_SAFE_CALL(cudaFree(d_total_stats));
   }

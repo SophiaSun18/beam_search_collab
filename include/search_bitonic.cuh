@@ -6,7 +6,7 @@
 #define INTERNAL_TOPK   128
 #endif
 #define SEARCH_WIDTH    1     // MAX: 2 nodes * 32 degree = 64 neighbors = CANDIDATE_BUFFER_SIZE
-#define BITLEN          GPU_HASH_BITLEN_FOR_TOPK(INTERNAL_TOPK)
+// #define BITLEN          GPU_HASH_BITLEN_FOR_TOPK(INTERNAL_TOPK)
 #define MAX_ITERATIONS  (1 << 15)
 #define TEAM_SIZE       8
 #define USE_SEED        0
@@ -14,20 +14,23 @@
 #define THRESHOLD_CONFIG    0
 #define HASH_TABLE_CONFIG   1
 #define CANDIDATE_BUFFER_SIZE 64
-#define RESULT_BUFFER_SIZE (INTERNAL_TOPK + CANDIDATE_BUFFER_SIZE)
+// #define RESULT_BUFFER_SIZE (INTERNAL_TOPK + CANDIDATE_BUFFER_SIZE)
 
-static __host__ inline uint32_t calculate_shared_mem_size(int dim, int topk, int max_deg, 
+static __host__ inline uint32_t calculate_shared_mem_size(int dim, int beam_sz, int max_deg,
                                                            int search_width, int bitlen) {
+    const size_t result_buffer_size = static_cast<size_t>(beam_sz) + CANDIDATE_BUFFER_SIZE;
     size_t size = 0;    
-    size += hashtable_getsize(BITLEN) * sizeof(INDEX_T);    // hash table
-    size += RESULT_BUFFER_SIZE * sizeof(INDEX_T);           // top k and candidate index
-    size += RESULT_BUFFER_SIZE * sizeof(DISTANCE_T);        // top k and candidate distance
-    size += SEARCH_WIDTH * sizeof(INDEX_T);                 // next expanders / parent buffer
+    size += hashtable_getsize(bitlen) * sizeof(INDEX_T);    // hash table
+    size += result_buffer_size * sizeof(INDEX_T);           // top k and candidate index
+    size += result_buffer_size * sizeof(DISTANCE_T);        // top k and candidate distance
+    size += search_width * sizeof(INDEX_T);                 // next expanders / parent buffer
     size += dim * 4;                                        // query buffer size
     size += 2 * 4;                                          // terminate flag and counter
     if (GPU_SEARCH_STATS) {
         size += GPU_SEARCH_STAT_COUNT * sizeof(uint32_t);   // search stats
     }
+    size += beam_sz * sizeof(INDEX_T);                      // merged topk scratch index
+    size += beam_sz * sizeof(DISTANCE_T);                   // merged topk scratch distance
     size += GPU_TIMING_COUNT * sizeof(gpu_long_t);          // timing stats
     printf("shared memory size: %ld\n", size);
     return size;
@@ -45,7 +48,7 @@ static inline std::vector<uint32_t> load_sign_bit(const char* filename) {
 template <typename T>
 static __global__ GPU_LAUNCH_BOUNDS(BLOCK_SIZE)
 void BeamSearch(
-    int K, int nq, int dim, size_t npoints,
+    int K, int nq, int dim, int beam_sz, int bitlen, size_t npoints,
     const T* __restrict__ d_queries,
     const T* __restrict__ d_data,
     vid_t* __restrict__ d_results,
@@ -72,19 +75,22 @@ void BeamSearch(
     extern __shared__ char shared_memory[];
     INDEX_T* ALL_INDEX = (INDEX_T*)shared_memory;
     INDEX_T* TOP_K_INDEX      = ALL_INDEX;
-    INDEX_T* CANDIDATE_INDEX  = ALL_INDEX + INTERNAL_TOPK;
+    INDEX_T* CANDIDATE_INDEX  = ALL_INDEX + beam_sz;
 
-    DISTANCE_T* ALL_DISTANCE = (DISTANCE_T*)(ALL_INDEX + RESULT_BUFFER_SIZE);
+    const uint32_t result_buffer_size = static_cast<uint32_t>(beam_sz + CANDIDATE_BUFFER_SIZE);
+    DISTANCE_T* ALL_DISTANCE = (DISTANCE_T*)(ALL_INDEX + result_buffer_size);
     DISTANCE_T* TOP_K_DISTANCE      = ALL_DISTANCE;
-    DISTANCE_T* CANDIDATE_DISTANCE  = ALL_DISTANCE + INTERNAL_TOPK;
+    DISTANCE_T* CANDIDATE_DISTANCE  = ALL_DISTANCE + beam_sz;
 
-    INDEX_T* HASH_TABLE = (INDEX_T*)(ALL_DISTANCE + RESULT_BUFFER_SIZE);
-    INDEX_T* PARENT_LIST = (INDEX_T*)(HASH_TABLE + hashtable_getsize(BITLEN));
+    INDEX_T* HASH_TABLE = (INDEX_T*)(ALL_DISTANCE + result_buffer_size);
+    INDEX_T* PARENT_LIST = (INDEX_T*)(HASH_TABLE + hashtable_getsize(bitlen));
     DATA_T* QUERY_BUFFER = (DATA_T*)(PARENT_LIST + SEARCH_WIDTH);
     uint32_t* counter = (uint32_t*)(QUERY_BUFFER + dim);
     uint32_t* hops = (uint32_t*)(counter + 1);
     uint32_t* stats = hops + 1;
-    gpu_long_t* timing = reinterpret_cast<gpu_long_t*>(stats + (GPU_SEARCH_STATS ? GPU_SEARCH_STAT_COUNT : 0));
+    INDEX_T* MERGED_TOPK_INDEX = reinterpret_cast<INDEX_T*>(stats + (GPU_SEARCH_STATS ? GPU_SEARCH_STAT_COUNT : 0));
+    DISTANCE_T* MERGED_TOPK_DISTANCE = reinterpret_cast<DISTANCE_T*>(MERGED_TOPK_INDEX + beam_sz);
+    gpu_long_t* timing = reinterpret_cast<gpu_long_t*>(MERGED_TOPK_DISTANCE + beam_sz);
 
     // initialize the block-wise total distance computation count
     __shared__ uint32_t keep_expanding;
@@ -102,7 +108,7 @@ void BeamSearch(
     }
 
     // initialize the hash table to record visited (computed) nodes
-    if (HASH_TABLE_CONFIG) hashtable_init(HASH_TABLE, BITLEN);
+    if (HASH_TABLE_CONFIG) hashtable_init(HASH_TABLE, bitlen);
 
     // load query into shared memory
     for (int i = tid; i < dim; i += blockDim.x) {
@@ -110,7 +116,7 @@ void BeamSearch(
     }
     
     // load the top k list with dummy initial values
-    for (int i = tid; i < INTERNAL_TOPK; i += blockDim.x) {
+    for (int i = tid; i < beam_sz; i += blockDim.x) {
         TOP_K_INDEX[i] = MAX_INDEX;
         TOP_K_DISTANCE[i] = FLT_MAX;
     }
@@ -127,7 +133,7 @@ void BeamSearch(
         if (lane_id == 0) {     // warp computes, only lane 0 writes
             if (CANDIDATE_INDEX[i] != MAX_INDEX) {
                 atomicAdd(&counter[0], 1);
-                hashtable_insert(HASH_TABLE, BITLEN, CANDIDATE_INDEX[i]);
+                hashtable_insert(HASH_TABLE, bitlen, CANDIDATE_INDEX[i]);
                 if (GPU_DISTANCE_TIMING) {
                     atomicAdd(&timing[GPU_TIMING_L2_CALLS], gpu_long_t(1));
                     atomicAdd(&timing[GPU_TIMING_L2_CYCLES], gpu_globaltimer() - l2_start);
@@ -144,9 +150,9 @@ void BeamSearch(
         // forgettable hash table management according to the CARGA paper
         if (HASH_TABLE_CONFIG) {
             if ((iter + 1) % SMALL_HASH_RESET_INTERVAL == 0) {
-                hashtable_init(HASH_TABLE, BITLEN);
+                hashtable_init(HASH_TABLE, bitlen);
                 __syncthreads();
-                hashtable_restore(HASH_TABLE, BITLEN, TOP_K_INDEX, INTERNAL_TOPK);
+                hashtable_restore(HASH_TABLE, bitlen, TOP_K_INDEX, beam_sz);
             }
             __syncthreads();
         }
@@ -154,8 +160,9 @@ void BeamSearch(
         // use warp level sort to find the actual closest top K elements and update the topK list
         gpu_long_t sort_start = 0;
         if (GPU_DISTANCE_TIMING && tid == 0) sort_start = gpu_globaltimer();
-        topk_by_sort_candidates_and_merge<2, INTERNAL_TOPK / WARP_SIZE>(ALL_INDEX, ALL_DISTANCE, RESULT_BUFFER_SIZE,
-            CANDIDATE_BUFFER_SIZE, INTERNAL_TOPK, (iter == 0));
+        dispatch_topk_by_sort_candidates_and_merge<2>(
+            ALL_INDEX, ALL_DISTANCE, MERGED_TOPK_INDEX, MERGED_TOPK_DISTANCE,
+            result_buffer_size, CANDIDATE_BUFFER_SIZE, beam_sz, (iter == 0));
         __syncthreads();
         if (GPU_DISTANCE_TIMING && tid == 0) {
             atomicAdd(&timing[GPU_TIMING_SORT_CYCLES], gpu_globaltimer() - sort_start);
@@ -164,7 +171,7 @@ void BeamSearch(
         if (debug_mode && query_id == 0 && tid == 0) {
             printf("[DEBUG] iteration %d\n", iter + 1);
             printf("  beam state:\n");
-            for (int i = 0; i < INTERNAL_TOPK; ++i) {
+            for (int i = 0; i < beam_sz; ++i) {
                 const INDEX_T raw = TOP_K_INDEX[i];
                 const bool expanded = (raw & 0x80000000u) != 0;
                 printf("    idx=%d, node=%u, dist=%.6f, expanded=%s\n",
@@ -187,7 +194,7 @@ void BeamSearch(
         gpu_long_t pick_start = 0;
         if (GPU_DISTANCE_TIMING && tid == 0) pick_start = gpu_globaltimer();
         if (warp_id == 0) {
-            keep_expanding = pick_expanders(SEARCH_WIDTH, PARENT_LIST, INTERNAL_TOPK, TOP_K_INDEX);
+            keep_expanding = pick_expanders(SEARCH_WIDTH, PARENT_LIST, beam_sz, TOP_K_INDEX);
         }
         __syncthreads();
         if (GPU_DISTANCE_TIMING && tid == 0) {
@@ -196,9 +203,9 @@ void BeamSearch(
         if (debug_mode && query_id == 0 && tid == 0) {
             const INDEX_T parent_slot = PARENT_LIST[0];
             const INDEX_T parent_raw =
-                (keep_expanding && parent_slot < INTERNAL_TOPK) ? TOP_K_INDEX[parent_slot] : MAX_INDEX;
+                (keep_expanding && parent_slot < beam_sz) ? TOP_K_INDEX[parent_slot] : MAX_INDEX;
             const DISTANCE_T parent_dist =
-                (keep_expanding && parent_slot < INTERNAL_TOPK) ? TOP_K_DISTANCE[parent_slot] : FLT_MAX;
+                (keep_expanding && parent_slot < beam_sz) ? TOP_K_DISTANCE[parent_slot] : FLT_MAX;
             if (keep_expanding) {
                 printf("  expanding node: %u\n", parent_raw & 0x7fffffff);
                 printf("  expanding slot: %u, dist=%.6f\n", parent_slot, parent_dist);
@@ -235,7 +242,7 @@ void BeamSearch(
             INDEX_T child_id = (i < maxDegree) ? neighbors[i] : MAX_INDEX;      // only in-bound threads take from the neighbor list
 
             if (child_id != MAX_INDEX) {    // check if visited already
-                if (hashtable_insert(HASH_TABLE, BITLEN, child_id) == 0) {
+                if (hashtable_insert(HASH_TABLE, bitlen, child_id) == 0) {
                     child_id = MAX_INDEX;
                     CANDIDATE_DISTANCE[i] = FLT_MAX;
                 } else {
@@ -273,8 +280,9 @@ void BeamSearch(
     // final sort before writeback
     gpu_long_t final_sort_start = 0;
     if (GPU_DISTANCE_TIMING && tid == 0) final_sort_start = gpu_globaltimer();
-    topk_by_sort_candidates_and_merge<2, INTERNAL_TOPK / WARP_SIZE>(ALL_INDEX, ALL_DISTANCE, RESULT_BUFFER_SIZE,
-        CANDIDATE_BUFFER_SIZE, INTERNAL_TOPK, false);
+    dispatch_topk_by_sort_candidates_and_merge<2>(
+        ALL_INDEX, ALL_DISTANCE, MERGED_TOPK_INDEX, MERGED_TOPK_DISTANCE,
+        result_buffer_size, CANDIDATE_BUFFER_SIZE, beam_sz, false);
     __syncthreads();
     if (GPU_DISTANCE_TIMING && tid == 0) {
         atomicAdd(&timing[GPU_TIMING_FINAL_SORT_CYCLES], gpu_globaltimer() - final_sort_start);

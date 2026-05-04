@@ -9,12 +9,12 @@
 #define INTERNAL_TOPK   128
 #endif
 #define SEARCH_WIDTH    1     // MAX: 2 nodes * 32 degree = 64 neighbors = CANDIDATE_BUFFER_SIZE
-#define BITLEN          GPU_HASH_BITLEN_FOR_TOPK(INTERNAL_TOPK)
+// #define BITLEN          GPU_HASH_BITLEN_FOR_TOPK(INTERNAL_TOPK)
 #define MAX_ITERATIONS (1 << 15)
 #define TEAM_SIZE       8
 #define HASH_TABLE_CONFIG   1
 #define CANDIDATE_BUFFER_SIZE 64
-#define RESULT_BUFFER_SIZE (INTERNAL_TOPK + CANDIDATE_BUFFER_SIZE)
+// #define RESULT_BUFFER_SIZE (INTERNAL_TOPK + CANDIDATE_BUFFER_SIZE)
 
 #ifndef GPU_RABITQ_FASTSCAN
 #define GPU_RABITQ_FASTSCAN 1
@@ -43,18 +43,19 @@ static __device__ inline void staged_copy_async_finish_or_sync() {
 #endif
 }
 
-static __host__ inline uint32_t calculate_shared_mem_size(int dim, int topk, int max_deg, 
-                                                           int search_width, int bitlen) {
+static __host__ inline uint32_t calculate_shared_mem_size(int dim, int beam_sz, int result_k,
+                                                           int max_deg, int search_width, int bitlen) {
     auto align_up = [](size_t value, size_t alignment) {
         return (value + alignment - 1) & ~(alignment - 1);
     };
     size_t padded_dim = 1ULL << static_cast<size_t>(ceilf(log2f(dim)));
     size_t code_words = padded_dim / 64;
+    const size_t result_buffer_size = static_cast<size_t>(beam_sz) + CANDIDATE_BUFFER_SIZE;
     size_t size = 0;    
-    size += hashtable_getsize(BITLEN) * sizeof(INDEX_T);    // hash table
-    size += RESULT_BUFFER_SIZE * sizeof(INDEX_T);           // top k and candidate index
-    size += RESULT_BUFFER_SIZE * sizeof(DISTANCE_T);        // top k and candidate distance
-    size += SEARCH_WIDTH * sizeof(INDEX_T);                 // next expanders / parent buffer
+    size += hashtable_getsize(bitlen) * sizeof(INDEX_T);    // hash table
+    size += result_buffer_size * sizeof(INDEX_T);           // top k and candidate index
+    size += result_buffer_size * sizeof(DISTANCE_T);        // top k and candidate distance
+    size += search_width * sizeof(INDEX_T);                 // next expanders / parent buffer
     size += dim * 4;                                        // query buffer size
     size += padded_dim * sizeof(float);                     // rotated query
     size += padded_dim * sizeof(uint8_t);                   // quantized query
@@ -68,8 +69,10 @@ static __host__ inline uint32_t calculate_shared_mem_size(int dim, int topk, int
     if (GPU_SEARCH_STATS) {
         size += GPU_SEARCH_STAT_COUNT * sizeof(uint32_t);   // search stats
     }
-    size += topk * sizeof(INDEX_T);                         // result pool index
-    size += topk * sizeof(DISTANCE_T);                      // result pool distance
+    size += beam_sz * sizeof(INDEX_T);                      // merged topk scratch index
+    size += beam_sz * sizeof(DISTANCE_T);                   // merged topk scratch distance
+    size += result_k * sizeof(INDEX_T);                     // result pool index
+    size += result_k * sizeof(DISTANCE_T);                  // result pool distance
     size += 2 * sizeof(uint32_t);                           // result pool size and worst idx
     size += sizeof(DISTANCE_T);                             // result pool worst dist
 #if GPU_DISTANCE_TIMING
@@ -82,7 +85,7 @@ static __host__ inline uint32_t calculate_shared_mem_size(int dim, int topk, int
 
 static __global__ GPU_LAUNCH_BOUNDS(BLOCK_SIZE)
 void QuantizedBeamSearch(
-    int K, int nq, int dim, int max_degree, size_t npoints,
+    int K, int nq, int dim, int beam_sz, int bitlen, int max_degree, size_t npoints,
     const float* __restrict__ d_queries,
     const float* __restrict__ d_qg_data,
     const float* __restrict__ d_qg_signs,
@@ -112,14 +115,15 @@ void QuantizedBeamSearch(
     extern __shared__ char shared_memory[];
     INDEX_T* ALL_INDEX = (INDEX_T*)shared_memory;
     INDEX_T* TOP_K_INDEX      = ALL_INDEX;
-    INDEX_T* CANDIDATE_INDEX  = ALL_INDEX + INTERNAL_TOPK;
+    INDEX_T* CANDIDATE_INDEX  = ALL_INDEX + beam_sz;
 
-    DISTANCE_T* ALL_DISTANCE = (DISTANCE_T*)(ALL_INDEX + RESULT_BUFFER_SIZE);
+    const uint32_t result_buffer_size = static_cast<uint32_t>(beam_sz + CANDIDATE_BUFFER_SIZE);
+    DISTANCE_T* ALL_DISTANCE = (DISTANCE_T*)(ALL_INDEX + result_buffer_size);
     DISTANCE_T* TOP_K_DISTANCE      = ALL_DISTANCE;
-    DISTANCE_T* CANDIDATE_DISTANCE  = ALL_DISTANCE + INTERNAL_TOPK;
+    DISTANCE_T* CANDIDATE_DISTANCE  = ALL_DISTANCE + beam_sz;
 
-    INDEX_T* HASH_TABLE = (INDEX_T*)(ALL_DISTANCE + RESULT_BUFFER_SIZE);
-    INDEX_T* PARENT_LIST = (INDEX_T*)(HASH_TABLE + hashtable_getsize(BITLEN));
+    INDEX_T* HASH_TABLE = (INDEX_T*)(ALL_DISTANCE + result_buffer_size);
+    INDEX_T* PARENT_LIST = (INDEX_T*)(HASH_TABLE + hashtable_getsize(bitlen));
     DATA_T* QUERY_BUFFER = (DATA_T*)(PARENT_LIST + SEARCH_WIDTH);
 
     float* ROTATED_QUERY_BUFFER = reinterpret_cast<float*>(QUERY_BUFFER + dim);
@@ -138,7 +142,9 @@ void QuantizedBeamSearch(
     uint32_t* counter = reinterpret_cast<uint32_t*>(STAGED_FACTOR_BUFFER + 3 * max_degree);
     uint32_t* hops = counter + 1;
     uint32_t* stats = hops + 1;
-    INDEX_T* RESULT_POOL_INDEX = reinterpret_cast<INDEX_T*>(stats + (GPU_SEARCH_STATS ? GPU_SEARCH_STAT_COUNT : 0));
+    INDEX_T* MERGED_TOPK_INDEX = reinterpret_cast<INDEX_T*>(stats + (GPU_SEARCH_STATS ? GPU_SEARCH_STAT_COUNT : 0));
+    DISTANCE_T* MERGED_TOPK_DISTANCE = reinterpret_cast<DISTANCE_T*>(MERGED_TOPK_INDEX + beam_sz);
+    INDEX_T* RESULT_POOL_INDEX = reinterpret_cast<INDEX_T*>(MERGED_TOPK_DISTANCE + beam_sz);
     DISTANCE_T* RESULT_POOL_DISTANCE = reinterpret_cast<DISTANCE_T*>(RESULT_POOL_INDEX + K);
     uint32_t* result_pool_size = reinterpret_cast<uint32_t*>(RESULT_POOL_DISTANCE + K);
     uint32_t* result_pool_worst_idx = result_pool_size + 1;
@@ -182,7 +188,7 @@ void QuantizedBeamSearch(
     }
 
     // initialize the hash table to record expanded nodes
-    if (HASH_TABLE_CONFIG) hashtable_init(HASH_TABLE, BITLEN);
+    if (HASH_TABLE_CONFIG) hashtable_init(HASH_TABLE, bitlen);
 
     // load query into shared memory
     for (int i = tid; i < dim; i += blockDim.x) {
@@ -190,7 +196,7 @@ void QuantizedBeamSearch(
     }
     
     // load the top k list and candidate list with dummy initial values
-    for (int i = tid; i < RESULT_BUFFER_SIZE; i += blockDim.x) {
+    for (int i = tid; i < static_cast<int>(result_buffer_size); i += blockDim.x) {
         ALL_INDEX[i] = MAX_INDEX;
         ALL_DISTANCE[i] = FLT_MAX;
     }
@@ -234,9 +240,9 @@ void QuantizedBeamSearch(
         // forgettable hash table management according to the CARGA paper
         if (HASH_TABLE_CONFIG) {
             if ((iter + 1) % SMALL_HASH_RESET_INTERVAL == 0) {
-                hashtable_init(HASH_TABLE, BITLEN);
+                hashtable_init(HASH_TABLE, bitlen);
                 __syncthreads();
-                hashtable_restore_expand_only(HASH_TABLE, BITLEN, TOP_K_INDEX, INTERNAL_TOPK);
+                hashtable_restore_expand_only(HASH_TABLE, bitlen, TOP_K_INDEX, beam_sz);
             }
             __syncthreads();
         }
@@ -244,8 +250,9 @@ void QuantizedBeamSearch(
         // use warp level sort to find the actual closest top K elements and update the topK list
         gpu_long_t sort_start = 0;
         if (GPU_DISTANCE_TIMING && tid == 0) sort_start = gpu_globaltimer();
-        topk_by_sort_candidates_and_merge<2, INTERNAL_TOPK / WARP_SIZE>(ALL_INDEX, ALL_DISTANCE, RESULT_BUFFER_SIZE,
-            CANDIDATE_BUFFER_SIZE, INTERNAL_TOPK, (iter == 0));
+        dispatch_topk_by_sort_candidates_and_merge<2>(
+            ALL_INDEX, ALL_DISTANCE, MERGED_TOPK_INDEX, MERGED_TOPK_DISTANCE,
+            result_buffer_size, CANDIDATE_BUFFER_SIZE, beam_sz, (iter == 0));
         __syncthreads();
         
         // clear the candidate buffer before next iteration to avoid stale entries
@@ -261,7 +268,7 @@ void QuantizedBeamSearch(
         if (debug_mode && query_id == 0 && tid == 0) {
             printf("[DEBUG] iteration %d\n", iter + 1);
             printf("  beam state:\n");
-            for (int i = 0; i < INTERNAL_TOPK; ++i) {
+            for (int i = 0; i < beam_sz; ++i) {
                 const INDEX_T raw = TOP_K_INDEX[i];
                 const bool expanded = (raw & 0x80000000u) != 0;
                 printf("    idx=%d, node=%u, dist=%.6f, expanded=%s\n",
@@ -284,7 +291,7 @@ void QuantizedBeamSearch(
         gpu_long_t pick_start = 0;
         if (GPU_DISTANCE_TIMING && tid == 0) pick_start = gpu_globaltimer();
         if (warp_id == 0) {
-            keep_expanding = pick_expanders(SEARCH_WIDTH, PARENT_LIST, INTERNAL_TOPK, TOP_K_INDEX);
+            keep_expanding = pick_expanders(SEARCH_WIDTH, PARENT_LIST, beam_sz, TOP_K_INDEX);
         }
         __syncthreads();
         if (GPU_DISTANCE_TIMING && tid == 0) {
@@ -306,7 +313,7 @@ void QuantizedBeamSearch(
         INDEX_T current_node = TOP_K_INDEX[PARENT_LIST[0]] & 0x7fffffff;
 
         if (tid == 0) {
-            current_expanded = hashtable_insert(HASH_TABLE, BITLEN, current_node);
+            current_expanded = hashtable_insert(HASH_TABLE, bitlen, current_node);
         }
         __syncthreads();
         if (!current_expanded) {
@@ -316,7 +323,7 @@ void QuantizedBeamSearch(
         if (debug_mode && query_id == 0 && tid == 0) {
             const INDEX_T parent_slot = PARENT_LIST[0];
             const DISTANCE_T parent_dist =
-                (parent_slot < INTERNAL_TOPK) ? TOP_K_DISTANCE[parent_slot] : FLT_MAX;
+                (parent_slot < beam_sz) ? TOP_K_DISTANCE[parent_slot] : FLT_MAX;
             printf("  expanding node: %u\n", current_node);
             printf("  expanding slot: %u, dist=%.6f\n", parent_slot, parent_dist);
         }
@@ -368,7 +375,7 @@ void QuantizedBeamSearch(
         if (GPU_DISTANCE_TIMING && tid == 0) visited_start = gpu_globaltimer();
         for (int i = tid; i < CANDIDATE_BUFFER_SIZE; i += blockDim.x) {
             INDEX_T child_id = (i < max_degree) ? current_neighbors[i] : MAX_INDEX;
-            if (child_id != MAX_INDEX && hashtable_contains(HASH_TABLE, BITLEN, child_id)) {
+            if (child_id != MAX_INDEX && hashtable_contains(HASH_TABLE, bitlen, child_id)) {
                 child_id = MAX_INDEX;
             }
             CANDIDATE_INDEX[i] = child_id;
@@ -485,8 +492,9 @@ void QuantizedBeamSearch(
     // final sort before writeback
     gpu_long_t final_sort_start = 0;
     if (GPU_DISTANCE_TIMING && tid == 0) final_sort_start = gpu_globaltimer();
-    topk_by_sort_candidates_and_merge<2, INTERNAL_TOPK / WARP_SIZE>(ALL_INDEX, ALL_DISTANCE, RESULT_BUFFER_SIZE,
-        CANDIDATE_BUFFER_SIZE, INTERNAL_TOPK, false);
+    dispatch_topk_by_sort_candidates_and_merge<2>(
+        ALL_INDEX, ALL_DISTANCE, MERGED_TOPK_INDEX, MERGED_TOPK_DISTANCE,
+        result_buffer_size, CANDIDATE_BUFFER_SIZE, beam_sz, false);
     __syncthreads();
     if (GPU_DISTANCE_TIMING && tid == 0) {
         atomicAdd(&timing[GPU_TIMING_FINAL_SORT_CYCLES], gpu_globaltimer() - final_sort_start);
