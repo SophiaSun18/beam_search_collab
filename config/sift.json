@@ -2,8 +2,8 @@
     "data": {
         "graph": "data/sift/graph.bin",
         "base":  "data/sift/base.fvecs",
-        "query": "data/sift/query_10x.fvecs",
-        "gt":    "data/sift/groundtruth_10x.ivecs",
+        "query": "data/sift/query.fvecs",
+        "gt":    "data/sift/groundtruth.ivecs",
         "codebook": "data/sift/codebook.bin"
     },
     "search": {
