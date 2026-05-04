@@ -21,13 +21,57 @@ This produces:
 
 ## Data Preparation
 
-### HDF5 to project binaries
+### Quick start: download a dataset
+
+`script/download_dataset.sh` downloads an ANN-benchmarks dataset and runs the full pipeline (unpack, build graph, build codebook) in one command:
+
+```bash
+./script/download_dataset.sh sift-128-euclidean
+./script/download_dataset.sh glove-100-angular --degree 64
+```
+
+Angular and dot-product datasets are automatically L2-normalized so that euclidean distance preserves cosine neighbor ordering. Each step is skipped if its output already exists.
+
+Options:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--degree <int>` | 32 | Graph out-degree |
+| `--beam-width <int>` | 128 | Graph build beam width |
+| `--alpha <float>` | 2.0 | Vamana pruning alpha |
+| `--seed <int>` | 1234 | Random seed |
+| `--skip-graph` | | Skip graph building |
+| `--skip-codebook` | | Skip codebook building |
+
+Available datasets from [ann-benchmarks.com](https://ann-benchmarks.com):
+
+| Dataset | Dim | Metric |
+|---------|-----|--------|
+| `sift-128-euclidean` | 128 | euclidean |
+| `gist-960-euclidean` | 960 | euclidean |
+| `fashion-mnist-784-euclidean` | 784 | euclidean |
+| `mnist-784-euclidean` | 784 | euclidean |
+| `glove-25-angular` | 25 | angular (normalized) |
+| `glove-50-angular` | 50 | angular (normalized) |
+| `glove-100-angular` | 100 | angular (normalized) |
+| `glove-200-angular` | 200 | angular (normalized) |
+| `deep-image-96-angular` | 96 | angular (normalized) |
+| `nytimes-256-angular` | 256 | angular (normalized) |
+| `nytimes-16-angular` | 16 | angular (normalized) |
+| `lastfm-64-dot` | 64 | dot (normalized) |
+
+### Manual steps
+
+#### HDF5 to project binaries
 
 `script/unpack.py` converts ANN-benchmarks style HDF5 files into the formats consumed by the CLIs:
 
 ```bash
 uv run script/unpack.py sift-128-euclidean.hdf5 data/sift
+uv run script/unpack.py glove-100-angular.hdf5 data/glove --normalize
 ```
+
+The `--normalize` flag L2-normalizes base and query vectors (use for angular/cosine datasets).
 
 Generated files:
 
@@ -36,7 +80,7 @@ Generated files:
 - `groundtruth.ivecs` from dataset `neighbors`
 - optional `groundtruth_distances.npy` from dataset `distances`
 
-### Build a graph
+#### Build a graph
 
 ```bash
 ./build/build_graph \
@@ -52,7 +96,7 @@ Options:
 - `--metric l2|ip` selects the build distance metric
 - `--seed` controls insertion order shuffling
 
-### Build a RAbitQ codebook
+#### Build a RAbitQ codebook
 
 `build_rabitq` quantizes each edge in the graph for approximate distance estimation:
 
@@ -177,6 +221,8 @@ cd build && ctest
 | `src/gpu_cli.cu` | GPU search CLI |
 | `src/cpu_cli.cpp` | CPU search CLI |
 | `src/replicate_queries.cpp` | Query replication utility |
+| `script/download_dataset.sh` | Download + build pipeline for ANN-benchmarks datasets |
+| `script/unpack.py` | HDF5 to fvecs/ivecs converter (with optional normalization) |
 | `include/cpu_graph.hpp` | `CPUGraph` — host-side graph with file I/O |
 | `include/cpu_search_base.hpp` | `CPUBaseSearch` — CPU beam search with exact L2 |
 | `include/cpu_search_rabitq.hpp` | `CPURabitqSearch` — CPU beam search with RAbitQ estimation |
