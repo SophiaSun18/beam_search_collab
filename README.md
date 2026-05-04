@@ -68,17 +68,24 @@ The output codebook is required by the `rabitq` search mode. It contains per-edg
 
 ## Usage
 
-Both `gpu_cli` and `cpu_cli` read a single JSON object from stdin with `"data"` and `"search"` keys:
+Both `gpu_cli` and `cpu_cli` read a single JSON object from stdin with `"data"` and `"search"` keys.
+Pre-built configs live in `config/`:
+
+```bash
+./build/gpu_cli < config/sift.json
+```
+
+To run with an inline config:
 
 ```bash
 ./build/gpu_cli <<EOF
 {
     "data": {
-        "graph": "path/to/graph.bin",
-        "base":  "path/to/base.fvecs",
-        "query": "path/to/query.fvecs",
-        "gt":    "path/to/groundtruth.ivecs",
-        "codebook": "path/to/codebook.bin"
+        "graph": "data/sift/graph.bin",
+        "base":  "data/sift/base.fvecs",
+        "query": "data/sift/query.fvecs",
+        "gt":    "data/sift/groundtruth.ivecs",
+        "codebook": "data/sift/codebook.bin"
     },
     "search": {
         "mode": "base",
@@ -89,14 +96,6 @@ Both `gpu_cli` and `cpu_cli` read a single JSON object from stdin with `"data"` 
         "reset_interval": 16
     }
 }
-EOF
-```
-
-Configs can be composed from separate files:
-
-```bash
-./build/gpu_cli <<EOF
-{ "data": $(cat data.json), "search": $(cat search.json) }
 EOF
 ```
 
@@ -195,4 +194,5 @@ cd build && ctest
 | `include/filter_hash.cuh` | `HashFilter` — linear-probing hash set for visited nodes |
 | `include/filter_bloom.cuh` | `BloomFilter` — Bloom filter alternative |
 | `include/visit_filter.cuh` | `VisitFilter` concept + includes both filter implementations |
+| `config/` | Pre-built JSON configs for datasets (e.g. `sift.json`) |
 | `3rd/nlohmann/json.hpp` | Vendored JSON parser (v3.11.3) |
