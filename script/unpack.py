@@ -47,6 +47,8 @@ def main() -> int:
     parser.add_argument("--base-name", default="base", help="Output prefix for training vectors")
     parser.add_argument("--query-name", default="query", help="Output prefix for query vectors")
     parser.add_argument("--gt-name", default="groundtruth", help="Output prefix for groundtruth ids")
+    parser.add_argument("--normalize", action="store_true",
+                        help="L2-normalize base and query vectors (use for angular/cosine datasets)")
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -57,9 +59,18 @@ def main() -> int:
         if missing:
             raise KeyError(f"missing datasets in {args.input}: {', '.join(missing)}")
 
-        train = fin["train"][:]
-        test = fin["test"][:]
+        train = np.asarray(fin["train"][:], dtype=np.float32)
+        test = np.asarray(fin["test"][:], dtype=np.float32)
         neighbors = fin["neighbors"][:]
+
+        if args.normalize:
+            norms = np.linalg.norm(train, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            train /= norms
+            norms = np.linalg.norm(test, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            test /= norms
+            print("L2-normalized base and query vectors")
 
         write_fvecs(args.output_dir / f"{args.base_name}.fvecs", train)
         write_fvecs(args.output_dir / f"{args.query_name}.fvecs", test)
