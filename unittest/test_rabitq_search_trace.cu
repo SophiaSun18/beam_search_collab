@@ -25,6 +25,22 @@
 // Use the same warp structure: NY=1, SharedBitonicTopK<32,1>, REG=1
 using TraceTopK = SharedBitonicTopK<32, 1>;
 static constexpr unsigned TRACE_REG = 1;
+static constexpr int TRACE_NUM_BITS = RABITQ_BQUERY;
+
+static __host__ __device__ size_t fastscan_trace_smem_bytes(int dim)
+{
+    int pdim = rabitq_padded_dim(dim);
+    int wpp = pdim / 32;
+    size_t size = alignof(float) - 1;
+    size += pdim * sizeof(float);
+    size = (size + alignof(uint32_t) - 1) & ~(alignof(uint32_t) - 1);
+    size += static_cast<size_t>(TRACE_NUM_BITS) * wpp * sizeof(uint32_t);
+    size = (size + alignof(float) - 1) & ~(alignof(float) - 1);
+    size += sizeof(float);
+    size += sizeof(float);
+    size += sizeof(int32_t);
+    return size;
+}
 
 __global__ void kernel_rabitq_traced(
     GPUGraphView graph, GPURabitqView rabitq, GPURabitqSearchCfg cfg,
@@ -40,7 +56,7 @@ __global__ void kernel_rabitq_traced(
 
     const unsigned lane = threadIdx.x;
     const unsigned max_degree = graph.degree();
-    const unsigned bitcode_words = rabitq.padded_dim() / 64;
+    const int wpp = rabitq.words_per_plane();
 
     // Construct search state (mirrors GPURabitqSearch internals)
     TraceTopK topk(ptr, cfg.topk_size);
@@ -62,14 +78,14 @@ __global__ void kernel_rabitq_traced(
     float* cand_dist = reinterpret_cast<float*>(ptr);
     ptr += max_degree * sizeof(float);
 
-    char* query_smem = ptr;
-    ptr += RabitqQuery<32>::shared_mem_bytes(dim);
+    char* fastscan_smem = ptr;
+    ptr += fastscan_trace_smem_bytes(dim);
 
     ptr = reinterpret_cast<char*>(
-        (reinterpret_cast<uintptr_t>(ptr) + alignof(uint64_t) - 1)
-            & ~(static_cast<uintptr_t>(alignof(uint64_t)) - 1));
-    uint64_t* staged_codes = reinterpret_cast<uint64_t*>(ptr);
-    ptr += static_cast<size_t>(max_degree) * bitcode_words * sizeof(uint64_t);
+        (reinterpret_cast<uintptr_t>(ptr) + alignof(uint32_t) - 1)
+            & ~(static_cast<uintptr_t>(alignof(uint32_t)) - 1));
+    uint32_t* staged_codes = reinterpret_cast<uint32_t*>(ptr);
+    ptr += static_cast<size_t>(max_degree) * wpp * sizeof(uint32_t);
 
     ptr = reinterpret_cast<char*>(
         (reinterpret_cast<uintptr_t>(ptr) + alignof(float) - 1)
@@ -99,9 +115,10 @@ __global__ void kernel_rabitq_traced(
     }
     __syncwarp();
 
-    // Prepare RabitqQuery
-    char* qp = query_smem;
-    RabitqQuery<32> rq(qp, query_buf, rabitq.signs(), dim);
+    // Prepare RabitQFastScan
+    char* fsp = fastscan_smem;
+    RabitqQuantizer<32> quantizer(rabitq.signs(), 0);
+    RabitQFastScan<32, TRACE_NUM_BITS> fs(fsp, query_buf, dim, quantizer);
     __syncwarp();
 
     int actual_iters = 0;
@@ -164,8 +181,8 @@ __global__ void kernel_rabitq_traced(
         __syncwarp();
 
         // Load codes/factors
-        const uint64_t* src_codes = rabitq.codes(current_node);
-        int code_count = static_cast<int>(max_degree * bitcode_words);
+        const uint32_t* src_codes = rabitq.codes(current_node);
+        int code_count = static_cast<int>(max_degree) * wpp;
         for (int i = static_cast<int>(lane); i < code_count; i += 32)
             staged_codes[i] = src_codes[i];
         const float* src_factors = rabitq.factors(current_node);
@@ -181,21 +198,17 @@ __global__ void kernel_rabitq_traced(
         if (lane == 0)
             d_trace_dists[iter] = exact_dist;
 
-        // Fastscan
-        int pdim = rabitq.padded_dim();
+        // Distance estimation
         int num_batches = (max_degree + 32 - 1) / 32;
         for (int batch = 0; batch < num_batches; batch++) {
             int batch_begin = batch * 32;
             int active = min(32, static_cast<int>(max_degree) - batch_begin);
 
-            const uint8_t* codes_block =
-                reinterpret_cast<const uint8_t*>(staged_codes)
-                + batch * pdim * 4;
+            const uint32_t* batch_codes = staged_codes + batch_begin * wpp;
 
-            rq.scan_neighbors_32(
-                codes_block, staged_factors,
-                static_cast<int>(max_degree), batch_begin,
-                exact_dist, cand_dist + batch_begin, active);
+            fs.dot(batch_codes, active,
+                   staged_factors + batch_begin, static_cast<int>(max_degree),
+                   exact_dist, cand_dist + batch_begin);
 
             if (lane < static_cast<unsigned>(active)) {
                 if (cand_idx[batch_begin + lane] == UINT_MAX)
@@ -238,12 +251,11 @@ CPUTraceResult cpu_rabitq_search_trace(
 
     CPURabitqSearch searcher(graph, rq, cfg);
 
-    // We need trace, so reimplement with trace output
     CPUTraceResult trace;
     int dim  = graph.dim;
     int pdim = rq.padded_dim;
     int degree = graph.degree;
-    int num_codebooks = pdim / 4;
+    int wpp = rq.words_per_plane;
     constexpr int BQUERY = 6;
 
     // rotate query
@@ -271,23 +283,12 @@ CPUTraceResult cpu_rabitq_search_trace(
     std::vector<uint8_t> quant(pdim);
     int32_t sum_q = 0;
     for (int d = 0; d < pdim; ++d) {
-        uint8_t q_val = static_cast<uint8_t>(
-            lroundf((q_rot[d] - low) * inv_w + 0.5f));
-        quant[d] = q_val;
+        float x = (q_rot[d] - low) * inv_w;
+        int q_val = static_cast<int>(floorf(x + 0.5f));
+        if (q_val < 0) q_val = 0;
+        if (q_val > (1 << BQUERY) - 1) q_val = (1 << BQUERY) - 1;
+        quant[d] = static_cast<uint8_t>(q_val);
         sum_q += q_val;
-    }
-
-    std::vector<uint8_t> lut(num_codebooks * 16);
-    for (int cb = 0; cb < num_codebooks; ++cb) {
-        const uint8_t* qc = quant.data() + cb * 4;
-        uint8_t* lc = lut.data() + cb * 16;
-        lc[0] = 0;
-        for (int mask = 1; mask < 16; ++mask) {
-            int lowbit = mask & -mask;
-            int pos = (lowbit == 8) ? 0 : (lowbit == 4) ? 1
-                    : (lowbit == 2) ? 2 : 3;
-            lc[mask] = static_cast<uint8_t>(lc[mask - lowbit] + qc[pos]);
-        }
     }
 
     auto l2_exact = [&](vid_t node) {
@@ -308,28 +309,19 @@ CPUTraceResult cpu_rabitq_search_trace(
         float fvq = factors[2 * degree + nbr_idx];
         if (tx == FLT_MAX) return FLT_MAX;
 
-        const uint8_t* codes = reinterpret_cast<const uint8_t*>(
-            rq.codes.data() + static_cast<size_t>(node) * degree * rq.bitcode_words);
-        int batch = nbr_idx / 32;
-        int lane  = nbr_idx % 32;
-        const uint8_t* batch_ptr = codes + batch * pdim * 4;
+        const uint32_t* nbr_codes = rq.codes.data()
+            + static_cast<size_t>(node) * degree * wpp
+            + nbr_idx * wpp;
 
         uint32_t raw_sum = 0;
-        for (int cb = 0; cb < num_codebooks; ++cb) {
-            int pair_idx     = cb >> 1;
-            int nibble_group = cb & 1;
-            int lane16       = lane & 15;
-            int byte_idx     = ((lane16 & 7) << 1) | (lane16 >> 3);
-            uint8_t val = batch_ptr[pair_idx * 32 + nibble_group * 16 + byte_idx];
-            uint8_t code = (lane < 16)
-                ? static_cast<uint8_t>(val & 0x0f)
-                : static_cast<uint8_t>(val >> 4);
-            raw_sum += lut[cb * 16 + code];
+        for (int d = 0; d < pdim; ++d) {
+            if ((nbr_codes[d / 32] >> (d % 32)) & 1)
+                raw_sum += quant[d];
         }
 
-        float result_float = static_cast<float>(
+        float ip = static_cast<float>(
             (static_cast<int32_t>(raw_sum) << 1) - sum_q);
-        float est = tx + exact_dist + fdq * w * result_float + fvq * low;
+        float est = tx + exact_dist + fdq * w * ip + fvq * low;
         if (!std::isfinite(est)) return FLT_MAX;
         return est;
     };

@@ -36,7 +36,7 @@ SimResult simulate_gpu_logic(
     int dim = graph.dim;
     int pdim = rq.padded_dim;
     int degree = graph.degree;
-    int num_codebooks = pdim / 4;
+    int wpp = rq.words_per_plane;
 
     // ── prepare query (same as CPU rabitq search) ────────────────────
     std::vector<float> q_rot(pdim);
@@ -61,18 +61,6 @@ SimResult simulate_gpu_logic(
         quant[d] = qv; sum_q += qv;
     }
 
-    std::vector<uint8_t> lut(num_codebooks * 16);
-    for (int cb = 0; cb < num_codebooks; ++cb) {
-        const uint8_t* qc = quant.data() + cb*4;
-        uint8_t* lc = lut.data() + cb*16;
-        lc[0] = 0;
-        for (int mask = 1; mask < 16; ++mask) {
-            int lb = mask & -mask;
-            int pos = (lb==8)?0:(lb==4)?1:(lb==2)?2:3;
-            lc[mask] = static_cast<uint8_t>(lc[mask-lb] + qc[pos]);
-        }
-    }
-
     auto l2_exact = [&](vid_t node) {
         const auto vec = graph.vect(node);
         float s = 0; for (int d = 0; d < dim; ++d) { float diff = query[d]-vec[d]; s += diff*diff; } return s;
@@ -82,20 +70,15 @@ SimResult simulate_gpu_logic(
         const float* factors = rq.factors.data() + static_cast<size_t>(node)*3*degree;
         float tx = factors[nbr_idx], fdq = factors[degree+nbr_idx], fvq = factors[2*degree+nbr_idx];
         if (tx == FLT_MAX) return FLT_MAX;
-        const uint8_t* codes = reinterpret_cast<const uint8_t*>(
-            rq.codes.data() + static_cast<size_t>(node)*degree*rq.bitcode_words);
-        int batch = nbr_idx/32, lane = nbr_idx%32;
-        const uint8_t* bp = codes + batch*pdim*4;
+        const uint32_t* nbr_codes = rq.codes.data()
+            + static_cast<size_t>(node)*degree*wpp + nbr_idx*wpp;
         uint32_t raw = 0;
-        for (int cb = 0; cb < num_codebooks; ++cb) {
-            int pi = cb>>1, ng = cb&1, l16 = lane&15;
-            int bi = ((l16&7)<<1)|(l16>>3);
-            uint8_t val = bp[pi*32+ng*16+bi];
-            uint8_t code = (lane<16)?(val&0x0f):(val>>4);
-            raw += lut[cb*16+code];
+        for (int d = 0; d < pdim; ++d) {
+            if ((nbr_codes[d/32] >> (d%32)) & 1)
+                raw += quant[d];
         }
-        float rf = static_cast<float>((static_cast<int32_t>(raw)<<1)-sum_q);
-        float est = tx + exact_dist + fdq*w*rf + fvq*low;
+        float ip = static_cast<float>((static_cast<int32_t>(raw)<<1)-sum_q);
+        float est = tx + exact_dist + fdq*w*ip + fvq*low;
         return std::isfinite(est) ? est : FLT_MAX;
     };
 

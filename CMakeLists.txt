@@ -1,4 +1,11 @@
 cmake_minimum_required(VERSION 3.24)
+
+# Use nvcc with GCC 14 as CUDA host compiler (GCC 16's libstdc++ is incompatible with nvcc)
+set(GCC14_ROOT "$ENV{HOME}/.local/opt/gcc14/usr")
+if(NOT DEFINED CMAKE_CUDA_HOST_COMPILER AND EXISTS "${GCC14_ROOT}/bin/g++")
+    set(CMAKE_CUDA_HOST_COMPILER "${GCC14_ROOT}/bin/g++")
+endif()
+
 project(beam_search_collab LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -6,6 +13,7 @@ set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_ARCHITECTURES 89)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_INCLUDES 0)
+
 
 # ── Third-party interface libraries ──────────────────────────────────────────
 
@@ -37,7 +45,7 @@ target_link_libraries(build_rabitq PRIVATE OpenMP::OpenMP_CXX)
 add_executable(gpu_cli src/gpu_cli.cu)
 target_include_directories(gpu_cli PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(gpu_cli PRIVATE nlohmann_json)
-target_compile_options(gpu_cli PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3 --ptxas-options=-v>)
+target_compile_options(gpu_cli PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3 --ptxas-options=--warn-on-local-memory-usage>)
 
 # ── Tests ────────────────────────────────────────────────────────────────────
 
@@ -92,6 +100,11 @@ add_executable(test_filter_hash unittest/test_filter_hash.cu)
 target_include_directories(test_filter_hash PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_compile_options(test_filter_hash PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
 add_test(NAME test_filter_hash COMMAND test_filter_hash)
+
+add_executable(test_fastscan unittest/test_fastscan.cu)
+target_include_directories(test_fastscan PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_compile_options(test_fastscan PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
+add_test(NAME test_fastscan COMMAND test_fastscan)
 
 # ── Profiling ───────────────────────────────────────────────────────────────
 

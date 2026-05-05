@@ -23,7 +23,7 @@ public:
     CPURabitqSearch(const CPUGraph& graph, const CPURabitqData& rq,
                     const CPURabitqSearchCfg& cfg)
         : graph_(graph), rq_(rq), cfg_(cfg),
-          padded_dim_(rq.padded_dim), num_codebooks_(rq.padded_dim / 4) {}
+          padded_dim_(rq.padded_dim), words_per_plane_(rq.words_per_plane) {}
 
     void search(const float* query, vid_t* results, int K) const {
         int dim  = graph_.dim;
@@ -56,23 +56,6 @@ public:
             sum_q += q_val;
         }
 
-        // ── build LUT ────────────────────────────────────────────────
-        int ncb = num_codebooks_;
-        std::vector<uint8_t> lut(ncb * 16);
-        for (int cb = 0; cb < ncb; ++cb) {
-            const uint8_t* qc = quant.data() + cb * 4;
-            uint8_t* lc = lut.data() + cb * 16;
-            lc[0] = 0;
-            for (int mask = 1; mask < 16; ++mask) {
-                int lowbit = mask & -mask;
-                int pos = (lowbit == 8) ? 0
-                        : (lowbit == 4) ? 1
-                        : (lowbit == 2) ? 2
-                        :                 3;
-                lc[mask] = static_cast<uint8_t>(lc[mask - lowbit] + qc[pos]);
-            }
-        }
-
         // ── exact L2 helper ──────────────────────────────────────────
         auto l2_exact = [&](vid_t node) {
             const auto vec = graph_.vect(node);
@@ -84,7 +67,8 @@ public:
             return sum;
         };
 
-        // ── fastscan estimate for one neighbor ───────────────────────
+        // ── estimate distance for one neighbor ──────────────────────
+        int wpp = words_per_plane_;
         auto estimate = [&](vid_t node, int nbr_idx, float exact_dist) {
             const float* factors = rq_.factors.data()
                 + static_cast<size_t>(node) * 3 * degree;
@@ -94,30 +78,19 @@ public:
 
             if (tx == FLT_MAX) return FLT_MAX;
 
-            const uint8_t* codes = reinterpret_cast<const uint8_t*>(
-                rq_.codes.data()
-                + static_cast<size_t>(node) * degree * rq_.bitcode_words);
-
-            int batch = nbr_idx / 32;
-            int lane  = nbr_idx % 32;
-            const uint8_t* batch_ptr = codes + batch * pdim * 4;
+            const uint32_t* nbr_codes = rq_.codes.data()
+                + static_cast<size_t>(node) * degree * wpp
+                + nbr_idx * wpp;
 
             uint32_t raw_sum = 0;
-            for (int cb = 0; cb < ncb; ++cb) {
-                int pair_idx     = cb >> 1;
-                int nibble_group = cb & 1;
-                int lane16       = lane & 15;
-                int byte_idx     = ((lane16 & 7) << 1) | (lane16 >> 3);
-                uint8_t val = batch_ptr[pair_idx * 32 + nibble_group * 16 + byte_idx];
-                uint8_t code = (lane < 16)
-                    ? static_cast<uint8_t>(val & 0x0f)
-                    : static_cast<uint8_t>(val >> 4);
-                raw_sum += lut[cb * 16 + code];
+            for (int d = 0; d < pdim; ++d) {
+                if ((nbr_codes[d / 32] >> (d % 32)) & 1)
+                    raw_sum += quant[d];
             }
 
-            float result_float = static_cast<float>(
+            float ip = static_cast<float>(
                 (static_cast<int32_t>(raw_sum) << 1) - sum_q);
-            float est = tx + exact_dist + fdq * w * result_float + fvq * low;
+            float est = tx + exact_dist + fdq * w * ip + fvq * low;
 
             if (!std::isfinite(est)) return FLT_MAX;
             return est;
@@ -189,5 +162,5 @@ private:
     const CPURabitqData&  rq_;
     CPURabitqSearchCfg    cfg_;
     int                   padded_dim_;
-    int                   num_codebooks_;
+    int                   words_per_plane_;
 };

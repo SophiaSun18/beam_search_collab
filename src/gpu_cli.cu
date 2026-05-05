@@ -78,8 +78,6 @@ static vid_t compute_entry_point(const CPUGraph& graph) {
 
 // ── kernels ─────────────────────────────────────────────────────────────────
 
-static constexpr unsigned CLI_BLOCK_SIZE = 256;
-
 template <unsigned BX>
 __global__ void kernel_base_search(
     GPUGraphView graph, GPUBaseSearchCfg cfg,
@@ -192,11 +190,8 @@ static void run_warp_reg(const GPUGraph& gpu_graph, const GPUBaseSearchCfg& cfg,
             case  4: 
                 run_warp_regx<NY, REG,  4, Filter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); 
                 return;
-            case  8: 
-                run_warp_regx<NY, REG,  8, Filter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); 
-                return;
-            case 16: 
-                run_warp_regx<NY, REG, 16, Filter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results); 
+            case  8:
+                run_warp_regx<NY, REG,  8, Filter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
                 return;
             default: break;
         }
@@ -457,16 +452,12 @@ int main() {
             run_warp<2>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
         } else if (mode == "warp4") {
             run_warp<4>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
-        } else if (mode == "warp8") {
-            run_warp<8>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
         } else if (mode == "bwarp1") {
             run_warp<1, BloomFilter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
         } else if (mode == "bwarp2") {
             run_warp<2, BloomFilter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
         } else if (mode == "bwarp4") {
             run_warp<4, BloomFilter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
-        } else if (mode == "bwarp8") {
-            run_warp<8, BloomFilter>(gpu_graph, cfg, nq, dim, K, d_queries, d_results);
         } else {
             std::cerr << "Unknown mode: " << mode << std::endl;
             return 1;

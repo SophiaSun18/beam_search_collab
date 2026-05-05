@@ -40,34 +40,18 @@ static void rotate_vector(const float* src, float* dst,
     wht_inplace(dst, padded_dim);
 }
 
-// ── Fastscan encode: write one 4-bit nibble for (lane, codebook) ───────────
+// ── Pack 1-bit codes into uint32_t words ───────────────────────────────────
 
-static void fastscan_encode(uint8_t* packed, int lane_id,
-                             int codebook_idx, uint8_t nibble) {
-    int pair_idx     = codebook_idx >> 1;
-    int nibble_group = codebook_idx & 1;
-    int lane16       = lane_id & 15;
-    int byte_idx     = ((lane16 & 7) << 1) | (lane16 >> 3);
-    int offset       = pair_idx * 32 + nibble_group * 16 + byte_idx;
-    if (lane_id < 16)
-        packed[offset] = static_cast<uint8_t>(
-            (packed[offset] & 0xf0) | (nibble & 0x0f));
-    else
-        packed[offset] = static_cast<uint8_t>(
-            (packed[offset] & 0x0f) | ((nibble & 0x0f) << 4));
-}
-
-// ── Compute 4-bit nibble from binary code for one codebook group ───────────
-
-static uint8_t binary_to_nibble(const uint8_t* bits, int codebook_idx) {
-    int base = codebook_idx * 4;
-    uint8_t n = 0;
-    // bit layout matches fastscan LUT: bit3→dim+0, bit2→dim+1, bit1→dim+2, bit0→dim+3
-    if (bits[base + 0]) n |= 8;
-    if (bits[base + 1]) n |= 4;
-    if (bits[base + 2]) n |= 2;
-    if (bits[base + 3]) n |= 1;
-    return n;
+static void pack_bits(const uint8_t* bits, uint32_t* out, int padded_dim) {
+    int words = padded_dim / 32;
+    for (int w = 0; w < words; ++w) {
+        uint32_t word = 0;
+        for (int b = 0; b < 32; ++b) {
+            if (bits[w * 32 + b])
+                word |= (1u << b);
+        }
+        out[w] = word;
+    }
 }
 
 // ── Find medoid (node closest to centroid) ─────────────────────────────────
@@ -144,13 +128,11 @@ int main(int argc, char** argv) {
     size_t n       = g.num_nodes;
     int padded_dim = 1;
     while (padded_dim < dim) padded_dim <<= 1;
-    int bitcode_words  = padded_dim / 64;
-    int num_codebooks  = padded_dim / 4;
-    int batches_per_node = (degree + 31) / 32;
+    int words_per_plane = padded_dim / 32;
 
     std::cout << "dim=" << dim << " padded_dim=" << padded_dim
               << " degree=" << degree << " n=" << n
-              << " bitcode_words=" << bitcode_words << "\n";
+              << " words_per_plane=" << words_per_plane << "\n";
 
     // ── generate random signs ───────────────────────────────────────────
     std::vector<float> signs(padded_dim);
@@ -166,13 +148,13 @@ int main(int argc, char** argv) {
     vid_t entry_point = find_medoid(g);
     std::cout << "Entry point (medoid): " << entry_point << "\n";
 
-    // ── per-node codebook row layout (in floats) ────────────────────────
-    //   [raw_vector: dim]
-    //   [packed_codes: bitcode_words * 2 * degree]  (uint64 reinterpreted as pairs of float)
-    //   [factors: 3 * degree]                       (triple_x | factor_dq | factor_vq)
-    //   [neighbor_IDs: degree]                      (uint32 cast to float)
+    // ── per-node codebook row layout (in uint32-sized slots) ─────────────
+    //   [raw_vector: dim]               (float)
+    //   [codes: words_per_plane*degree] (uint32_t, 1 bit per dim per neighbor)
+    //   [factors: 3 * degree]           (float: triple_x | factor_dq | factor_vq)
+    //   [neighbor_IDs: degree]          (uint32 cast to float)
     size_t code_off   = static_cast<size_t>(dim);
-    size_t factor_off = code_off + static_cast<size_t>(bitcode_words) * 2 * degree;
+    size_t factor_off = code_off + static_cast<size_t>(words_per_plane) * degree;
     size_t nbr_off    = factor_off + 3 * static_cast<size_t>(degree);
     size_t row_floats = nbr_off + static_cast<size_t>(degree);
 
@@ -205,11 +187,10 @@ int main(int argc, char** argv) {
 
             auto nbrs = g.nbrs(static_cast<vid_t>(u));
 
-            // pointer to packed codes region (as bytes)
-            uint8_t* codes_ptr = reinterpret_cast<uint8_t*>(row + code_off);
-            // zero out codes region
+            // pointer to codes region (uint32_t per-neighbor bit-vectors)
+            uint32_t* codes_ptr = reinterpret_cast<uint32_t*>(row + code_off);
             std::memset(codes_ptr, 0,
-                        static_cast<size_t>(bitcode_words) * degree * sizeof(uint64_t));
+                        static_cast<size_t>(words_per_plane) * degree * sizeof(uint32_t));
 
             // pointer to factors region: [triple_x * degree][factor_dq * degree][factor_vq * degree]
             float* fac_triple = row + factor_off;
@@ -254,16 +235,8 @@ int main(int argc, char** argv) {
                     bin_sum += bits[d];
                 }
 
-                // fastscan pack: find which batch of 32 this neighbor belongs to
-                int batch = i / 32;
-                int lane  = i % 32;
-                uint8_t* batch_ptr = codes_ptr
-                    + batch * padded_dim * 4;   // 4 bytes per dim per batch of 32
-
-                for (int cb = 0; cb < num_codebooks; ++cb) {
-                    uint8_t nibble = binary_to_nibble(bits.data(), cb);
-                    fastscan_encode(batch_ptr, lane, cb, nibble);
-                }
+                // pack 1-bit codes for this neighbor
+                pack_bits(bits.data(), codes_ptr + i * words_per_plane, padded_dim);
 
                 // compute factors
                 float fac_norm = 1.0f / std::sqrt(static_cast<float>(dim));
