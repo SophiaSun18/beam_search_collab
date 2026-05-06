@@ -14,10 +14,15 @@
 #define TEAM_SIZE       8
 #define HASH_TABLE_CONFIG   1
 #define CANDIDATE_BUFFER_SIZE 64
+#define FILL_WARP_COUNT (BLOCK_SIZE / WARP_SIZE)
 // #define RESULT_BUFFER_SIZE (INTERNAL_TOPK + CANDIDATE_BUFFER_SIZE)
 
 #ifndef GPU_RABITQ_FASTSCAN
 #define GPU_RABITQ_FASTSCAN 1
+#endif
+
+#ifndef GPU_RABITQ_FINAL_FILLUP
+#define GPU_RABITQ_FINAL_FILLUP 1
 #endif
 
 template <typename T>
@@ -158,6 +163,9 @@ void QuantizedBeamSearch(
 #endif
 
     __shared__ QueryFactors qf;
+    __shared__ INDEX_T fill_candidate_nodes[FILL_WARP_COUNT];
+    __shared__ DISTANCE_T fill_candidate_dists[FILL_WARP_COUNT];
+    __shared__ INDEX_T fill_parent_node_shared;
 
     // initialize the block-wise total distance computation count
     __shared__ uint32_t keep_expanding;
@@ -499,6 +507,112 @@ void QuantizedBeamSearch(
     if (GPU_DISTANCE_TIMING && tid == 0) {
         atomicAdd(&timing[GPU_TIMING_FINAL_SORT_CYCLES], gpu_globaltimer() - final_sort_start);
     }
+
+    if (tid == 0) {
+        result_pool_sort_small(RESULT_POOL_INDEX, RESULT_POOL_DISTANCE, result_pool_size[0]);
+        result_pool_recompute_worst(
+            RESULT_POOL_DISTANCE,
+            result_pool_size[0],
+            result_pool_worst_idx,
+            result_pool_worst_dist);
+    }
+    __syncthreads();
+
+#if GPU_RABITQ_FINAL_FILLUP
+    if (result_pool_size[0] < static_cast<uint32_t>(K)) {
+        const uint32_t base_pool_size = result_pool_size[0];
+        for (uint32_t parent_idx = 0; parent_idx < base_pool_size; ++parent_idx) {
+            if (tid == 0) {
+                fill_parent_node_shared = RESULT_POOL_INDEX[parent_idx];
+            }
+            __syncthreads();
+
+            const INDEX_T parent_node = fill_parent_node_shared;
+            if (parent_node == MAX_INDEX) {
+                continue;
+            }
+
+            const float* parent_row = d_qg_data + static_cast<size_t>(parent_node) * row_offset;
+            const vidType* parent_neighbors = reinterpret_cast<const vidType*>(parent_row + neighbor_offset);
+
+            for (int nbr_base = 0; nbr_base < max_degree; nbr_base += FILL_WARP_COUNT) {
+                if (lane_id == 0) {
+                    fill_candidate_nodes[warp_id] = MAX_INDEX;
+                }
+                __syncthreads();
+
+                const int nbr_idx = nbr_base + warp_id;
+                INDEX_T child_node = MAX_INDEX;
+                uint32_t inserted = 0;
+                if (nbr_idx < max_degree) {
+                    if (lane_id == 0) {
+                        child_node = parent_neighbors[nbr_idx];
+                        inserted = hashtable_insert(HASH_TABLE, bitlen, child_node);
+                    }
+                    child_node = __shfl_sync(FULL_MASK, child_node, 0);
+                    inserted = __shfl_sync(FULL_MASK, inserted, 0);
+                }
+
+                if (nbr_idx < max_degree && inserted && child_node != MAX_INDEX) {
+                    gpu_long_t fill_l2_start = 0;
+                    if (GPU_DISTANCE_TIMING && lane_id == 0) {
+                        fill_l2_start = gpu_globaltimer();
+                    }
+                    DISTANCE_T child_dist = warp_l2_distance(
+                        dim, query, d_qg_data + static_cast<size_t>(child_node) * row_offset);
+                    if (lane_id == 0) {
+                        fill_candidate_nodes[warp_id] = child_node;
+                        fill_candidate_dists[warp_id] = child_dist;
+                        if (GPU_SEARCH_STATS) {
+                            stats[GPU_SEARCH_STAT_DIST_CMPS]++;
+                        }
+                        if (GPU_DISTANCE_TIMING) {
+                            atomicAdd(&timing[GPU_TIMING_L2_CALLS], gpu_long_t(1));
+                            atomicAdd(&timing[GPU_TIMING_L2_CYCLES], gpu_globaltimer() - fill_l2_start);
+                        }
+                    }
+                }
+                __syncthreads();
+
+                if (tid == 0) {
+                    const int chunk_end = min(max_degree - nbr_base, FILL_WARP_COUNT);
+                    for (int chunk_warp = 0; chunk_warp < chunk_end; ++chunk_warp) {
+                        const INDEX_T accepted_child = fill_candidate_nodes[chunk_warp];
+                        if (accepted_child == MAX_INDEX) {
+                            continue;
+                        }
+                        result_pool_push_unique_unsorted(
+                            RESULT_POOL_INDEX,
+                            RESULT_POOL_DISTANCE,
+                            result_pool_size,
+                            result_pool_worst_idx,
+                            result_pool_worst_dist,
+                            K,
+                            accepted_child,
+                            fill_candidate_dists[chunk_warp]);
+                    }
+                }
+                __syncthreads();
+
+                if (result_pool_size[0] >= static_cast<uint32_t>(K)) {
+                    break;
+                }
+            }
+            if (result_pool_size[0] >= static_cast<uint32_t>(K)) {
+                break;
+            }
+        }
+        if (tid == 0) {
+            result_pool_sort_small(RESULT_POOL_INDEX, RESULT_POOL_DISTANCE, result_pool_size[0]);
+            result_pool_recompute_worst(
+                RESULT_POOL_DISTANCE,
+                result_pool_size[0],
+                result_pool_worst_idx,
+                result_pool_worst_dist);
+        }
+        __syncthreads();
+    }
+#endif
 
     if (tid == 0) {
 
