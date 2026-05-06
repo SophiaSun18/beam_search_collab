@@ -139,7 +139,7 @@ int main(int argc, char** argv) {
     {
         std::mt19937_64 gen(seed);
         std::uniform_int_distribution<int> coin(0, 1);
-        float scale = 1.0f / std::sqrtf(static_cast<float>(padded_dim));
+        float scale = 1.0f / std::sqrt(static_cast<float>(padded_dim));
         for (int i = 0; i < padded_dim; ++i)
             signs[i] = static_cast<float>(2 * coin(gen) - 1) * scale;
     }

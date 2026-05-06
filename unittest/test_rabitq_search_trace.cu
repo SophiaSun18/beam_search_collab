@@ -124,15 +124,6 @@ __global__ void kernel_rabitq_traced(
     int actual_iters = 0;
 
     for (int iter = 0; iter < cfg.max_iterations; iter++) {
-        // Hash reset
-        if ((iter + 1) % cfg.reset_interval == 0) {
-            hf.init();
-            __syncwarp();
-            for (unsigned i = lane; i < topk.capacity(); i += 32) {
-                uint32_t node = topk.id(i);
-                if (node != UINT_MAX) hf.insert(node);
-            }
-        }
         __syncwarp();
 
         // Merge candidates
@@ -405,7 +396,7 @@ int main(int argc, char** argv) {
     if (argc < 5) {
         std::cerr << "Usage: " << argv[0]
                   << " <graph_file> <base_file> <query_file> <codebook_file>"
-                  << " [topk_size] [max_iterations] [filter_capacity] [reset_interval]"
+                  << " [topk_size] [max_iterations] [filter_capacity]"
                   << std::endl;
         return 1;
     }
@@ -418,7 +409,6 @@ int main(int argc, char** argv) {
     unsigned topk_size       = (argc > 5) ? std::stoi(argv[5]) : 256;
     int      max_iterations  = (argc > 6) ? std::stoi(argv[6]) : 64;
     unsigned filter_capacity = (argc > 7) ? std::stoi(argv[7]) : 1024;
-    int      reset_interval  = (argc > 8) ? std::stoi(argv[8]) : 16;
     int      K = 10;
 
     CPUGraph cpu_graph;
@@ -439,7 +429,7 @@ int main(int argc, char** argv) {
               << ", entry=" << entry_point << std::endl;
     std::cout << "Config: topk=" << topk_size << ", max_iter=" << max_iterations
               << ", filter_cap=" << filter_capacity
-              << ", reset_interval=" << reset_interval << std::endl << std::endl;
+              << std::endl << std::endl;
 
     // CPU trace
     const float* query0 = h_queries;
@@ -481,7 +471,7 @@ int main(int argc, char** argv) {
     gpu_cfg.filter_capacity = filter_capacity;
     gpu_cfg.entry_point     = entry_point;
     gpu_cfg.max_iterations  = max_iterations;
-    gpu_cfg.reset_interval  = reset_interval;
+
 
     // Compute shared mem (same layout as the traced kernel)
     size_t smem_bytes = GPURabitqSearch<1, TraceTopK, TRACE_REG, HashFilter>::shared_mem_bytes(
