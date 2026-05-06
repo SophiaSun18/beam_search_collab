@@ -57,7 +57,7 @@ install_cuda() {
 }
 
 install_gcc() {
-    require wget ar tar
+    require wget ar tar zstd
     mkdir -p "${WORKDIR}"/{debs,root}
 
     echo "==> Downloading GCC ${GCC_MAJOR} packages..."
@@ -71,8 +71,13 @@ install_gcc() {
         mkdir -p "${WORKDIR}/tmp"
         cd "${WORKDIR}/tmp"
         ar x "$deb"
-        if ls data.tar.* &>/dev/null; then
-            tar xf data.tar.* -C "${WORKDIR}/root"
+        local data
+        data=$(ls data.tar.* 2>/dev/null | head -1) || true
+        if [ -n "$data" ]; then
+            case "$data" in
+                *.tar.zst) zstd -dcq "$data" | tar xf - -C "${WORKDIR}/root" ;;
+                *)         tar xf "$data" -C "${WORKDIR}/root" ;;
+            esac
         fi
         cd "${WORKDIR}"
         rm -rf "${WORKDIR}/tmp"
