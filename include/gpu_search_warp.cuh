@@ -154,17 +154,6 @@ __device__ void GPUWarpSearch<NY, TopK, REG, Filter>::search(
     // ── main loop ───────────────────────────────────────────────────────
     for (int iter = 0; iter < cfg_.max_iterations; iter++) {
 
-        // ── forgettable hash table reset + re-populate from frontier ────
-        if ((iter + 1) % cfg_.reset_interval == 0) {
-            hf_.init();
-            __syncwarp();
-            for (unsigned i = lane; i < topk_.capacity(); i += BX) {
-                uint32_t node = topk_.id(i);
-                if (node != MAX_INDEX) hf_.insert(node);
-            }
-        }
-        __syncwarp();
-
         // ── merge candidates into topk ──────────────────────────────────
         {
             float    d[REG];
@@ -177,6 +166,17 @@ __device__ void GPUWarpSearch<NY, TopK, REG, Filter>::search(
             }
             topk_.merge(d, x);
         }
+
+        // ── forgettable hash table reset + re-populate from frontier ────
+        if ((iter + 1) % cfg_.reset_interval == 0) {
+            hf_.init();
+            __syncwarp();
+            for (unsigned i = lane; i < topk_.capacity(); i += BX) {
+                uint32_t node = topk_.id(i);
+                if (node != MAX_INDEX) hf_.insert(node);
+            }
+        }
+        __syncwarp();
 
         // ── pick next node to expand ────────────────────────────────────
         uint32_t pbuf[1];

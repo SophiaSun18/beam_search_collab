@@ -171,6 +171,13 @@ class SharedBitonicTopK : private BitonicScratchBase<(BX > 32)>,
      * @param n     Number of elements to write, must be <= topk.
      */
     __device__ void flush(float* dist, uint32_t* idx, unsigned n);
+
+    /**
+     * @brief Rerank all elements using a warp-collaborative distance functor.
+     */
+    template <typename F>
+    __device__ void rerank(F&& f);
+
     /**
      * @brief Number of slots in the buffer.
      */
@@ -370,6 +377,42 @@ __device__ unsigned SharedBitonicTopK<BX, REG>::pick(uint32_t (&out)[PICK_N], un
     }
 
     return (found < n) ? found : n;
+}
+
+// ── rerank ──────────────────────────────────────────────────────────────────
+
+template <unsigned BX, unsigned REG>
+template <typename F>
+__device__ void SharedBitonicTopK<BX, REG>::rerank(F&& f) {
+    const unsigned tid = threadIdx.x;
+
+    for (unsigned i = 0; i < topk; i++) {
+        uint32_t node = topk_idx[i] & ~0x80000000u;
+        float d = (node != 0xFFFFFFFF) ? f(node) : FLT_MAX;
+        if (tid == 0) topk_dist[i] = d;
+    }
+    sync();
+
+    // re-sort descending via bitonic sort on shared memory
+    for (unsigned len = 2; len <= topk; len <<= 1) {
+        for (unsigned stride = len >> 1; stride >= 1; stride >>= 1) {
+            for (unsigned i = tid; i < topk; i += BX) {
+                unsigned partner = i ^ stride;
+                if (partner > i && partner < topk) {
+                    bool desc_block = ((i & len) == 0);
+                    float di = topk_dist[i], dp = topk_dist[partner];
+                    if (desc_block ? (di < dp) : (di > dp)) {
+                        topk_dist[i] = dp; topk_dist[partner] = di;
+                        uint32_t ti = topk_idx[i], tp = topk_idx[partner];
+                        topk_idx[i] = tp; topk_idx[partner] = ti;
+                    }
+                }
+            }
+            sync();
+        }
+    }
+
+    this->set_cursor(topk > 0 ? topk - 1 : 0);
 }
 
 // ── flush ───────────────────────────────────────────────────────────────────

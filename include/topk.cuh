@@ -34,6 +34,10 @@ concept TopKBuffer = requires(
     // Template on output array size: pick<N>(out, n).
     { buf.template pick<REG>(idx, n) } -> std::convertible_to<unsigned>;
 
+    // Also requires: template <typename F> __device__ void rerank(F&& f)
+    // Recomputes distances via warp-collaborative functor f(uint32_t node_id) -> float,
+    // then re-sorts. All lanes must call f in lockstep.
+
     // Write the n smallest elements to dist/idx arrays (e.g. global memory).
     { buf.flush((float*)nullptr, (uint32_t*)nullptr, n) } -> std::same_as<void>;
 

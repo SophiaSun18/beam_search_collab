@@ -3,12 +3,13 @@
         "graph": "data/sift/graph.bin",
         "base":  "data/sift/base.fvecs",
         "query": "data/sift/query.fvecs",
-        "gt":    "data/sift/groundtruth.ivecs"
+        "gt":    "data/sift/groundtruth.ivecs",
+        "codebook": "data/sift/codebook.bin"
     },
     "search": {
         "mode": "bwarp4",
         "K": 100,
-        "topk_size": 128,
+        "topk_size": 256,
         "filter_capacity": 4096,
         "max_iterations": 1024,
         "reset_interval": 64

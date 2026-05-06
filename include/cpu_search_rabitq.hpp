@@ -141,6 +141,8 @@ public:
             }
         }
 
+        for (auto& e : beam)
+            e.dist = l2_exact(e.node);
         std::sort(beam.begin(), beam.end(), beam_sort);
         for (int i = 0; i < K; ++i)
             results[i] = (i < static_cast<int>(beam.size()))

@@ -27,6 +27,7 @@ using json = nlohmann::json;
 static float compute_recall(const vid_t* predicted, const int* groundtruth,
                              size_t nq, int topk, int gt_k) {
     size_t correct = 0;
+    size_t total_dups = 0;
     for (size_t i = 0; i < nq; i++) {
         std::unordered_set<int> gt_set;
         gt_set.reserve(static_cast<size_t>(gt_k));
@@ -37,11 +38,15 @@ static float compute_recall(const vid_t* predicted, const int* groundtruth,
         seen.reserve(static_cast<size_t>(topk));
         for (int j = 0; j < topk; j++) {
             int pred = static_cast<int>(predicted[i * topk + j]);
-            if (!seen.insert(pred).second) continue;
+            if (pred == -1) continue;
+            if (!seen.insert(pred).second) { total_dups++; continue; }
             if (gt_set.count(pred) != 0) correct++;
         }
     }
-    return static_cast<float>(correct) / (nq * topk);
+    if (total_dups > 0)
+        std::cout << "  duplicates: " << total_dups << " total ("
+                  << static_cast<double>(total_dups) / nq << " avg/query)" << std::endl;
+    return static_cast<float>(correct) / (nq * std::min(topk, gt_k));
 }
 
 // ── entry point computation ─────────────────────────────────────────────────
@@ -405,6 +410,7 @@ int main() {
     // allocate results
     vid_t* d_results;
     CUDA_CHECK(cudaMalloc(&d_results, nq * K * sizeof(vid_t)));
+    CUDA_CHECK(cudaMemset(d_results, 0xFF, nq * K * sizeof(vid_t)));
     std::vector<vid_t> h_results(nq * K);
 
     std::cout << "search: mode=" << mode << " K=" << K << std::endl;
@@ -427,7 +433,6 @@ int main() {
         rq_cfg.filter_capacity = js.value("filter_capacity", 1024u);
         rq_cfg.entry_point    = rq_entry;
         rq_cfg.max_iterations = js.value("max_iterations", 1024);
-        rq_cfg.reset_interval = js.value("reset_interval", 16);
 
         run_rabitq<1>(gpu_graph, gpu_rq, rq_cfg, nq, dim, K, d_queries, d_results);
     } else {

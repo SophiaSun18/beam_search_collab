@@ -23,7 +23,6 @@ struct GPURabitqSearchCfg {
     unsigned filter_capacity;
     vid_t    entry_point;
     int      max_iterations;
-    int      reset_interval;
 };
 
 /**
@@ -312,6 +311,30 @@ __device__ void GPURabitqSearch<NY, TopK, REG, Filter>::search(
         }
     }
 
-    // copy results into output field
-    topk_.flush(cand_dist_, results, K);
+    // rerank by exact L2 before returning results
+    topk_.rerank([&](uint32_t node) {
+        return l2_warp(dim, query_buf_, graph_.vect(node).data());
+    });
+
+    // dedup flush: scan buffer from tail (smallest) in warp-wide batches
+    hf_.init();
+    __syncwarp();
+
+    unsigned topk_cap = topk_.capacity();
+    int written = 0;
+    for (unsigned base = topk_cap; base > 0 && written < K; ) {
+        unsigned start = (base >= BX) ? base - BX : 0;
+        unsigned my_pos = start + lane;
+        uint32_t node = (my_pos < base) ? topk_.id(my_pos) : MAX_INDEX;
+        uint32_t ok = (node != MAX_INDEX) ? hf_.insert(node) : 0;
+        uint32_t mask = __ballot_sync(0xffffffff, ok != 0);
+
+        // compact unique nodes into results
+        int count = __popc(mask);
+        int prefix = __popc(mask & ((1u << lane) - 1));
+        if (ok != 0 && written + prefix < K)
+            results[written + prefix] = node;
+        written += count;
+        base = start;
+    }
 }

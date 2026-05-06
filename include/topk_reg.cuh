@@ -63,6 +63,16 @@ public:
     __device__ unsigned pick(uint32_t (&out)[N], unsigned n);
 
     /**
+     * @brief Rerank all elements using a warp-collaborative distance functor.
+     *
+     * For each valid element, broadcasts its node ID to all lanes, calls
+     * f(node_id) (which may use warp-collaborative ops like reductions),
+     * and replaces the stored distance. Then re-sorts descending.
+     */
+    template <typename F>
+    __device__ void rerank(F&& f);
+
+    /**
      * @brief Flush the n smallest elements to memory.
      *
      * Reads from the tail of the descending buffer. Clears MSB marks.
@@ -230,6 +240,34 @@ __device__ unsigned RegBitonicTopK<REGX, REGY>::pick(
     }
 
     return (found < n) ? found : n;
+}
+
+// ── rerank ──────────────────────────────────────────────────────────────────
+
+template <unsigned REGX, unsigned REGY>
+template <typename F>
+__device__ void RegBitonicTopK<REGX, REGY>::rerank(F&& f) {
+    const unsigned lane = threadIdx.x & 31;
+
+    #pragma unroll
+    for (unsigned r = 0; r < REGX; r++) {
+        for (unsigned src = 0; src < 32; src++) {
+            uint32_t node = __shfl_sync(0xffffffff, topk_i_[r], src);
+            uint32_t node_clean = node & ~0x80000000u;
+            float d = (node_clean != 0xFFFFFFFF) ? f(node_clean) : FLT_MAX;
+            if (lane == src)
+                topk_d_[r] = d;
+        }
+    }
+
+    // sort_warp_full produces ascending; negate to get descending
+    #pragma unroll
+    for (unsigned r = 0; r < REGX; r++)
+        topk_d_[r] = -topk_d_[r];
+    sort_warp_full<REGX>(topk_d_, topk_i_);
+    #pragma unroll
+    for (unsigned r = 0; r < REGX; r++)
+        topk_d_[r] = -topk_d_[r];
 }
 
 // ── flush ───────────────────────────────────────────────────────────────────
