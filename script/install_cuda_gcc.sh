@@ -71,7 +71,9 @@ install_gcc() {
         mkdir -p "${WORKDIR}/tmp"
         cd "${WORKDIR}/tmp"
         ar x "$deb"
-        tar xf data.tar.* -C "${WORKDIR}/root"
+        if ls data.tar.* &>/dev/null; then
+            tar xf data.tar.* -C "${WORKDIR}/root"
+        fi
         cd "${WORKDIR}"
         rm -rf "${WORKDIR}/tmp"
     done
