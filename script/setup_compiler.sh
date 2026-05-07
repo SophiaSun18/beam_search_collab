@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Install CUDA toolkit + GCC into ~/.local/ without root.
+# Skips components already installed. Appends env setup to ~/.bashrc.
 # Targets x86_64 Linux. GCC extracted from Ubuntu 24.04 .deb packages.
 #
 # Usage:
-#   bash install_cuda_gcc.sh              # install both
-#   bash install_cuda_gcc.sh --cuda-only  # CUDA only
-#   bash install_cuda_gcc.sh --gcc-only   # GCC only
+#   bash setup_compiler.sh              # install both
+#   bash setup_compiler.sh --cuda-only  # CUDA only
+#   bash setup_compiler.sh --gcc-only   # GCC only
 #
 # Override install prefix:
-#   INSTALL_PREFIX=/opt/local bash install_cuda_gcc.sh
+#   INSTALL_PREFIX=/opt/local bash setup_compiler.sh
 
 set -euo pipefail
 
@@ -43,6 +44,11 @@ require() {
 }
 
 install_cuda() {
+    if [ -x "${PREFIX}/bin/nvcc" ]; then
+        echo "==> CUDA already installed at ${PREFIX}/bin/nvcc, skipping."
+        return
+    fi
+
     require wget
     echo "==> Downloading CUDA toolkit (~5 GB)..."
     wget -c -q --show-progress -O "${WORKDIR}/cuda.run" "$CUDA_RUNFILE_URL"
@@ -57,6 +63,11 @@ install_cuda() {
 }
 
 install_gcc() {
+    if [ -x "${PREFIX}/bin/gcc-${GCC_MAJOR}" ]; then
+        echo "==> GCC ${GCC_MAJOR} already installed at ${PREFIX}/bin/gcc-${GCC_MAJOR}, skipping."
+        return
+    fi
+
     require wget ar tar zstd
     mkdir -p "${WORKDIR}"/{debs,root}
 
@@ -105,6 +116,26 @@ install_gcc() {
     echo "==> GCC ${GCC_MAJOR} installed."
 }
 
+setup_env() {
+    local marker="# setup_compiler.sh"
+    local rcfile="$HOME/.bashrc"
+
+    if grep -qF "$marker" "$rcfile" 2>/dev/null; then
+        echo "==> Environment already configured in ${rcfile}, skipping."
+        return
+    fi
+
+    cat >> "$rcfile" <<EOF
+
+$marker
+export PATH="${PREFIX}/bin:\$PATH"
+export LD_LIBRARY_PATH="${PREFIX}/lib64:${PREFIX}/lib:\${LD_LIBRARY_PATH:-}"
+EOF
+
+    echo "==> Appended PATH and LD_LIBRARY_PATH to ${rcfile}."
+    echo "    Run 'source ~/.bashrc' or start a new shell to activate."
+}
+
 DO_CUDA=1
 DO_GCC=1
 for arg in "$@"; do
@@ -123,20 +154,9 @@ mkdir -p "${PREFIX}"/{bin,lib,share,include}
 
 [ "$DO_CUDA" = 1 ] && install_cuda
 [ "$DO_GCC" = 1 ]  && install_gcc
+setup_env
 
-cat <<DONE
-
-========================================
- Installation complete!
-========================================
-
-Add to your shell profile:
-
-  export PATH="${PREFIX}/bin:\$PATH"
-  export LD_LIBRARY_PATH="${PREFIX}/lib64:${PREFIX}/lib:\${LD_LIBRARY_PATH:-}"
-
-Verify:
-  nvcc --version
-  gcc --version
-
-DONE
+echo ""
+echo "========================================"
+echo " Done! Run 'source ~/.bashrc' to activate."
+echo "========================================"
