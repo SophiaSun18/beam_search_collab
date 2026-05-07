@@ -1,0 +1,14 @@
+{
+    "data": {
+        "graph": "data/gist/codebook.bin",
+        "base":  "data/gist/base.fvecs",
+        "query": "data/gist/query.fvecs",
+        "gt":    "data/gist/groundtruth.ivecs"
+    },
+    "search": {
+        "mode": "rabitq",
+        "K": 100,
+        "beam": 128,
+        "degree": 32
+    }
+}

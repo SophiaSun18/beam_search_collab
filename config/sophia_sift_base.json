@@ -1,0 +1,13 @@
+{
+    "data": {
+        "graph": "data/sift/graph.bin",
+        "base":  "data/sift/base.fvecs",
+        "query": "data/sift/query.fvecs",
+        "gt":    "data/sift/groundtruth.ivecs"
+    },
+    "search": {
+        "mode": "base",
+        "K": 100,
+        "beam": 128
+    }
+}
