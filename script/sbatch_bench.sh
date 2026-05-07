@@ -8,8 +8,8 @@
 #SBATCH -o log/bench.o%j
 #SBATCH -e log/bench.e%j
 
-set -euo pipefail
-source ~/.bashrc
+set +u; source ~/.bashrc; set -u
+set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
