@@ -8,8 +8,12 @@
 #SBATCH -o log/build.o%j
 #SBATCH -e log/build.e%j
 
-set +u; source ~/.bashrc; set -u
 set -eo pipefail
+
+module --force purge
+module load modtree/gpu
+module load cuda/12.8.0
+module load gcc/11.2.0
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
