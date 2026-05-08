@@ -19,6 +19,18 @@ module load cuda/12.8.0
 
 mkdir -p result
 
+# remove stale results with no matching config pair
+for rf in result/*.txt; do
+    [[ -f "$rf" ]] || continue
+    name=$(basename "$rf" .txt)
+    data_name="${name%%__*}"
+    search_name="${name#*__}"
+    if [[ ! -f "config/dataset/${data_name}.json" || ! -f "config/search/${search_name}.json" ]]; then
+        echo "Removing stale result: $rf"
+        rm "$rf"
+    fi
+done
+
 skipped=0
 ran=0
 
