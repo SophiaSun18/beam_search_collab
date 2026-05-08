@@ -415,19 +415,25 @@ template <typename T>
 float compute_recall(const T* predicted, const int* groundtruth,
                      size_t nq, int topk, int gt_k) {
     size_t correct = 0;
-    for (size_t i = 0; i < nq; ++i) {
-        for (int j = 0; j < topk; ++j) {
-            int pred = int(predicted[i * topk + j]);
-            for (int k = 0; k < gt_k; ++k) {
-                int gt = groundtruth[i * gt_k + k];
-                if (pred == gt) {
-                    ++correct;
-                    break;
-                }
-            }
+    size_t total_dups = 0;
+    for (size_t i = 0; i < nq; i++) {
+        std::unordered_set<int> gt_set;
+        gt_set.reserve(static_cast<size_t>(gt_k));
+        for (int k = 0; k < gt_k; k++)
+            gt_set.insert(groundtruth[i * gt_k + k]);
+        std::unordered_set<int> seen;
+        seen.reserve(static_cast<size_t>(topk));
+        for (int j = 0; j < topk; j++) {
+            int pred = static_cast<int>(predicted[i * topk + j]);
+            if (pred == -1) continue;
+            if (!seen.insert(pred).second) { total_dups++; continue; }
+            if (gt_set.count(pred) != 0) correct++;
         }
     }
-    return float(correct) / (nq * topk);
+    if (total_dups > 0)
+        std::cout << "  duplicates: " << total_dups << " total ("
+                  << static_cast<double>(total_dups) / nq << " avg/query)" << std::endl;
+    return static_cast<float>(correct) / (nq * std::min(topk, gt_k));
 }
 
 // Fast Walsh-Hadamard Transform (in-place, power-of-2 B, B >= 8)
