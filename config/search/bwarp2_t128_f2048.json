@@ -1,0 +1,8 @@
+{
+    "mode": "bwarp2",
+    "K": 100,
+    "topk_size": 128,
+    "filter_capacity": 2048,
+    "max_iterations": 1024,
+    "reset_interval": 64
+}
