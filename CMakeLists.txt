@@ -6,7 +6,7 @@ if(NOT DEFINED CMAKE_CUDA_HOST_COMPILER AND EXISTS "${GCC14_ROOT}/bin/g++")
     set(CMAKE_CUDA_HOST_COMPILER "${GCC14_ROOT}/bin/g++")
 endif()
 
-project(beam_search_collab LANGUAGES CXX CUDA)
+project(warpann LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CUDA_STANDARD 20)
