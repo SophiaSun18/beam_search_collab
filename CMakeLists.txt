@@ -14,7 +14,6 @@ set(CMAKE_CUDA_ARCHITECTURES "native" CACHE STRING "CUDA architectures (e.g. 80;
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_INCLUDES 0)
 
-
 # ── Third-party interface libraries ──────────────────────────────────────────
 
 add_library(nlohmann_json INTERFACE)
@@ -24,14 +23,19 @@ find_package(OpenMP REQUIRED COMPONENTS CXX)
 
 # ── CLI targets ──────────────────────────────────────────────────────────────
 
-add_executable(build_graph src/build_graph.cpp)
-target_compile_options(build_graph PRIVATE -O3)
-target_link_libraries(build_graph PRIVATE OpenMP::OpenMP_CXX)
+add_executable(gpu_cli src/gpu_cli.cu src/legacy_sophia.cu)
+target_include_directories(gpu_cli PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR})
+target_link_libraries(gpu_cli PRIVATE nlohmann_json)
+target_compile_options(gpu_cli PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3 --ptxas-options=--warn-on-local-memory-usage>)
 
 add_executable(cpu_cli src/cpu_cli.cpp)
 target_include_directories(cpu_cli PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(cpu_cli PRIVATE nlohmann_json)
 target_compile_options(cpu_cli PRIVATE -O3)
+
+add_executable(build_graph src/build_graph.cpp)
+target_compile_options(build_graph PRIVATE -O3)
+target_link_libraries(build_graph PRIVATE OpenMP::OpenMP_CXX)
 
 add_executable(replicate_queries src/replicate_queries.cpp)
 target_include_directories(replicate_queries PRIVATE ${CMAKE_SOURCE_DIR}/include)
@@ -41,11 +45,6 @@ add_executable(build_rabitq src/build_rabitq.cpp)
 target_include_directories(build_rabitq PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_compile_options(build_rabitq PRIVATE -O3)
 target_link_libraries(build_rabitq PRIVATE OpenMP::OpenMP_CXX)
-
-add_executable(gpu_cli src/gpu_cli.cu src/legacy_sophia.cu)
-target_include_directories(gpu_cli PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR})
-target_link_libraries(gpu_cli PRIVATE nlohmann_json)
-target_compile_options(gpu_cli PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3 --ptxas-options=--warn-on-local-memory-usage>)
 
 # ── Tests ────────────────────────────────────────────────────────────────────
 
@@ -111,6 +110,10 @@ add_test(NAME test_fastscan COMMAND test_fastscan)
 add_executable(prof_filter_hash unittest/prof_filter_hash.cu)
 target_include_directories(prof_filter_hash PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_compile_options(prof_filter_hash PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
+
+add_executable(prof_filter_bloom unittest/prof_filter_bloom.cu)
+target_include_directories(prof_filter_bloom PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_compile_options(prof_filter_bloom PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
 
 add_executable(prof_l2 unittest/prof_l2.cu)
 target_include_directories(prof_l2 PRIVATE ${CMAKE_SOURCE_DIR}/include)
