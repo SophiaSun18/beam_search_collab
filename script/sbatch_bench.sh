@@ -10,12 +10,13 @@
 
 set -eo pipefail
 
-cd "$SLURM_SUBMIT_DIR"
-
-module --force purge
-module load modtree/gpu
-module load gcc/11.2.0
-module load cuda/12.8.0
+if [[ "$1" != "--skip-module-load" ]]; then
+    cd "$SLURM_SUBMIT_DIR"
+    module --force purge
+    module load modtree/gpu
+    module load gcc/11.2.0
+    module load cuda/12.8.0
+fi
 
 mkdir -p result
 
