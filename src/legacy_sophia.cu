@@ -2,6 +2,8 @@
 // All sophia headers and sources inlined into a single compilation unit.
 // Exposes run_sophia(json) for use by the merged gpu_cli.
 
+#pragma nv_diag_suppress 177
+
 // ═══════════════════════════════════════════════════════════════════════
 // ── include/utils.h (inlined) ──
 // ═══════════════════════════════════════════════════════════════════════
