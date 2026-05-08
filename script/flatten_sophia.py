@@ -107,20 +107,7 @@ int run_sophia(const nlohmann::json& j) {
     // strip "sophia_" prefix for internal dispatch
     if (mode.rfind("sophia_", 0) == 0) mode = mode.substr(7);
 
-    std::cout << "========================================\n"
-         << "GPU Beam Search (Sophia)\n"
-         << "========================================\n"
-         << "Mode:    " << mode << "\n"
-         << "Base:    " << base_file << "\n"
-         << "Query:   " << query_file << "\n"
-         << "GT:      " << gt_file << "\n"
-         << "Graph:   " << graph_file << "\n"
-         << "K:       " << K << "\n"
-         << "Beam:    " << beam_size << "\n";
-    if (mode == "rabitq") std::cout << "Degree:  " << degree << "\n";
-    if (!csv_file.empty())    std::cout << "CSV:     " << csv_file << "\n";
-    if (debug_mode)           std::cout << "Debug:   on\n";
-    std::cout << "========================================\n\n";
+    std::cout << "search: mode=sophia_" << mode << " K=" << K << std::endl;
 
     srand(42);
 
@@ -172,28 +159,10 @@ int run_sophia(const nlohmann::json& j) {
         return 1;
     }
 
-    double qps = nq / elapsed;
-    double latency_ms = elapsed / nq * 1000;
+    std::cout << "  time: " << elapsed * 1000.0 << " ms"
+              << "  qps: " << nq / elapsed << std::endl;
     float recall = compute_recall(results.data(), groundtruth.data(), nq, K, gt_k);
-
-    std::cout << "\n========================================\n"
-         << "Results\n"
-         << "========================================\n"
-         << "Total time:  " << elapsed * 1000 << " ms\n"
-         << "Throughput:  " << qps << " queries/sec\n"
-         << "Avg latency: " << latency_ms << " ms/query\n"
-         << "Recall@" << K << ":   " << recall << "\n"
-         << "========================================\n";
-
-    gpu_stats.common.runtime = elapsed;
-    gpu_stats.common.latency = latency_ms;
-    gpu_stats.common.throughput = qps;
-    gpu_stats.common.recall = recall;
-
-    if (!csv_file.empty()) {
-        append_gpu_stats_to_csv(csv_file, K, beam_size, gpu_stats);
-        std::cout << "Saved GPU stats CSV row to: " << csv_file << "\n";
-    }
+    std::cout << "recall@" << K << ": " << recall << std::endl;
 
     return 0;
 }
