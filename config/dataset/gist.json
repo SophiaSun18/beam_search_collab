@@ -1,0 +1,7 @@
+{
+    "graph":    "data/gist/graph.bin",
+    "base":     "data/gist/base.fvecs",
+    "query":    "data/gist/query.fvecs",
+    "gt":       "data/gist/groundtruth.ivecs",
+    "codebook": "data/gist/codebook.bin"
+}

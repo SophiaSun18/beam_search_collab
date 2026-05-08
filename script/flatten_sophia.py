@@ -84,42 +84,28 @@ def process_source(text, path=""):
         result = "#undef USE_TENSOR_RABITQ\n#define USE_TENSOR_RABITQ 0\n" + result
     return result
 
-JSON_MAIN = r'''
-// ── JSON stdin CLI (replaces original argv parser) ─────────────────────────
+RUN_SOPHIA = r'''
+// ── run_sophia(): entry point callable from merged gpu_cli ─────────────────
 
 #include <nlohmann/json.hpp>
-using json = nlohmann::json;
 
-int main() {
-    json j;
-    try {
-        j = json::parse(std::cin, nullptr, true, true);
-    } catch (const json::parse_error& e) {
-        std::cerr << "JSON parse error: " << e.what() << std::endl;
-        return 1;
-    }
-
-    if (!j.contains("data")) {
-        std::cerr << "Missing \"data\" key" << std::endl;
-        return 1;
-    }
-    auto& jd = j["data"];
+int run_sophia(const nlohmann::json& j) {
+    auto& jd = j.at("data");
     std::string base_file  = jd.at("base");
     std::string query_file = jd.at("query");
     std::string gt_file    = jd.at("gt");
     std::string graph_file = jd.at("graph");
 
-    if (!j.contains("search")) {
-        std::cerr << "Missing \"search\" key" << std::endl;
-        return 1;
-    }
-    auto& js = j["search"];
+    auto& js = j.at("search");
     std::string mode    = js.at("mode");
     int K               = js.value("K", 100);
     int beam_size       = js.value("beam", 128);
     int degree          = js.value("degree", 32);
     std::string csv_file = js.value("csv", "");
     bool debug_mode     = js.value("debug", false);
+
+    // strip "sophia_" prefix for internal dispatch
+    if (mode.rfind("sophia_", 0) == 0) mode = mode.substr(7);
 
     std::cout << "========================================\n"
          << "GPU Beam Search (Sophia)\n"
@@ -182,7 +168,7 @@ int main() {
         qg.gpu_search(static_cast<int>(nq), queries.data(), K, distances.data(), results.data(), beam_size, elapsed, &gpu_stats, debug_mode);
 
     } else {
-        std::cerr << "Unknown mode: " << mode << "\n";
+        std::cerr << "Unknown sophia mode: " << mode << "\n";
         return 1;
     }
 
@@ -215,9 +201,9 @@ int main() {
 
 def main():
     parts = []
-    parts.append("// gpu_cli_sophia.cu — Flattened from sophia branch")
+    parts.append("// legacy_sophia.cu — Flattened from sophia branch")
     parts.append("// All sophia headers and sources inlined into a single compilation unit.")
-    parts.append("// CLI reads JSON config from stdin.\n")
+    parts.append("// Exposes run_sophia(json) for use by the merged gpu_cli.\n")
 
     # Emit headers in dependency order — keep system includes in their original context
     for path in HEADERS_IN_ORDER:
@@ -265,9 +251,9 @@ static __host__ inline uint32_t calculate_shared_mem_size_tensor(int, int, int, 
 
     # Emit the JSON main
     parts.append("// ═══════════════════════════════════════════════════════════════════════")
-    parts.append("// ── JSON stdin CLI ──")
+    parts.append("// ── run_sophia() entry point ──")
     parts.append("// ═══════════════════════════════════════════════════════════════════════")
-    parts.append(JSON_MAIN)
+    parts.append(RUN_SOPHIA)
 
     print('\n'.join(parts))
 

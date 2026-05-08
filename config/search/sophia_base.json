@@ -1,0 +1,5 @@
+{
+    "mode": "sophia_base",
+    "K": 100,
+    "beam": 128
+}

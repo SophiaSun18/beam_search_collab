@@ -42,15 +42,10 @@ target_include_directories(build_rabitq PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_compile_options(build_rabitq PRIVATE -O3)
 target_link_libraries(build_rabitq PRIVATE OpenMP::OpenMP_CXX)
 
-add_executable(gpu_cli src/gpu_cli.cu)
-target_include_directories(gpu_cli PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_executable(gpu_cli src/gpu_cli.cu src/legacy_sophia.cu)
+target_include_directories(gpu_cli PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR})
 target_link_libraries(gpu_cli PRIVATE nlohmann_json)
 target_compile_options(gpu_cli PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3 --ptxas-options=--warn-on-local-memory-usage>)
-
-add_executable(gpu_cli_sophia src/gpu_cli_sophia.cu)
-target_include_directories(gpu_cli_sophia PRIVATE ${CMAKE_SOURCE_DIR})
-target_link_libraries(gpu_cli_sophia PRIVATE nlohmann_json)
-target_compile_options(gpu_cli_sophia PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
 
 # ── Tests ────────────────────────────────────────────────────────────────────
 

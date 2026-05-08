@@ -1,0 +1,7 @@
+{
+    "graph":    "data/sift/graph.bin",
+    "base":     "data/sift/base.fvecs",
+    "query":    "data/sift/query.fvecs",
+    "gt":       "data/sift/groundtruth.ivecs",
+    "codebook": "data/sift/codebook.bin"
+}

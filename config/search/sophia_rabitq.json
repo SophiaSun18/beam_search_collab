@@ -1,0 +1,6 @@
+{
+    "mode": "sophia_rabitq",
+    "K": 100,
+    "beam": 128,
+    "degree": 32
+}

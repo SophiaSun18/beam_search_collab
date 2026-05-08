@@ -13,6 +13,7 @@
 #include "gpu_search_base.cuh"
 #include "gpu_search_warp.cuh"
 #include "gpu_search_rabitq.cuh"
+#include "legacy_sophia.cuh"
 
 using json = nlohmann::json;
 
@@ -357,6 +358,13 @@ int main() {
     } catch (const json::parse_error& e) {
         std::cerr << "JSON parse error: " << e.what() << std::endl;
         return 1;
+    }
+
+    // ── sophia legacy modes ─────────────────────────────────────────────
+    {
+        std::string mode = j.value("/search/mode"_json_pointer, "");
+        if (mode.rfind("sophia_", 0) == 0)
+            return run_sophia(j);
     }
 
     // ── data config ─────────────────────────────────────────────────────
