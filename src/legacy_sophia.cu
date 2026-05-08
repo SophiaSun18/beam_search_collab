@@ -4653,6 +4653,11 @@ void BeamSearch(
     // loop end condition: either entire topK expanded, or reach max iteration limit
     for (int iter = 0; iter < MAX_ITERATIONS; iter++) {
 
+        // use warp level sort to find the actual closest top K elements and update the topK list
+        topk_by_sort_candidates_and_merge<2, INTERNAL_TOPK / WARP_SIZE>(ALL_INDEX, ALL_DISTANCE, RESULT_BUFFER_SIZE,
+            CANDIDATE_BUFFER_SIZE, INTERNAL_TOPK, (iter == 0));
+        __syncthreads();
+
         // forgettable hash table management according to the CARGA paper
         if (HASH_TABLE_CONFIG) {
             if ((iter + 1) % SMALL_HASH_RESET_INTERVAL == 0) {
@@ -4662,32 +4667,6 @@ void BeamSearch(
             }
             __syncthreads();
         }
-      
-        // use warp level sort to find the actual closest top K elements and update the topK list
-        topk_by_sort_candidates_and_merge<2, INTERNAL_TOPK / WARP_SIZE>(ALL_INDEX, ALL_DISTANCE, RESULT_BUFFER_SIZE,
-            CANDIDATE_BUFFER_SIZE, INTERNAL_TOPK, (iter == 0));
-        __syncthreads();
-
-        if (debug_mode && query_id == 0 && tid == 0) {
-            printf("[DEBUG] iteration %d\n", iter + 1);
-            printf("  beam state:\n");
-            for (int i = 0; i < INTERNAL_TOPK; ++i) {
-                const INDEX_T raw = TOP_K_INDEX[i];
-                const bool expanded = (raw & 0x80000000u) != 0;
-                printf("    idx=%d, node=%u, dist=%.6f, expanded=%s\n",
-                       i,
-                       raw & 0x7fffffff,
-                       TOP_K_DISTANCE[i],
-                       expanded ? "true" : "false");
-            }
-            printf("  candidate buffer:\n");
-            for (int i = 0; i < CANDIDATE_BUFFER_SIZE; ++i) {
-                printf("    idx=%d, node=%u, dist=%.6f\n",
-                       i,
-                       CANDIDATE_INDEX[i] & 0x7fffffff,
-                       CANDIDATE_DISTANCE[i]);
-            }
-        }
 
         // warp 0 pick the top-N unexpanded nodes and store in shared memory
         // this already marks the expanded nodes MSB to 1, no need to mark again
@@ -4695,19 +4674,7 @@ void BeamSearch(
             keep_expanding = pick_expanders(SEARCH_WIDTH, PARENT_LIST, INTERNAL_TOPK, TOP_K_INDEX);
         }
         __syncthreads();
-        if (debug_mode && query_id == 0 && tid == 0) {
-            const INDEX_T parent_slot = PARENT_LIST[0];
-            const INDEX_T parent_raw =
-                (keep_expanding && parent_slot < INTERNAL_TOPK) ? TOP_K_INDEX[parent_slot] : MAX_INDEX;
-            const DISTANCE_T parent_dist =
-                (keep_expanding && parent_slot < INTERNAL_TOPK) ? TOP_K_DISTANCE[parent_slot] : FLT_MAX;
-            if (keep_expanding) {
-                printf("  expanding node: %u\n", parent_raw & 0x7fffffff);
-                printf("  expanding slot: %u, dist=%.6f\n", parent_slot, parent_dist);
-            } else {
-                printf("  expanding node: none\n");
-            }
-        }
+
         if (!keep_expanding) {
             if (tid == 0) {
                 hops[0] = iter;

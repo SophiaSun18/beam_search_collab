@@ -157,17 +157,6 @@ __device__ void GPUBaseSearch<BX, TopK, REG, Filter>::search(
     // ── main loop ───────────────────────────────────────────────────────
     for (int iter = 0; iter < cfg_.max_iterations; iter++) {
 
-        // ── forgettable hash table reset + re-populate from frontier ────
-        if ((iter + 1) % cfg_.reset_interval == 0) {
-            hf_.init();
-            __syncthreads();
-            for (unsigned i = tid; i < topk_.capacity(); i += BX) {
-                uint32_t node = topk_.id(i);
-                if (node != MAX_INDEX) hf_.insert(node);
-            }
-        }
-        __syncthreads();
-
         // ── merge candidates into topk ──────────────────────────────────
         {
             float    d[REG];
@@ -180,6 +169,17 @@ __device__ void GPUBaseSearch<BX, TopK, REG, Filter>::search(
             }
             topk_.merge(d, x);
         }
+
+        // ── forgettable hash table reset + re-populate from frontier ────
+        if ((iter + 1) % cfg_.reset_interval == 0) {
+            hf_.init();
+            __syncthreads();
+            for (unsigned i = tid; i < topk_.capacity(); i += BX) {
+                uint32_t node = topk_.id(i);
+                if (node != MAX_INDEX) hf_.insert(node);
+            }
+        }
+        __syncthreads();
 
         // ── pick next node to expand ────────────────────────────────────
         {
