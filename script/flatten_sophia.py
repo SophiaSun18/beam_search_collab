@@ -141,7 +141,7 @@ int run_sophia(const nlohmann::json& j) {
         int query_dim = 0;
         queries = IndexGraph<float>::load_queries(query_file.c_str(), nq, query_dim);
         if (debug_mode) { std::cout << "[DEBUG] running only query 0\n"; nq = std::min<size_t>(nq, 1); }
-        if (nq > 10000) { std::cout << "Limiting queries to 10000\n"; nq = 10000; }
+
 
         size_t gt_nq = 0;
         groundtruth = IndexGraph<float>::load_groundtruth(gt_file.c_str(), gt_nq, gt_k);
@@ -157,7 +157,7 @@ int run_sophia(const nlohmann::json& j) {
         int query_dim = 0;
         queries = IndexGraph<float>::load_queries(query_file.c_str(), nq, query_dim);
         if (debug_mode) { std::cout << "[DEBUG] running only query 0\n"; nq = std::min<size_t>(nq, 1); }
-        if (nq > 10000) { std::cout << "Limiting queries to 10000\n"; nq = 10000; }
+
 
         size_t gt_nq = 0;
         groundtruth = IndexGraph<float>::load_groundtruth(gt_file.c_str(), gt_nq, gt_k);
