@@ -14,6 +14,7 @@ Options:
   --beam-width <int>   Graph build beam width (default: 128)
   --alpha <float>      Vamana pruning alpha (default: 2.0)
   --seed <int>         Random seed (default: 1234)
+  --replicate <int>    Tile queries/gt N times (default: 10)
   --skip-graph         Skip graph building
   --skip-codebook      Skip codebook building
   --help               Show this help
@@ -32,6 +33,7 @@ DEGREE=32
 BEAM_WIDTH=128
 ALPHA=2.0
 SEED=1234
+REPLICATE=10
 SKIP_GRAPH=false
 SKIP_CODEBOOK=false
 
@@ -49,6 +51,7 @@ while [[ $# -gt 0 ]]; do
         --beam-width)  BEAM_WIDTH="$2"; shift 2 ;;
         --alpha)       ALPHA="$2";      shift 2 ;;
         --seed)        SEED="$2";       shift 2 ;;
+        --replicate)   REPLICATE="$2"; shift 2 ;;
         --skip-graph)  SKIP_GRAPH=true; shift ;;
         --skip-codebook) SKIP_CODEBOOK=true; shift ;;
         --help)        echo "$USAGE"; exit 0 ;;
@@ -122,6 +125,19 @@ else
         -out "$CODEBOOK_FILE" \
         -seed "$SEED"
     echo "Codebook saved to $CODEBOOK_FILE"
+fi
+
+# ── Step 5: Replicate queries/groundtruth ────────────────────────────────────
+if [[ "$REPLICATE" -gt 0 ]]; then
+    QUERY_REP="$DATA_DIR/query_${REPLICATE}x.fvecs"
+    GT_REP="$DATA_DIR/groundtruth_${REPLICATE}x.ivecs"
+    if [[ -f "$QUERY_REP" && -f "$GT_REP" ]]; then
+        echo "Replicated files already exist: ${REPLICATE}x"
+    else
+        echo "Replicating queries & groundtruth ${REPLICATE}x ..."
+        "$ROOT/build/replicate_queries" "$DATA_DIR/query.fvecs"        "$QUERY_REP" "$REPLICATE" fvecs
+        "$ROOT/build/replicate_queries" "$DATA_DIR/groundtruth.ivecs"  "$GT_REP"    "$REPLICATE" ivecs
+    fi
 fi
 
 # ── Done ──────────────────────────────────────────────────────────────────────
