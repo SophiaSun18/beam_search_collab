@@ -4,5 +4,5 @@
     "topk_size": 128,
     "filter_capacity": 4096,
     "max_iterations": 1024,
-    "reset_interval": 128
+    "reset_interval": 32
 }
