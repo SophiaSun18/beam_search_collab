@@ -1,0 +1,2 @@
+- [No sort-then-reverse for bitonic halves](feedback_bitonic_no_sort_reverse.md) — keep kept half in correct order upfront, don't sort+reverse in loop
+- [Keep interfaces minimal](feedback_minimal_interface.md) — 3 methods max, self-contained structs, communicate early if confused

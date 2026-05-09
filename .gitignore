@@ -1,0 +1,19 @@
+# ignore local dataset directory
+bin/
+collect-result/
+csv/
+result/
+profile_result/
+data/
+scripts/
+build/
+
+*.log
+*.out
+*.csv
+*.txt
+!CMakeLists.txt
+
+*benchmark*
+*ncu*
+*profile*

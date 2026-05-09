@@ -1,0 +1,8 @@
+{
+    "mode": "warp2",
+    "K": 100,
+    "topk_size": 128,
+    "filter_capacity": 8192,
+    "max_iterations": 1024,
+    "reset_interval": 256
+}

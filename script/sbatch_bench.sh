@@ -1,0 +1,57 @@
+#!/bin/bash
+#SBATCH -p gpu
+#SBATCH --gpus-per-node=1
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --time=01:00:00
+#SBATCH -J warpann-bench
+#SBATCH -o %x.o%j
+#SBATCH -e %x.e%j
+
+set -eo pipefail
+
+if [[ "$1" != "--skip-module-load" ]]; then
+    cd "$SLURM_SUBMIT_DIR"
+    module --force purge
+    module load modtree/gpu
+    module load gcc/11.2.0
+    module load cuda/12.8.0
+fi
+
+mkdir -p result
+
+# remove stale results with no matching config pair
+for rf in result/*.txt; do
+    [[ -f "$rf" ]] || continue
+    name=$(basename "$rf" .txt)
+    data_name="${name%%__*}"
+    search_name="${name#*__}"
+    if [[ ! -f "config/dataset/${data_name}.json" || ! -f "config/search/${search_name}.json" ]]; then
+        echo "Removing stale result: $rf"
+        rm "$rf"
+    fi
+done
+
+skipped=0
+ran=0
+
+for data_cfg in config/dataset/*.json; do
+    data_name=$(basename "$data_cfg" .json)
+    for search_cfg in config/search/*.json; do
+        search_name=$(basename "$search_cfg" .json)
+        result_file="result/${data_name}__${search_name}.txt"
+        if [[ -s "$result_file" ]]; then
+            skipped=$((skipped + 1))
+            continue
+        fi
+        echo "========================================"
+        echo "Data: $data_name  Search: $search_name"
+        echo "========================================"
+        jq -s '{data: .[0], search: .[1]}' "$data_cfg" "$search_cfg" \
+            | ./build/gpu_cli 2>&1 | tee "$result_file"
+        ran=$((ran + 1))
+        echo ""
+    done
+done
+
+echo "==> Done. Ran: $ran  Skipped: $skipped"

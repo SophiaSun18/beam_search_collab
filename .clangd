@@ -1,0 +1,15 @@
+CompileFlags:
+  Remove:
+    - "-forward-unknown-to-host-compiler"
+    - "--options-file*"
+    - "--generate-code*"
+    - "--ptxas-options*"
+    - "-Xfatbin*"
+    - "-gencode*"
+    - "--expt-extended-lambda"
+    - "--expt-relaxed-constexpr"
+  Add:
+    - "--cuda-path=/opt/cuda"
+    - "--cuda-gpu-arch=sm_89"
+    - "-xcuda"
+  CompilationDatabase: build/
