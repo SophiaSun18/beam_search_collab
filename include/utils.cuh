@@ -1286,6 +1286,18 @@ static __device__ __forceinline__ uint8_t fastscan_decode_code_gpu(
                         : static_cast<uint8_t>(packed >> 4);
 }
 
+static __device__ __forceinline__ uint8_t fastscan_decode_code_for_neighbor_gpu(
+    const uint8_t* packed_codes_block, int neighbor_idx, int codebook_idx) {
+  const int pair_idx = codebook_idx >> 1;
+  const int nibble_group = codebook_idx & 1;
+  const int neighbor_mod16 = neighbor_idx & 15;
+  const int byte_idx = fastscan_lane_pack_index(neighbor_mod16);
+  const uint8_t packed =
+      packed_codes_block[pair_idx * 32 + nibble_group * 16 + byte_idx];
+  return (neighbor_idx < 16) ? static_cast<uint8_t>(packed & 0x0f)
+                             : static_cast<uint8_t>(packed >> 4);
+}
+
 static __device__ inline void pack_lut_gpu(
     int dim, const uint8_t* __restrict__ quantized_query, uint8_t* __restrict__ lut) {
   const int tid = threadIdx.x;
@@ -1328,4 +1340,25 @@ static __device__ inline void scan_all_neighbors_32_gpu(
   est_dist += factor_dq[lane_id] * qf.width * result_float;
   est_dist += factor_vq[lane_id] * qf.low_val;
   appro_dist[lane_id] = est_dist;
+}
+
+static __device__ inline DISTANCE_T scan_one_neighbor_warp_gpu(
+    const QueryFactors& qf, const uint8_t* packed_codes_block, int neighbor_idx,
+    float exact_dist, int padded_dim) {
+  const int lane_id = threadIdx.x & (WARP_SIZE - 1);
+  const int num_codebook = padded_dim >> 2;
+  uint32_t local_raw_sum = 0;
+
+  for (int cb = lane_id; cb < num_codebook; cb += WARP_SIZE) {
+    const uint8_t code = fastscan_decode_code_for_neighbor_gpu(packed_codes_block, neighbor_idx, cb);
+    local_raw_sum += static_cast<uint32_t>(qf.lut[(cb << 4) + code]);
+  }
+
+  for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+    local_raw_sum += __shfl_down_sync(FULL_MASK, local_raw_sum, offset);
+  }
+
+  if (lane_id != 0) return 0.0f;
+
+  return static_cast<float>((static_cast<int32_t>(local_raw_sum) << 1) - qf.sum_q);
 }
