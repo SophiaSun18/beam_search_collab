@@ -10,8 +10,8 @@ enum MetricType { METRIC_L2, METRIC_IP };
 
 inline MetricType g_metric_type = METRIC_L2;
 
-inline constexpr std::array<std::string_view, 2> kIpMetricDatasets = {
-    "text2image",
+inline constexpr std::array<std::string_view, 1> kIpMetricDatasets = {
+    "text2image1m",
 };
 
 inline MetricType infer_metric_from_dataset_path(const std::string& path) {

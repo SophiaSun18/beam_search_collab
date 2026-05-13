@@ -11,8 +11,8 @@
 #define SEARCH_WIDTH    1     // MAX: 2 nodes * 32 degree = 64 neighbors = CANDIDATE_BUFFER_SIZE
 // #define BITLEN          GPU_HASH_BITLEN_FOR_TOPK(INTERNAL_TOPK)
 #define MAX_ITERATIONS (1 << 15)
-#define TEAM_SIZE       8
-#define HASH_TABLE_CONFIG   1
+// #define TEAM_SIZE       8
+// #define HASH_TABLE_CONFIG   1
 #define CANDIDATE_BUFFER_SIZE 64
 #define FILL_WARP_COUNT (BLOCK_SIZE / WARP_SIZE)
 // #define RESULT_BUFFER_SIZE (INTERNAL_TOPK + CANDIDATE_BUFFER_SIZE)
@@ -53,7 +53,7 @@ static __device__ inline void staged_copy_async_finish_or_sync() {
 }
 
 static __host__ inline uint32_t calculate_shared_mem_size(int dim, int beam_sz, int result_k,
-                                                           int max_deg, int search_width, int bitlen) {
+                                                           int max_deg, int bitlen) {
     auto align_up = [](size_t value, size_t alignment) {
         return (value + alignment - 1) & ~(alignment - 1);
     };
@@ -64,7 +64,7 @@ static __host__ inline uint32_t calculate_shared_mem_size(int dim, int beam_sz, 
     size += hashtable_getsize(bitlen) * sizeof(INDEX_T);    // hash table
     size += result_buffer_size * sizeof(INDEX_T);           // top k and candidate index
     size += result_buffer_size * sizeof(DISTANCE_T);        // top k and candidate distance
-    size += search_width * sizeof(INDEX_T);                 // next expanders / parent buffer
+    size += SEARCH_WIDTH * sizeof(INDEX_T);                 // next expanders / parent buffer
     size += dim * 4;                                        // query buffer size
     size += padded_dim * sizeof(float);                     // rotated query
     size += padded_dim * sizeof(uint8_t);                   // quantized query
@@ -201,11 +201,11 @@ void QuantizedBeamSearch(
     }
 
     // initialize the hash table to record expanded nodes
-    if (HASH_TABLE_CONFIG) hashtable_init(HASH_TABLE, bitlen);
+    hashtable_init(HASH_TABLE, bitlen);
 
     // load query into shared memory
     for (int i = tid; i < dim; i += blockDim.x) {
-        if (i < dim) QUERY_BUFFER[i] = query[i];
+        QUERY_BUFFER[i] = query[i];
     }
     
     // load the top k list and candidate list with dummy initial values
@@ -251,14 +251,12 @@ void QuantizedBeamSearch(
     for (int iter = 0; iter < MAX_ITERATIONS; iter++) {
 
         // forgettable hash table management according to the CARGA paper
-        if (HASH_TABLE_CONFIG) {
-            if ((iter + 1) % SMALL_HASH_RESET_INTERVAL == 0) {
-                hashtable_init(HASH_TABLE, bitlen);
-                __syncthreads();
-                hashtable_restore_expand_only(HASH_TABLE, bitlen, TOP_K_INDEX, beam_sz);
-            }
+        if ((iter + 1) % SMALL_HASH_RESET_INTERVAL == 0) {
+            hashtable_init(HASH_TABLE, bitlen);
             __syncthreads();
+            hashtable_restore_expand_only(HASH_TABLE, bitlen, TOP_K_INDEX, beam_sz);
         }
+        __syncthreads();
 
         // use warp level sort to find the actual closest top K elements and update the topK list
         gpu_long_t sort_start = 0;
@@ -567,7 +565,6 @@ void QuantizedBeamSearch(
     }
     __syncthreads();
 
-#if GPU_RABITQ_FINAL_FILLUP
     if (result_pool_size[0] < static_cast<uint32_t>(K)) {
         const uint32_t base_pool_size = result_pool_size[0];
         for (uint32_t parent_idx = 0; parent_idx < base_pool_size; ++parent_idx) {
@@ -661,7 +658,6 @@ void QuantizedBeamSearch(
         }
         __syncthreads();
     }
-#endif
 
     if (tid == 0) {
 
@@ -704,7 +700,4 @@ void QuantizedBeamSearch(
     }
 
     (void)d_qg_signs;
-    (void)npoints;
-    (void)code_offset;
-    (void)factor_offset;
 }
