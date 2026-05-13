@@ -18,6 +18,9 @@
 
 static __host__ inline uint32_t calculate_shared_mem_size(int dim, int beam_sz, int max_deg,
                                                            int search_width, int bitlen) {
+    auto align_up = [](size_t value, size_t alignment) {
+        return (value + alignment - 1) & ~(alignment - 1);
+    };
     const size_t result_buffer_size = static_cast<size_t>(beam_sz) + CANDIDATE_BUFFER_SIZE;
     size_t size = 0;    
     size += hashtable_getsize(bitlen) * sizeof(INDEX_T);    // hash table
@@ -31,6 +34,7 @@ static __host__ inline uint32_t calculate_shared_mem_size(int dim, int beam_sz, 
     }
     size += beam_sz * sizeof(INDEX_T);                      // merged topk scratch index
     size += beam_sz * sizeof(DISTANCE_T);                   // merged topk scratch distance
+    size = align_up(size, alignof(gpu_long_t));             // align timing stats
     size += GPU_TIMING_COUNT * sizeof(gpu_long_t);          // timing stats
     printf("shared memory size: %ld\n", size);
     return size;
@@ -91,7 +95,10 @@ void BeamSearch(
     uint32_t* stats = hops + 1;
     INDEX_T* MERGED_TOPK_INDEX = reinterpret_cast<INDEX_T*>(stats + (GPU_SEARCH_STATS ? GPU_SEARCH_STAT_COUNT : 0));
     DISTANCE_T* MERGED_TOPK_DISTANCE = reinterpret_cast<DISTANCE_T*>(MERGED_TOPK_INDEX + beam_sz);
-    gpu_long_t* timing = reinterpret_cast<gpu_long_t*>(MERGED_TOPK_DISTANCE + beam_sz);
+    char* timing_base = reinterpret_cast<char*>(MERGED_TOPK_DISTANCE + beam_sz);
+    timing_base = reinterpret_cast<char*>((reinterpret_cast<uintptr_t>(timing_base) + alignof(gpu_long_t) - 1) &
+                                          ~(static_cast<uintptr_t>(alignof(gpu_long_t)) - 1));
+    gpu_long_t* timing = reinterpret_cast<gpu_long_t*>(timing_base);
 
     // initialize the block-wise total distance computation count
     __shared__ uint32_t keep_expanding;
