@@ -27,11 +27,7 @@ static vid_t compute_gpu_base_entry_point(const float* data, size_t npoints, siz
   float best_dist = FLT_MAX;
   for (size_t i = 0; i < npoints; ++i) {
     const float* row = data + i * dim;
-    float dist = 0.0f;
-    for (size_t d = 0; d < dim; ++d) {
-      const float diff = row[d] - centroid[d];
-      dist += diff * diff;
-    }
+    float dist = compute_distance(static_cast<int>(dim), row, centroid.data());
     if (dist < best_dist) {
       best_dist = dist;
       best = static_cast<vid_t>(i);
@@ -48,7 +44,9 @@ void IndexGraph<T>::search(int nq, const T* queries, int K, T *result_vec, vid_t
   auto max_degree = this->maxDeg;
   auto beam_size = beam_sz;
   auto bitlen = GPU_HASH_BITLEN_FOR_TOPK(beam_size);
+  const bool use_ip = (this->metric == METRIC_IP);
   printf("Beam search on GPU: K=%d, nq=%d, dim=%d, npoints=%ld, beam_size=%d, internal_topk=%d\n", K, nq, dim, npoints, beam_size, INTERNAL_TOPK);
+  printf("Metric: %s\n", metric_name(this->metric));
 
   size_t num_threads = BLOCK_SIZE;
   size_t num_blocks = GPU_DISTANCE_TIMING ? 1 : nq;
@@ -135,7 +133,7 @@ void IndexGraph<T>::search(int nq, const T* queries, int K, T *result_vec, vid_t
   printf("\nStarting GPU beam search...\n");
   auto start = std::chrono::high_resolution_clock::now();
   BeamSearch<T><<<num_blocks, num_threads, shm_size>>>(K, nq, dim, beam_size, bitlen, npoints, d_queries, d_data, d_results, 
-                                                         d_total_stats, d_total_timing, d_starting_points, d_seed_map, d_sign_bit, gg, debug_mode);
+                                                         d_total_stats, d_total_timing, d_starting_points, d_seed_map, d_sign_bit, gg, use_ip, debug_mode);
   CUDA_SAFE_CALL(cudaGetLastError());
   cudaDeviceSynchronize();
   auto end = std::chrono::high_resolution_clock::now();

@@ -358,6 +358,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    g_metric_type = infer_metric_from_dataset_path(base_file);
+    cout << "Metric: " << metric_name(g_metric_type) << "\n";
+
     // load all input data
     size_t n_base, dim_base;
     size_t n_query, dim_query;

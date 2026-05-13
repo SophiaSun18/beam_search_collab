@@ -8,6 +8,7 @@
 
 #include "include/index.hpp"
 #include "include/qg.hpp"
+#include "include/metric.hpp"
 #include "include/utils.h"
 #include "include/search_bitonic.cuh"
 using namespace std;
@@ -68,6 +69,8 @@ int main(int argc, char** argv) {
     cout << "Data file: " << data_file << "\n";
     cout << "Query file: " << query_file << "\n";
     cout << "Ground truth: " << gt_file << "\n";
+    g_metric_type = infer_metric_from_dataset_path(data_file);
+    cout << "Metric: " << metric_name(g_metric_type) << "\n";
     
     // Initialize the random seed
     srand(42);
@@ -131,6 +134,7 @@ int main(int argc, char** argv) {
         IndexGraph<float> index;
         index.load_graph_index(graph_prefix);
         index.load_data(data_file);
+        index.metric = g_metric_type;
 
         int query_dim = 0;
         queries = IndexGraph<float>::load_queries(query_file, nq, query_dim);
@@ -164,11 +168,6 @@ int main(int argc, char** argv) {
             cout << "[DEBUG] debug mode enabled: running only query 0\n";
             nq = std::min<size_t>(nq, 1);
         }
-        if (nq > 10000) {
-            cout << "Limiting queries to 10000\n";
-            nq = 10000;
-        }
-
         size_t gt_nq = 0;
         groundtruth = IndexGraph<float>::load_groundtruth(gt_file, gt_nq, gt_k);
         groundtruth = vector<int>(
@@ -263,11 +262,6 @@ int main(int argc, char** argv) {
             cout << "[DEBUG] debug mode enabled: running only query 0\n";
             nq = std::min<size_t>(nq, 1);
         }
-        if (nq > 10000) {
-            cout << "Limiting queries to 10000\n";
-            nq = 10000;
-        }
-
         size_t gt_nq = 0;
         groundtruth = IndexGraph<float>::load_groundtruth(gt_file, gt_nq, gt_k);
         groundtruth = vector<int>(
@@ -285,6 +279,7 @@ int main(int argc, char** argv) {
         distances.resize(nq * K);
 
         QuantizationGraph qg(index.ntotal, index.d, degree, qg_codebook);
+        qg.set_metric(g_metric_type);
         qg.gpu_search(static_cast<int>(nq), queries.data(), K, distances.data(), results.data(), beam_size, elapsed, &gpu_stats, debug_mode);
     } else {
         cerr << "Unknown mode: " << mode << "\n";

@@ -436,6 +436,8 @@ public:
     inline size_t get_dim() const { return dim_; }
     inline int get_padded_dim() const { return padded_dim_; }
     inline int get_degree() const { return degree_; }
+    inline MetricType get_metric() const { return metric_; }
+    inline void set_metric(MetricType metric) { metric_ = metric; }
 
     inline size_t get_code_offset() const { return code_offset_; }
     inline size_t get_factor_offset() const { return factor_offset_; }
@@ -514,4 +516,5 @@ private:
     uint64_t* codes_and_factors_ = nullptr;
     vidType* graph_edges_ = nullptr;
     float* signs_ptr_ = nullptr;
+    MetricType metric_ = METRIC_L2;
 };

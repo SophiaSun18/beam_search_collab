@@ -5,11 +5,10 @@
 #include <cassert>
 #include <cstdint>
 #include <string>
+#include "metric.hpp"
 #include "utils.h"
 
 typedef uint32_t vid_t;
-
-enum MetricType { METRIC_L2, METRIC_IP };
 
 template <typename T>
 class IndexGraph {

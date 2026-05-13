@@ -25,11 +25,7 @@ static vidType compute_gpu_rabitq_entry_point(const float* data, size_t npoints,
   float best_dist = FLT_MAX;
   for (size_t i = 0; i < npoints; ++i) {
     const float* row = data + i * row_offset;
-    float dist = 0.0f;
-    for (size_t d = 0; d < dim; ++d) {
-      const float diff = row[d] - centroid[d];
-      dist += diff * diff;
-    }
+    float dist = compute_distance(static_cast<int>(dim), row, centroid.data());
     if (dist < best_dist) {
       best_dist = dist;
       best = static_cast<vidType>(i);
@@ -50,8 +46,10 @@ void QuantizationGraph::gpu_search(int nq, const float* queries, int K, float* r
   auto max_degree = this->degree_;
   auto beam_size = beam_sz;
   auto bitlen = GPU_HASH_BITLEN_FOR_TOPK(beam_size);
+  const bool use_ip = (this->get_metric() == METRIC_IP);
   const int active_nq = GPU_DISTANCE_TIMING ? 1 : nq;
   printf("\nBeam search on GPU: K=%d, nq=%d, dim=%ld, npoints=%ld, beam_size=%d, internal_topk=%d\n", K, active_nq, dim, npoints, beam_size, INTERNAL_TOPK);
+  printf("Metric: %s\n", metric_name(this->get_metric()));
   size_t num_threads = BLOCK_SIZE;
   size_t num_blocks = active_nq;
   std::cout << "\nnum_blocks = " << num_blocks << " num_threads = " << num_threads << "\n";
@@ -110,11 +108,15 @@ void QuantizationGraph::gpu_search(int nq, const float* queries, int K, float* r
   }
   CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
-  vidType entry_point =
-      compute_gpu_rabitq_entry_point(this->get_data_ptr(), npoints, dim, this->get_row_offset());
+  vidType entry_point = this->get_entry_point();
+  if (entry_point == UINT32_MAX) {
+    entry_point =
+        compute_gpu_rabitq_entry_point(this->get_data_ptr(), npoints, dim, this->get_row_offset());
+  }
   printf("GPU rabitq entry point: %u\n", entry_point);
 
-  uint32_t shm_size = calculate_shared_mem_size(static_cast<int>(dim), beam_size, K, max_degree, SEARCH_WIDTH, bitlen);
+  uint32_t shm_size = calculate_shared_mem_size(static_cast<int>(dim), beam_size, K,
+                                                static_cast<int>(max_degree), bitlen);
   CUDA_SAFE_CALL(cudaFuncSetAttribute(
       QuantizedBeamSearch,
       cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -131,10 +133,10 @@ void QuantizationGraph::gpu_search(int nq, const float* queries, int K, float* r
   printf("\nStarting GPU rabitq search...\n");
   auto start = std::chrono::high_resolution_clock::now();
   QuantizedBeamSearch<<<num_blocks, num_threads, shm_size>>>(
-      K, active_nq, static_cast<int>(dim), beam_size, bitlen, max_degree, npoints,
+      K, active_nq, static_cast<int>(dim), beam_size, bitlen, static_cast<int>(max_degree),
       d_queries, d_qg_data, d_qg_signs, d_results, d_total_stats, d_total_timing,
       entry_point, this->get_row_offset(), this->get_neighbor_offset(),
-      this->get_code_offset(), this->get_factor_offset(), debug_mode);
+      this->get_code_offset(), this->get_factor_offset(), use_ip, debug_mode);
   CUDA_SAFE_CALL(cudaGetLastError());
   cudaDeviceSynchronize();
   auto end = std::chrono::high_resolution_clock::now();

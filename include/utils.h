@@ -15,6 +15,8 @@
 #include <filesystem>
 #include <iomanip>
 #include <omp.h>
+
+#include "metric.hpp"
 #if !defined(__CUDACC__) && (defined(__AVX512F__) || defined(__AVX2__) || defined(__SSE2__))
 #include <immintrin.h>
 #endif
@@ -297,6 +299,14 @@ inline float compute_distance_scalar(int dim, const float* __restrict__ a, const
     return sum;
 }
 
+inline float compute_ip_distance_scalar(int dim, const float* __restrict__ a, const float* __restrict__ b) {
+    float sum = 0.0f;
+    for (int i = 0; i < dim; i++) {
+        sum += a[i] * b[i];
+    }
+    return -sum;
+}
+
 #ifdef __AVX2__
 // from DiskANN
 static inline float _mm256_reduce_add_ps(__m256 x) {
@@ -333,6 +343,25 @@ inline float compute_distance_vec256(int dim, const float* __restrict__ a, const
     }
     return dist;
 }
+
+inline float compute_ip_distance_vec256(int dim, const float* __restrict__ a, const float* __restrict__ b) {
+    uint16_t niters = (uint16_t)(dim / 8);
+    __m256 sum = _mm256_setzero_ps();
+    for (uint16_t j = 0; j < niters; j++) {
+        if (j + 1 < niters) {
+            _mm_prefetch((char *)(a + 8 * (j + 1)), _MM_HINT_T0);
+            _mm_prefetch((char *)(b + 8 * (j + 1)), _MM_HINT_T0);
+        }
+        __m256 a_vec = _mm256_loadu_ps(a + 8 * j);
+        __m256 b_vec = _mm256_loadu_ps(b + 8 * j);
+        sum = _mm256_fmadd_ps(a_vec, b_vec, sum);
+    }
+    float ip = _mm256_reduce_add_ps(sum);
+    for (int i = static_cast<int>(niters) * 8; i < dim; ++i) {
+        ip += a[i] * b[i];
+    }
+    return -ip;
+}
 #endif // __AVX2__
 
 #ifdef __AVX512F__
@@ -359,10 +388,38 @@ inline float compute_distance_vec512(int dim, const float* __restrict__ a, const
     }
     return dist;
 }
+
+inline float compute_ip_distance_vec512(int dim, const float* __restrict__ a, const float* __restrict__ b) {
+    uint16_t niters = (uint16_t)(dim / 16);
+    __m512 sum = _mm512_setzero_ps();
+    for (uint16_t j = 0; j < niters; j++) {
+        if (j + 1 < niters) {
+            _mm_prefetch((char *)(a + 16 * (j + 1)), _MM_HINT_T0);
+            _mm_prefetch((char *)(b + 16 * (j + 1)), _MM_HINT_T0);
+        }
+        __m512 a_vec = _mm512_loadu_ps(a + 16 * j);
+        __m512 b_vec = _mm512_loadu_ps(b + 16 * j);
+        sum = _mm512_fmadd_ps(a_vec, b_vec, sum);
+    }
+    float ip = _mm512_reduce_add_ps(sum);
+    for (int i = static_cast<int>(niters) * 16; i < dim; ++i) {
+        ip += a[i] * b[i];
+    }
+    return -ip;
+}
 #endif // __AVX512F__
 
 // ─── Best-available distance function ───────────────────────────────
-inline float compute_distance(int dim, const float* __restrict__ a, const float* __restrict__ b) {
+inline float compute_distance(MetricType metric, int dim, const float* __restrict__ a, const float* __restrict__ b) {
+    if (metric == METRIC_IP) {
+#ifdef __AVX512F__
+        return compute_ip_distance_vec512(dim, a, b);
+#elif defined(__AVX2__)
+        return compute_ip_distance_vec256(dim, a, b);
+#else
+        return compute_ip_distance_scalar(dim, a, b);
+#endif
+    }
 #ifdef __AVX512F__
     return compute_distance_vec512(dim, a, b);
 #elif defined(__AVX2__)
@@ -370,6 +427,10 @@ inline float compute_distance(int dim, const float* __restrict__ a, const float*
 #else
     return compute_distance_scalar(dim, a, b);
 #endif
+}
+
+inline float compute_distance(int dim, const float* __restrict__ a, const float* __restrict__ b) {
+    return compute_distance(g_metric_type, dim, a, b);
 }
 
 inline void get_sign_bit_vec(const float* n1, const float* n2, uint32_t* out, size_t dim) {

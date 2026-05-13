@@ -94,7 +94,7 @@ static __host__ inline uint32_t calculate_shared_mem_size(int dim, int beam_sz, 
 
 static __global__ GPU_LAUNCH_BOUNDS(BLOCK_SIZE)
 void QuantizedBeamSearch(
-    int K, int nq, int dim, int beam_sz, int bitlen, int max_degree, size_t npoints,
+    int K, int nq, int dim, int beam_sz, int bitlen, int max_degree,
     const float* __restrict__ d_queries,
     const float* __restrict__ d_qg_data,
     const float* __restrict__ d_qg_signs,
@@ -106,6 +106,7 @@ void QuantizedBeamSearch(
     size_t neighbor_offset,
     size_t code_offset,
     size_t factor_offset,
+    bool use_ip,
     bool debug_mode
 ) {
     // basic information about this block and thread
@@ -222,7 +223,7 @@ void QuantizedBeamSearch(
     if (warp_id == 0) {
         gpu_long_t l2_start = 0;
         if (GPU_DISTANCE_TIMING && lane_id == 0) l2_start = gpu_globaltimer();
-        DISTANCE_T entry_dist = warp_l2_distance(dim, query, d_qg_data + static_cast<size_t>(entry_point) * row_offset);
+        DISTANCE_T entry_dist = warp_distance(dim, query, d_qg_data + static_cast<size_t>(entry_point) * row_offset, use_ip);
         if (lane_id == 0) {
             CANDIDATE_INDEX[0] = entry_point;
             CANDIDATE_DISTANCE[0] = entry_dist;
@@ -358,7 +359,7 @@ void QuantizedBeamSearch(
 
         gpu_long_t l2_start = 0;
         if (GPU_DISTANCE_TIMING && lane_id == 0) l2_start = gpu_globaltimer();
-        DISTANCE_T exact_dist = warp_l2_distance(dim, query, current_row);
+        DISTANCE_T exact_dist = warp_distance(dim, query, current_row, use_ip);
         if (GPU_DISTANCE_TIMING && lane_id == 0) {
             atomicAdd(&timing[GPU_TIMING_L2_CALLS], gpu_long_t(1));
             atomicAdd(&timing[GPU_TIMING_L2_CYCLES], gpu_globaltimer() - l2_start);
@@ -606,8 +607,8 @@ void QuantizedBeamSearch(
                     if (GPU_DISTANCE_TIMING && lane_id == 0) {
                         fill_l2_start = gpu_globaltimer();
                     }
-                    DISTANCE_T child_dist = warp_l2_distance(
-                        dim, query, d_qg_data + static_cast<size_t>(child_node) * row_offset);
+                    DISTANCE_T child_dist = warp_distance(
+                        dim, query, d_qg_data + static_cast<size_t>(child_node) * row_offset, use_ip);
                     if (lane_id == 0) {
                         fill_candidate_nodes[warp_id] = child_node;
                         fill_candidate_dists[warp_id] = child_dist;

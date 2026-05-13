@@ -762,6 +762,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    g_metric_type = infer_metric_from_dataset_path(base_file);
+    cout << "Metric: " << metric_name(g_metric_type) << "\n";
+
     // load all input data
     size_t n_base, dim_base;
     size_t n_query, dim_query;
@@ -774,6 +777,7 @@ int main(int argc, char** argv) {
     QuantizationGraph qg = (mode == "codebook")
         ? QuantizationGraph(n_base, dim_base, degree, qg_codebook)
         : QuantizationGraph(n_base, dim_base, degree, graph_file, rabitq_table, signs_table, base_vectors);
+    qg.set_metric(g_metric_type);
 
     cout << "Fine-grained timer: " << (TIMING_ENABLED ? "on" : "off") << "\n";
     cout << "Debug mode: " << (DEBUG_MODE ? "on" : "off") << "\n";

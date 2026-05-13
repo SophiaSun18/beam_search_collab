@@ -58,11 +58,12 @@ void BeamSearch(
     vid_t* d_seed_map,
     uint32_t* d_sign_bit,
     GraphGPU<vid_t> gg,
+    bool use_ip,
     bool debug_mode
 ) {
     // basic information about this block and thread
     const int query_id = blockIdx.x;
-    if (query_id > nq) return;
+    if (query_id >= nq) return;
     const T* query = d_queries + query_id * dim;
     const uint32_t maxDegree = gg.get_max_degree();
     INDEX_T* d_graph_ptr = gg.N(0);
@@ -128,7 +129,7 @@ void BeamSearch(
         gpu_long_t l2_start = 0;
         if (GPU_DISTANCE_TIMING && lane_id == 0 && CANDIDATE_INDEX[i] != MAX_INDEX) l2_start = gpu_globaltimer();
         if (CANDIDATE_INDEX[i] != MAX_INDEX) {
-            dist = warp_l2_distance(dim, query, d_data + CANDIDATE_INDEX[i] * dim);
+            dist = warp_distance(dim, query, d_data + CANDIDATE_INDEX[i] * dim, use_ip);
         }
         if (lane_id == 0) {     // warp computes, only lane 0 writes
             if (CANDIDATE_INDEX[i] != MAX_INDEX) {
@@ -229,7 +230,7 @@ void BeamSearch(
         vid_t* neighbors = gg.N(current_node);
         gpu_long_t l2_start = 0;
         if (GPU_DISTANCE_TIMING && lane_id == 0) l2_start = gpu_globaltimer();
-        DISTANCE_T exact_dist = warp_l2_distance(dim, query, d_data + current_node * dim);
+        DISTANCE_T exact_dist = warp_distance(dim, query, d_data + current_node * dim, use_ip);
         if (GPU_DISTANCE_TIMING && lane_id == 0) {
             atomicAdd(&timing[GPU_TIMING_L2_CALLS], gpu_long_t(1));
             atomicAdd(&timing[GPU_TIMING_L2_CYCLES], gpu_globaltimer() - l2_start);
@@ -264,7 +265,7 @@ void BeamSearch(
             // if current node is new in hash table, compute and store its distance
             gpu_long_t cand_l2_start = 0;
             if (GPU_DISTANCE_TIMING && lane_id == 0) cand_l2_start = gpu_globaltimer();
-            DISTANCE_T dist = warp_l2_distance(dim, query, d_data + CANDIDATE_INDEX[i] * dim);
+            DISTANCE_T dist = warp_distance(dim, query, d_data + CANDIDATE_INDEX[i] * dim, use_ip);
             if (lane_id == 0) {
                 atomicAdd(&counter[0], 1);
                 if (GPU_DISTANCE_TIMING) {
