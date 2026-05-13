@@ -20,11 +20,19 @@
    
 //#define FLT_MAX 3.40282347e+38
 #ifndef GPU_SEARCH_STATS
-#define GPU_SEARCH_STATS 1
+#define GPU_SEARCH_STATS 0
 #endif
 
 #ifndef GPU_DISTANCE_TIMING
 #define GPU_DISTANCE_TIMING 0
+#endif
+
+#ifndef GPU_RABITQ_FASTSCAN_SEQ_LUT_LAYOUT_LANES
+#define GPU_RABITQ_FASTSCAN_SEQ_LUT_LAYOUT_LANES 32
+#endif
+
+#ifndef GPU_RABITQ_USE_LUT
+#define GPU_RABITQ_USE_LUT 1
 #endif
 
 #define MAX_INDEX UINT_MAX
@@ -1255,7 +1263,7 @@ static __device__ void query_prepare_gpu(const float* query_raw, QueryFactors& s
   __syncthreads();
 }
 
-static __device__ inline DISTANCE_T estimated_distance_gpu(const QueryFactors& qf,
+static __device__ inline DISTANCE_T estimate_one_neighbor_warp_no_lut_gpu(const QueryFactors& qf,
   const uint64_t* packed_code, float triple_x, float factor_dq, float factor_vq,
   float exact_dist, int padded_dim_) {
 
@@ -1319,6 +1327,23 @@ static __device__ __forceinline__ uint8_t fastscan_decode_code_for_neighbor_gpu(
                              : static_cast<uint8_t>(packed >> 4);
 }
 
+template <int LUT_LAYOUT_LANES = GPU_RABITQ_FASTSCAN_SEQ_LUT_LAYOUT_LANES>
+static __device__ __forceinline__ uint8_t fastscan_decode_code_for_neighbor_seq_lut_gpu(
+    const uint8_t* code_base, int codebook_idx, int neighbor_in_tile = 0) {
+  static_assert(LUT_LAYOUT_LANES == 2 || LUT_LAYOUT_LANES == 4 || LUT_LAYOUT_LANES == 8 || LUT_LAYOUT_LANES == 16 || LUT_LAYOUT_LANES == 32,
+                "GPU_RABITQ_FASTSCAN_SEQ_LUT_LAYOUT_LANES must be 2, 4, 8, 16, or 32");
+  const int pair_idx = codebook_idx >> 1;
+  uint8_t packed;
+  if constexpr (LUT_LAYOUT_LANES == 32) {
+    packed = code_base[pair_idx];
+  } else {
+    constexpr int neighbors_per_tile = WARP_SIZE / LUT_LAYOUT_LANES;
+    packed = code_base[pair_idx * neighbors_per_tile + neighbor_in_tile];
+  }
+  return (codebook_idx & 1) ? static_cast<uint8_t>(packed >> 4)
+                            : static_cast<uint8_t>(packed & 0x0f);
+}
+
 static __device__ inline void pack_lut_gpu(
     int dim, const uint8_t* __restrict__ quantized_query, uint8_t* __restrict__ lut) {
   const int tid = threadIdx.x;
@@ -1363,23 +1388,56 @@ static __device__ inline void scan_all_neighbors_32_gpu(
   appro_dist[lane_id] = est_dist;
 }
 
-static __device__ inline DISTANCE_T scan_one_neighbor_warp_gpu(
-    const QueryFactors& qf, const uint8_t* packed_codes_block, int neighbor_idx,
-    float exact_dist, int padded_dim) {
+template <int LANES_PER_NEIGHBOR>
+static __device__ inline DISTANCE_T scan_one_neighbor_lanes_gpu(
+    const QueryFactors &qf, const uint8_t *packed_codes_block, int neighbor_idx,
+    const float *triple_x, const float *factor_dq, const float *factor_vq,
+    float exact_dist, int padded_dim, int bytes_per_neighbor) {
+  static_assert(LANES_PER_NEIGHBOR == 2 || LANES_PER_NEIGHBOR == 4 ||
+                    LANES_PER_NEIGHBOR == 8 || LANES_PER_NEIGHBOR == 16 ||
+                    LANES_PER_NEIGHBOR == 32,
+                "LANES_PER_NEIGHBOR must be one of 2, 4, 8, 16, or 32");
+  const float triple_x_value = triple_x[0];
+  if (triple_x_value == FLT_MAX)
+    return 0.0f;
+
   const int lane_id = threadIdx.x & (WARP_SIZE - 1);
+  const int group_lane = lane_id & (LANES_PER_NEIGHBOR - 1);
+  unsigned group_mask = FULL_MASK;
+  if constexpr (LANES_PER_NEIGHBOR != WARP_SIZE) {
+    const int group_start = lane_id - group_lane;
+    constexpr unsigned group_bits = (1u << LANES_PER_NEIGHBOR) - 1u;
+    group_mask = group_bits << group_start;
+  }
   const int num_codebook = padded_dim >> 2;
   uint32_t local_raw_sum = 0;
 
-  for (int cb = lane_id; cb < num_codebook; cb += WARP_SIZE) {
-    const uint8_t code = fastscan_decode_code_for_neighbor_gpu(packed_codes_block, neighbor_idx, cb);
+  constexpr int lut_layout_neighbors = WARP_SIZE / GPU_RABITQ_FASTSCAN_SEQ_LUT_LAYOUT_LANES;
+  const uint8_t *seq_lut_tile = packed_codes_block;
+  int seq_lut_neighbor_in_tile = 0;
+  if constexpr (GPU_RABITQ_FASTSCAN_SEQ_LUT_LAYOUT_LANES == 32) {
+    seq_lut_tile = packed_codes_block + neighbor_idx * bytes_per_neighbor;
+  } else {
+    const int tile_idx = neighbor_idx / lut_layout_neighbors;
+    seq_lut_neighbor_in_tile = neighbor_idx & (lut_layout_neighbors - 1);
+    seq_lut_tile = packed_codes_block + tile_idx * lut_layout_neighbors * bytes_per_neighbor;
+  }
+
+  for (int cb = group_lane; cb < num_codebook; cb += LANES_PER_NEIGHBOR) {
+    const uint8_t code = fastscan_decode_code_for_neighbor_seq_lut_gpu(
+        seq_lut_tile, cb, seq_lut_neighbor_in_tile);
     local_raw_sum += static_cast<uint32_t>(qf.lut[(cb << 4) + code]);
   }
 
-  for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
-    local_raw_sum += __shfl_down_sync(FULL_MASK, local_raw_sum, offset);
+  for (int offset = LANES_PER_NEIGHBOR / 2; offset > 0; offset >>= 1) {
+    local_raw_sum += __shfl_down_sync(group_mask, local_raw_sum, offset, LANES_PER_NEIGHBOR);
   }
 
-  if (lane_id != 0) return 0.0f;
+  if (group_lane != 0) return 0.0f;
 
-  return static_cast<float>((static_cast<int32_t>(local_raw_sum) << 1) - qf.sum_q);
+  const float result_float = static_cast<float>((static_cast<int32_t>(local_raw_sum) << 1) - qf.sum_q);
+  DISTANCE_T est_dist = triple_x_value + exact_dist;
+  est_dist += factor_dq[0] * qf.width * result_float;
+  est_dist += factor_vq[0] * qf.low_val;
+  return est_dist;
 }
