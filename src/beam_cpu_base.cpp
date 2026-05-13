@@ -281,7 +281,7 @@ int main(int argc, char** argv) {
     if (argc < 2) {
         cerr << "Usage:\n" << argv[0]
         << " -base <base.fvecs>" << " -query <query.fvecs>" << " -gt <groundtruth.ivecs>"
-        << " -graph <graph_index>\n" << " [-beam <int>]" 
+        << " -graph <graph_index>\n" << " [-k <int>]" << " [-beam <int>]" 
         << " [-p_ratio <float>]" << " [-a_ratio <float>]"
         << " [-timer <on|off|1|0>]" << " [-debug <on|off|1|0>]" << " [-csv <output.csv>]\n";
         return 1;
@@ -305,6 +305,9 @@ int main(int argc, char** argv) {
         }
         else if (arg == "-graph" && i + 1 < argc) {
             graph_file = argv[++i];
+        }
+        else if (arg == "-k" && i + 1 < argc) {
+            K = atoi(argv[++i]);
         }
         else if (arg == "-beam" && i + 1 < argc) {
             BEAM_SIZE = atoi(argv[++i]);

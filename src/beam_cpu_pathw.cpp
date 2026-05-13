@@ -214,7 +214,7 @@ int main(int argc, char** argv) {
         cerr << "Usage:\n" << argv[0]
         << " -base <base.fvecs>" << " -query <query.fvecs>" << " -gt <groundtruth.ivecs>"
         << " -graph <graph_index>\n" << " [-signbit <signbit.bin>]"
-        << " [-rabitq <prefix>]" << " [-straight]" << " [-qbits <2|4>]"
+        << " [-k <int>]" << " [-rabitq <prefix>]" << " [-straight]" << " [-qbits <2|4>]"
         << " [-beam <int>]" << " [-p_ratio <float>]" << " [-a_ratio <float>]" << " [-csv <output.csv>]\n";
         return 1;
     }
@@ -240,6 +240,9 @@ int main(int argc, char** argv) {
         }
         else if (arg == "-signbit" && i + 1 < argc) {
             signbit_file = argv[++i];
+        }
+        else if (arg == "-k" && i + 1 < argc) {
+            K = atoi(argv[++i]);
         }
         else if (arg == "-beam" && i + 1 < argc) {
             BEAM_SIZE = atoi(argv[++i]);

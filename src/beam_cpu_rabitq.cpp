@@ -586,7 +586,7 @@ int main(int argc, char** argv) {
         << " -degree <int>" << " [-mode <codebook|bins>]"
         << " [-qg <qg_codebook>]" << " [-graph <graph_index>]"
         << " [-rabitq <rabitq_table>]" << " [-sign <sign_table>]"
-        << " [-beam <int>]" << " [-p_ratio <float>]" << " [-a_ratio <float>]"
+        << " [-k <int>]" << " [-beam <int>]" << " [-p_ratio <float>]" << " [-a_ratio <float>]"
         << " [-l2_iter <int>]" << " [-l2_end_iter <int>]" << " [-l2_period <int>]" << " [-rerank_top_m <int>]"
         << " [-timer <on|off|1|0>]" << " [-debug <on|off|1|0>]"
         << " [-estimate_stats <on|off|1|0>]" << " [-estimate_stats_file <output.txt>]"
@@ -630,6 +630,9 @@ int main(int argc, char** argv) {
         }
         else if (arg == "-qg" && i + 1 < argc) {
             qg_codebook = argv[++i];
+        }
+        else if (arg == "-k" && i + 1 < argc) {
+            K = atoi(argv[++i]);
         }
         else if (arg == "-beam" && i + 1 < argc) {
             BEAM_SIZE = atoi(argv[++i]);

@@ -183,6 +183,7 @@ run_cpu_base() {
                             -base "$BASE_FILE" \
                             -query "$QUERY_FILE" \
                             -gt "$GT_FILE" \
+                            -k "$TOPK" \
                             -graph "$GRAPH_FILE" \
                             -beam $beam \
                             -p_ratio $pr \
@@ -195,6 +196,7 @@ run_cpu_base() {
                             -base "$BASE_FILE" \
                             -query "$QUERY_FILE" \
                             -gt "$GT_FILE" \
+                            -k "$TOPK" \
                             -graph "$GRAPH_FILE" \
                             -beam $beam \
                             -p_ratio $pr \
@@ -236,6 +238,7 @@ run_cpu_pathw() {
                             -base "$BASE_FILE" \
                             -query "$QUERY_FILE" \
                             -gt "$GT_FILE" \
+                            -k "$TOPK" \
                             -graph "$GRAPH_FILE" \
                             -signbit "$SIGNBIT_FILE" \
                             -beam $beam \
@@ -247,6 +250,7 @@ run_cpu_pathw() {
                             -base "$BASE_FILE" \
                             -query "$QUERY_FILE" \
                             -gt "$GT_FILE" \
+                            -k "$TOPK" \
                             -graph "$GRAPH_FILE" \
                             -signbit "$SIGNBIT_FILE" \
                             -beam $beam \
@@ -340,6 +344,7 @@ run_cpu_rabitq() {
                                 -base "$BASE_FILE" \
                                 -query "$QUERY_FILE" \
                                 -gt "$GT_FILE" \
+                                -k "$TOPK" \
                                 -degree "$DEGREE" \
                                 "${MODE_ARGS[@]}" \
                                 -beam $beam \
@@ -359,6 +364,7 @@ run_cpu_rabitq() {
                                 -base "$BASE_FILE" \
                                 -query "$QUERY_FILE" \
                                 -gt "$GT_FILE" \
+                                -k "$TOPK" \
                                 -degree "$DEGREE" \
                                 "${MODE_ARGS[@]}" \
                                 -beam $beam \
