@@ -27,8 +27,8 @@ SRC_PREPARE_PATHW_SIGNBIT = $(SRC_DIR)/prepare_pathw_signbit.cpp
 CPU_TARGETS = cpu_base cpu_pathw cpu_rabitq preprocess_rabitq prepare_pathw_signbit
 
 # GPU source files
-GPU_SOURCES = main.cu beam_gpu_base.cu beam_gpu_rabitq.cu
-GPU_HEADERS = $(HEADERS_DIR)index.hpp $(HEADERS_DIR)qg.hpp $(HEADERS_DIR)utils.h $(HEADERS_DIR)search_bitonic.cuh $(HEADERS_DIR)search_rabitq.cuh
+GPU_SOURCES = main.cu beam_gpu_base.cu beam_gpu_pathw.cu beam_gpu_rabitq.cu
+GPU_HEADERS = $(HEADERS_DIR)index.hpp $(HEADERS_DIR)qg.hpp $(HEADERS_DIR)utils.h $(HEADERS_DIR)search_bitonic.cuh $(HEADERS_DIR)search_pathw.cuh $(HEADERS_DIR)search_rabitq.cuh
 GPU_TARGET = gpu_search
 
 .PHONY: all cpu gpu clean
@@ -76,5 +76,5 @@ $(GPU_TARGET): $(GPU_SOURCES) $(GPU_HEADERS)
 # Clean all binaries
 # --------------------------------------------
 clean:
-	rm -f $(CPU_TARGETS) $(BIN_DIR)/cpu_base $(BIN_DIR)/cpu_pathw \
+	rm -f $(CPU_TARGETS) $(addprefix $(BIN_DIR)/,$(CPU_TARGETS)) \
 	      $(BIN_DIR)/$(GPU_TARGET) *.o

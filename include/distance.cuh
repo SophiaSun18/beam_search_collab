@@ -11,38 +11,70 @@ __device__ DISTANCE_T compute_similarity_vector_load_full(
     const DATA_T* query_ptr,
     INDEX_T child_id,
     bool valid_child) {
-    auto child_data_ptr  = d_dataset_ptr + child_id * dim;
     unsigned lane_id  = threadIdx.x % TEAM_SIZE;
     constexpr unsigned vlen = 16 / sizeof(DATA_T);  //128bit = 16Byte
-    constexpr unsigned reg_nelem = (MAX_DIM + TEAM_SIZE * vlen - 1) / (TEAM_SIZE * vlen);
-    float4 dl_buff[reg_nelem];
     unsigned int full_mask = 0xffffffff;
     DISTANCE_T norm2 = 0;
     if (valid_child) {
-        // Load
-        #pragma unroll
-        for (uint32_t e = 0; e < reg_nelem; e++) {
-            const uint32_t k = (lane_id + (TEAM_SIZE * e)) * vlen;
-            if (k >= dim) break;
-            dl_buff[e] = reinterpret_cast<const float4*>(child_data_ptr)[k / 4];
-        }
-        // Compute
-        #pragma unroll
-        for (uint32_t e = 0; e < reg_nelem; e++) {
-            const uint32_t k = (lane_id + (TEAM_SIZE * e)) * vlen;
-            if (k >= dim) break;
-            DISTANCE_T d = query_ptr[k];
-            norm2 += (d - dl_buff[e].x) * (d - dl_buff[e].x);
-            d = query_ptr[k + 1];
-            norm2 += (d - dl_buff[e].y) * (d - dl_buff[e].y);
-            d = query_ptr[k + 2];
-            norm2 += (d - dl_buff[e].z) * (d - dl_buff[e].z);
-            d = query_ptr[k + 3];
-            norm2 += (d - dl_buff[e].w) * (d - dl_buff[e].w);
-
+        const DATA_T* child_data_ptr = d_dataset_ptr + static_cast<size_t>(child_id) * dim;
+        const uint32_t vec_dim = dim & ~(vlen - 1);
+        if (dim <= MAX_DIM && (dim & (vlen - 1)) == 0) {
+            constexpr unsigned reg_nelem = (MAX_DIM + TEAM_SIZE * vlen - 1) / (TEAM_SIZE * vlen);
+            float4 dl_buff[reg_nelem];
+            const float4* child_vec_ptr = reinterpret_cast<const float4*>(child_data_ptr);
+            #pragma unroll
+            for (uint32_t e = 0; e < reg_nelem; e++) {
+                const uint32_t k = (lane_id + (TEAM_SIZE * e)) * vlen;
+                if (k >= dim) break;
+                dl_buff[e] = child_vec_ptr[k / vlen];
+            }
+            #pragma unroll
+            for (uint32_t e = 0; e < reg_nelem; e++) {
+                const uint32_t k = (lane_id + (TEAM_SIZE * e)) * vlen;
+                if (k >= dim) break;
+                DISTANCE_T d = query_ptr[k];
+                norm2 += (d - dl_buff[e].x) * (d - dl_buff[e].x);
+                d = query_ptr[k + 1];
+                norm2 += (d - dl_buff[e].y) * (d - dl_buff[e].y);
+                d = query_ptr[k + 2];
+                norm2 += (d - dl_buff[e].z) * (d - dl_buff[e].z);
+                d = query_ptr[k + 3];
+                norm2 += (d - dl_buff[e].w) * (d - dl_buff[e].w);
+            }
+        } else if ((dim & (vlen - 1)) == 0) {
+            const float4* child_vec_ptr = reinterpret_cast<const float4*>(child_data_ptr);
+            for (uint32_t k = lane_id * vlen; k < vec_dim; k += TEAM_SIZE * vlen) {
+                const float4 dl = child_vec_ptr[k / vlen];
+                DISTANCE_T d = query_ptr[k];
+                norm2 += (d - dl.x) * (d - dl.x);
+                d = query_ptr[k + 1];
+                norm2 += (d - dl.y) * (d - dl.y);
+                d = query_ptr[k + 2];
+                norm2 += (d - dl.z) * (d - dl.z);
+                d = query_ptr[k + 3];
+                norm2 += (d - dl.w) * (d - dl.w);
+            }
+        } else {
+            for (uint32_t k = lane_id * vlen; k < vec_dim; k += TEAM_SIZE * vlen) {
+                DISTANCE_T d = query_ptr[k];
+                DISTANCE_T x = child_data_ptr[k];
+                norm2 += (d - x) * (d - x);
+                d = query_ptr[k + 1];
+                x = child_data_ptr[k + 1];
+                norm2 += (d - x) * (d - x);
+                d = query_ptr[k + 2];
+                x = child_data_ptr[k + 2];
+                norm2 += (d - x) * (d - x);
+                d = query_ptr[k + 3];
+                x = child_data_ptr[k + 3];
+                norm2 += (d - x) * (d - x);
+            }
+            for (uint32_t k = vec_dim + lane_id; k < dim; k += TEAM_SIZE) {
+                const DISTANCE_T d = query_ptr[k] - child_data_ptr[k];
+                norm2 += d * d;
+            }
         }
     }
-    unsigned team_mask = __ballot_sync(0xffffffff, valid_child);
     for (uint32_t offset = TEAM_SIZE / 2; offset > 0; offset >>= 1) {
         norm2 += __shfl_xor_sync(full_mask, norm2, offset);
     }

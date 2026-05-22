@@ -12,6 +12,7 @@
 #include <cassert>
 #include <cstring>
 #include <cfloat>
+#include <cstdlib>
 #include <filesystem>
 #include <iomanip>
 #include <omp.h>
@@ -106,6 +107,17 @@ T* read_bin(const char* filename, size_t& n_out, size_t& d_out) {
 }
 
 template <typename T>
+void release_bin_buffer(T* ptr, size_t row_dim) {
+    if (ptr == nullptr) return;
+    const size_t row_bytes = row_dim * sizeof(T);
+    if (row_bytes % 64 == 0 || row_bytes % 32 == 0) {
+        std::free(ptr);
+    } else {
+        delete[] ptr;
+    }
+}
+
+template <typename T>
 void write_bin(const char* filename, const T* data, size_t n, size_t d) {
     std::ofstream output(filename, std::ios::binary);
     if (!output) throw std::runtime_error("Cannot open output bin file");
@@ -137,7 +149,7 @@ struct Graph {
         std::cout << "Loading graph index from " << gFile 
                   << ": ntotal = " << n << ", maxDeg = " << degree << std::endl;
 
-        delete[] edge_data;
+        release_bin_buffer(edge_data, deg);
     }
 
     void load_qg_index(const char* filename,
@@ -256,10 +268,6 @@ struct RunStats {
 
 struct GpuRunStats {
     RunStats common{};
-    int64_t gpu_l2_calls = 0;
-    int64_t gpu_l2_cycles = 0;
-    int64_t gpu_est_calls = 0;
-    int64_t gpu_est_cycles = 0;
 };
 
 struct SearchResult {
@@ -478,10 +486,11 @@ template <typename T>
 float compute_recall(const T* predicted, const int* groundtruth,
                      size_t nq, int topk, int gt_k) {
     size_t correct = 0;
+    const int eval_k = std::min(topk, gt_k);
     for (size_t i = 0; i < nq; ++i) {
         for (int j = 0; j < topk; ++j) {
             int pred = int(predicted[i * topk + j]);
-            for (int k = 0; k < gt_k; ++k) {
+            for (int k = 0; k < eval_k; ++k) {
                 int gt = groundtruth[i * gt_k + k];
                 if (pred == gt) {
                     ++correct;
@@ -742,8 +751,7 @@ inline void append_stats_to_csv(const std::string& filename,
             << "Time_pruning,"
             << "Time_candidate_buffer_management,"
             << "Time_nth_element,"
-            << "Time_hash_filter,"
-            << "\n";
+            << "Time_hash_filter\n";
     }
 
     out << k << ","
@@ -778,7 +786,8 @@ inline void append_stats_to_csv(const std::string& filename,
 }
 
 inline void append_gpu_stats_to_csv(const std::string& filename,
-    int k, int beam, const GpuRunStats& gpu_stats)
+    int k, int beam, const GpuRunStats& gpu_stats,
+    float prune_ratio = 0.0f, float approx_ratio = 0.0f)
 {
     bool file_exists = std::filesystem::exists(filename);
 
@@ -815,19 +824,14 @@ inline void append_gpu_stats_to_csv(const std::string& filename,
             << "Time_pruning,"
             << "Time_candidate_buffer_management,"
             << "Time_nth_element,"
-            << "Time_hash_filter,"
-            << "Gpu_l2_calls,"
-            << "Gpu_l2_cycles,"
-            << "Gpu_est_calls,"
-            << "Gpu_est_cycles,"
-            << "\n";
+            << "Time_hash_filter\n";
     }
 
     const RunStats& stats = gpu_stats.common;
     out << k << ","
         << beam << ","
-        << 0 << ","
-        << 0 << ","
+        << prune_ratio << ","
+        << approx_ratio << ","
         << 0 << ","
         << 0 << ","
         << 0 << ","
@@ -850,11 +854,7 @@ inline void append_gpu_stats_to_csv(const std::string& filename,
         << stats.time_pruning << ","
         << stats.time_candidate_buffer_mgmt << ","
         << stats.time_nth_element << ","
-        << stats.time_hash_filter << ","
-        << gpu_stats.gpu_l2_calls << ","
-        << gpu_stats.gpu_l2_cycles << ","
-        << gpu_stats.gpu_est_calls << ","
-        << gpu_stats.gpu_est_cycles << "\n";
+        << stats.time_hash_filter << "\n";
 
     out.close();
 }

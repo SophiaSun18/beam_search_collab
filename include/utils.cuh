@@ -23,10 +23,6 @@
 #define GPU_SEARCH_STATS 0
 #endif
 
-#ifndef GPU_DISTANCE_TIMING
-#define GPU_DISTANCE_TIMING 0
-#endif
-
 #ifndef GPU_RABITQ_FASTSCAN_SEQ_LUT_LAYOUT_LANES
 #define GPU_RABITQ_FASTSCAN_SEQ_LUT_LAYOUT_LANES 32
 #endif
@@ -54,38 +50,12 @@ typedef unsigned long long gpu_long_t; // for counters
 typedef uint32_t vidType;
 using vid_t = vidType;
 
-__device__ __forceinline__ gpu_long_t gpu_globaltimer() {
-  gpu_long_t ticks;
-  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(ticks));
-  return ticks;
-}
-
-enum GpuDistanceTimingIndex : int {
-  GPU_TIMING_L2_CALLS = 0,
-  GPU_TIMING_L2_CYCLES = 1,
-  GPU_TIMING_EST_CALLS = 2,
-  GPU_TIMING_EST_CYCLES = 3,
-  GPU_TIMING_EST_REGION_CANDIDATES = 4,
-  GPU_TIMING_EST_REGION_CYCLES = 5,
-  GPU_TIMING_QUERY_PREP_CYCLES = 6,
-  GPU_TIMING_SORT_CYCLES = 7,
-  GPU_TIMING_PICK_CYCLES = 8,
-  GPU_TIMING_VISITED_CYCLES = 9,
-  GPU_TIMING_STAGE_CYCLES = 10,
-  GPU_TIMING_FINAL_SORT_CYCLES = 11,
-  GPU_TIMING_RESULT_POOL_CYCLES = 12,
-  GPU_TIMING_TENSOR_QUERY_TILE_CYCLES = 13,
-  GPU_TIMING_TENSOR_UNPACK_CYCLES = 14,
-  GPU_TIMING_TENSOR_MMA_CYCLES = 15,
-  GPU_TIMING_TENSOR_FINAL_FACTOR_CYCLES = 16,
-  GPU_TIMING_COUNT = 17
-};
-
 enum GpuSearchStatIndex : int {
   GPU_SEARCH_STAT_DIST_CMPS = 0,
   GPU_SEARCH_STAT_DIST_EST = 1,
   GPU_SEARCH_STAT_ITERATIONS = 2,
-  GPU_SEARCH_STAT_COUNT = 3
+  GPU_SEARCH_STAT_PRUNED = 3,
+  GPU_SEARCH_STAT_COUNT = 4
 };
 
 struct QueryFactors {
@@ -309,8 +279,8 @@ __device__ void candidate_by_bitonic_sort(
 
   // sort 1
   if (warp_id > 0) return;
-  if (CANDIDATE_BUFFER_SIZE != 64) {
-    printf("CANDIDATE_BUFFER_SIZE must be 64\n");
+  if (CANDIDATE_BUFFER_SIZE > 64) {
+    printf("CANDIDATE_BUFFER_SIZE must be <= 64\n");
     assert(false);
   }
   // constexpr unsigned N_1 = 2;
@@ -350,8 +320,8 @@ __device__ void candidate_by_bitonic_sort_inverse(
 
   // sort 1
   if (warp_id > 0) { return; }
-  if (CANDIDATE_BUFFER_SIZE != 64) {
-    printf("CANDIDATE_BUFFER_SIZE must be 64\n");
+  if (CANDIDATE_BUFFER_SIZE > 64) {
+    printf("CANDIDATE_BUFFER_SIZE must be <= 64\n");
     assert(false);
   }
   // constexpr unsigned N_1 = 2;

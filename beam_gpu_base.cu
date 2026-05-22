@@ -49,7 +49,7 @@ void IndexGraph<T>::search(int nq, const T* queries, int K, T *result_vec, vid_t
   printf("Metric: %s\n", metric_name(this->metric));
 
   size_t num_threads = BLOCK_SIZE;
-  size_t num_blocks = GPU_DISTANCE_TIMING ? 1 : nq;
+  size_t num_blocks = nq;
   std::cout << "num_blocks = " << num_blocks << " num_threads = " << num_threads << "\n";
   cudaDeviceProp prop;
   int dev;
@@ -73,14 +73,11 @@ void IndexGraph<T>::search(int nq, const T* queries, int K, T *result_vec, vid_t
   // counters
   gpu_long_t *d_total_stats = nullptr;
   std::array<gpu_long_t, GPU_SEARCH_STAT_COUNT> total_stats{};
+  const size_t stats_rows = num_blocks;
   if (GPU_SEARCH_STATS) {
-    CUDA_SAFE_CALL(cudaMalloc((void **)&d_total_stats, GPU_SEARCH_STAT_COUNT * sizeof(gpu_long_t)));
-    CUDA_SAFE_CALL(cudaMemcpy(d_total_stats, total_stats.data(), GPU_SEARCH_STAT_COUNT * sizeof(gpu_long_t), cudaMemcpyHostToDevice));
+    CUDA_SAFE_CALL(cudaMalloc((void **)&d_total_stats, stats_rows * GPU_SEARCH_STAT_COUNT * sizeof(gpu_long_t)));
+    CUDA_SAFE_CALL(cudaMemset(d_total_stats, 0, stats_rows * GPU_SEARCH_STAT_COUNT * sizeof(gpu_long_t)));
   }
-  gpu_long_t *d_total_timing;
-  std::array<gpu_long_t, GPU_TIMING_COUNT> total_timing{};
-  CUDA_SAFE_CALL(cudaMalloc((void **)&d_total_timing, GPU_TIMING_COUNT * sizeof(gpu_long_t)));
-  CUDA_SAFE_CALL(cudaMemcpy(d_total_timing, total_timing.data(), GPU_TIMING_COUNT * sizeof(gpu_long_t), cudaMemcpyHostToDevice));
   CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
   GraphGPU<vid_t> gg(npoints, max_degree, this->edges.data()); // GPU graph 
@@ -101,7 +98,7 @@ void IndexGraph<T>::search(int nq, const T* queries, int K, T *result_vec, vid_t
   //printf("filter size = %d bytes\n", num_blocks * HASH_FILTER_SIZE * sizeof(vid_t));
   //CUDA_SAFE_CALL(cudaMalloc((void **)&d_filters, num_blocks * HASH_FILTER_SIZE * sizeof(vid_t)));
   BeamSearch<T><<<num_blocks, num_threads>>>(K, nq, dim, npoints, d_queries, d_data,
-                                             d_results, d_total_stats, d_total_timing, d_starting_points, d_total_hops, gg);
+                                             d_results, d_total_stats, d_starting_points, gg);
 #else
   uint32_t shm_size = calculate_shared_mem_size(dim, beam_size, max_degree, SEARCH_WIDTH, bitlen);
   vid_t *d_seed_map = nullptr;
@@ -120,9 +117,8 @@ void IndexGraph<T>::search(int nq, const T* queries, int K, T *result_vec, vid_t
     CUDA_SAFE_CALL(cudaMemcpy(d_sign_bit, h_sign_bit, sign_bit_size * sizeof(uint32_t), cudaMemcpyHostToDevice));
   }
 
-  cudaError_t err = cudaSuccess;
-  err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &numBlocksPerSM, BeamSearch<T>, blockSize, shm_size);
+  cudaError_t err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      &numBlocksPerSM, BeamSearch<T>, blockSize, shm_size);
   if (err != cudaSuccess) {
     printf("Error: %s\n", cudaGetErrorString(err));
     exit(-1);
@@ -132,8 +128,8 @@ void IndexGraph<T>::search(int nq, const T* queries, int K, T *result_vec, vid_t
   // Execute the search
   printf("\nStarting GPU beam search...\n");
   auto start = std::chrono::high_resolution_clock::now();
-  BeamSearch<T><<<num_blocks, num_threads, shm_size>>>(K, nq, dim, beam_size, bitlen, npoints, d_queries, d_data, d_results, 
-                                                         d_total_stats, d_total_timing, d_starting_points, d_seed_map, d_sign_bit, gg, use_ip, debug_mode);
+  BeamSearch<T><<<num_blocks, num_threads, shm_size>>>(K, nq, dim, beam_size, bitlen, npoints, d_queries, d_data, d_results,
+                                                         d_total_stats, d_starting_points, d_seed_map, d_sign_bit, gg, use_ip);
   CUDA_SAFE_CALL(cudaGetLastError());
   cudaDeviceSynchronize();
   auto end = std::chrono::high_resolution_clock::now();
@@ -144,9 +140,16 @@ void IndexGraph<T>::search(int nq, const T* queries, int K, T *result_vec, vid_t
   CUDA_SAFE_CALL(cudaDeviceSynchronize());
   CUDA_SAFE_CALL(cudaMemcpy(h_results, d_results, nq * K * sizeof(int), cudaMemcpyDeviceToHost));
   if (GPU_SEARCH_STATS) {
-    CUDA_SAFE_CALL(cudaMemcpy(total_stats.data(), d_total_stats, GPU_SEARCH_STAT_COUNT * sizeof(gpu_long_t), cudaMemcpyDeviceToHost));
+    std::vector<gpu_long_t> h_block_stats(stats_rows * GPU_SEARCH_STAT_COUNT);
+    CUDA_SAFE_CALL(cudaMemcpy(h_block_stats.data(), d_total_stats,
+                              h_block_stats.size() * sizeof(gpu_long_t),
+                              cudaMemcpyDeviceToHost));
+    for (size_t b = 0; b < stats_rows; ++b) {
+      for (int i = 0; i < GPU_SEARCH_STAT_COUNT; ++i) {
+        total_stats[i] += h_block_stats[b * GPU_SEARCH_STAT_COUNT + i];
+      }
+    }
   }
-  CUDA_SAFE_CALL(cudaMemcpy(total_timing.data(), d_total_timing, GPU_TIMING_COUNT * sizeof(gpu_long_t), cudaMemcpyDeviceToHost));
   CUDA_SAFE_CALL(cudaFree(d_queries));
   CUDA_SAFE_CALL(cudaFree(d_data));
   CUDA_SAFE_CALL(cudaFree(d_results));
@@ -155,7 +158,6 @@ void IndexGraph<T>::search(int nq, const T* queries, int K, T *result_vec, vid_t
   if (GPU_SEARCH_STATS) {
     CUDA_SAFE_CALL(cudaFree(d_total_stats));
   }
-  CUDA_SAFE_CALL(cudaFree(d_total_timing));
   if (GPU_SEARCH_STATS) {
     std::cout << "total # exact distance computations: " << total_stats[GPU_SEARCH_STAT_DIST_CMPS] << "\n";
     std::cout << "average # exact distance computations: " << static_cast<double>(total_stats[GPU_SEARCH_STAT_DIST_CMPS]) / nq << "\n";
@@ -164,13 +166,6 @@ void IndexGraph<T>::search(int nq, const T* queries, int K, T *result_vec, vid_t
     std::cout << "total # expansion steps: " << total_stats[GPU_SEARCH_STAT_ITERATIONS] << "\n";
     std::cout << "average # expansion steps: " << static_cast<double>(total_stats[GPU_SEARCH_STAT_ITERATIONS]) / nq << "\n";
   }
-  if (GPU_DISTANCE_TIMING) {
-    const double avg_l2_cycles =
-        total_timing[GPU_TIMING_L2_CALLS] ? static_cast<double>(total_timing[GPU_TIMING_L2_CYCLES]) / total_timing[GPU_TIMING_L2_CALLS] : 0.0;
-    std::cout << "total # l2 timing calls: " << total_timing[GPU_TIMING_L2_CALLS] << "\n";
-    std::cout << "average cycles per warp_l2_distance: " << avg_l2_cycles << "\n";
-  }
-
   if (gpu_stats != nullptr) {
     gpu_stats->common.total_dc = static_cast<int64_t>(total_stats[GPU_SEARCH_STAT_DIST_CMPS]);
     gpu_stats->common.total_ds = static_cast<int64_t>(total_stats[GPU_SEARCH_STAT_DIST_EST]);
@@ -179,10 +174,6 @@ void IndexGraph<T>::search(int nq, const T* queries, int K, T *result_vec, vid_t
     gpu_stats->common.total_iter = static_cast<int64_t>(total_stats[GPU_SEARCH_STAT_ITERATIONS]);
     gpu_stats->common.total_pruned = 0;
     gpu_stats->common.time_search_total = elapsed;
-    gpu_stats->gpu_l2_calls = static_cast<int64_t>(total_timing[GPU_TIMING_L2_CALLS]);
-    gpu_stats->gpu_l2_cycles = static_cast<int64_t>(total_timing[GPU_TIMING_L2_CYCLES]);
-    gpu_stats->gpu_est_calls = static_cast<int64_t>(total_timing[GPU_TIMING_EST_CALLS]);
-    gpu_stats->gpu_est_cycles = static_cast<int64_t>(total_timing[GPU_TIMING_EST_CYCLES]);
   }
   (void)debug_mode;
 }

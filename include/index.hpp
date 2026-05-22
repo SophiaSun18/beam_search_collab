@@ -37,7 +37,7 @@ public:
         std::cout << "Loading graph index from " << gFile 
                   << ": ntotal = " << ntotal << ", maxDeg = " << maxDeg << std::endl;
 
-        delete[] edge_data;
+        release_bin_buffer(edge_data, deg);
     }
 
     // Load graph file (.meta.txt + .edge.bin format)
@@ -189,4 +189,14 @@ public:
                 vid_t* result_idx, int beam_sz, double& elapsed,
                 GpuRunStats* gpu_stats = nullptr,
                 bool debug_mode = false);
+
+    // GPU PathWeaver-style search (implemented in beam_gpu_pathw.cu)
+    void search_pathw(int nq, const T* queries, int K, T* result_vec,
+                      vid_t* result_idx, int beam_sz,
+	                      const char* signbit_file,
+	                      float neighbor_keep_ratio,
+	                      float iteration_prune_ratio,
+	                      double& elapsed,
+	                      GpuRunStats* gpu_stats = nullptr,
+	                      bool debug_mode = false);
 };
