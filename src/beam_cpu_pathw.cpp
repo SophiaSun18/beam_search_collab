@@ -287,6 +287,7 @@ int main(int argc, char** argv) {
 
     // Run experiment
     RunStats stats = run_ann_experiment_pathw(g, K, n_base, n_query, dim_base, base_vectors, query_vectors, groundtruth, dim_gt, signbit_table);
+    release_bin_buffer(signbit_table, sign_bit_vector_size);
 
     if (!csv_file.empty()) {
         append_stats_to_csv(csv_file, K, BEAM_SIZE, PRUNE_RATIO, APPROX_RATIO, stats);
