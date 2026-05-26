@@ -202,9 +202,13 @@ void QuantizedBeamSearch(
     }
 
     // load the top k list and candidate list with dummy initial values
-    for (int i = tid; i < static_cast<int>(result_buffer_size); i += blockDim.x) {
-        ALL_INDEX[i] = MAX_INDEX;
-        ALL_DISTANCE[i] = FLT_MAX;
+    for (int i = tid; i < beam_sz; i += blockDim.x) {
+        TOP_K_INDEX[i] = MAX_INDEX;
+        TOP_K_DISTANCE[i] = FLT_MAX;
+    }
+    for (int i = tid; i < CANDIDATE_BUFFER_SIZE; i += blockDim.x) {
+        CANDIDATE_INDEX[i] = MAX_INDEX;
+        CANDIDATE_DISTANCE[i] = FLT_MAX;
     }
     for (int i = tid; i < K; i += blockDim.x) {
         RESULT_POOL_INDEX[i] = MAX_INDEX;

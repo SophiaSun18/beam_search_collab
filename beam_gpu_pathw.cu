@@ -70,9 +70,12 @@ void IndexGraph<T>::search_pathw(int nq, const T* queries, int K, T* result_vec,
   if (K > beam_size) {
     throw std::runtime_error("GPU PathW requires K <= beam_size");
   }
-  if (beam_size != INTERNAL_TOPK) {
+  if (beam_size <= 0) {
+    throw std::runtime_error("GPU PathW requires beam_size > 0");
+  }
+  if (beam_size > INTERNAL_TOPK) {
     throw std::runtime_error(
-        "GPU PathW requires beam_size == compiled INTERNAL_TOPK (" +
+        "GPU PathW requires beam_size <= compiled INTERNAL_TOPK (" +
         std::to_string(INTERNAL_TOPK) + ")");
   }
   if (max_degree > CANDIDATE_BUFFER_SIZE) {
@@ -154,7 +157,6 @@ void IndexGraph<T>::search_pathw(int nq, const T* queries, int K, T* result_vec,
                             stats_rows * GPU_SEARCH_STAT_COUNT * sizeof(gpu_long_t)));
   CUDA_SAFE_CALL(cudaMemset(d_total_stats, 0,
                             stats_rows * GPU_SEARCH_STAT_COUNT * sizeof(gpu_long_t)));
-
   CUDA_SAFE_CALL(cudaDeviceSynchronize());
 
   GraphGPU<vid_t> gg(npoints, max_degree, this->edges.data());
@@ -166,7 +168,7 @@ void IndexGraph<T>::search_pathw(int nq, const T* queries, int K, T* result_vec,
     printf("GPU pathw seed node: %u\n", search_entry_point);
   }
 
-  uint32_t shm_size = calculate_pathw_shared_mem_size(dim, bitlen, max_degree);
+  uint32_t shm_size = calculate_pathw_shared_mem_size(dim, beam_size, bitlen, max_degree);
   int numBlocksPerSM = 0;
   CUDA_SAFE_CALL(cudaFuncSetAttribute(PathWBeamSearch<T>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(shm_size)));
   CUDA_SAFE_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocksPerSM, PathWBeamSearch<T>, num_threads, shm_size));
@@ -176,7 +178,7 @@ void IndexGraph<T>::search_pathw(int nq, const T* queries, int K, T* result_vec,
   auto start = std::chrono::high_resolution_clock::now();
   PathWBeamSearch<T><<<num_blocks, num_threads, shm_size>>>(
       K, active_nq, dim, beam_size, bitlen, npoints, d_queries, d_data,
-      d_sign_bit, d_results, d_total_stats, entry_point, gg, neighbor_keep_ratio,
+      d_sign_bit, d_results, d_total_stats, search_entry_point, gg, neighbor_keep_ratio,
       iteration_prune_ratio);
   CUDA_SAFE_CALL(cudaGetLastError());
   CUDA_SAFE_CALL(cudaDeviceSynchronize());
@@ -193,7 +195,6 @@ void IndexGraph<T>::search_pathw(int nq, const T* queries, int K, T* result_vec,
       total_stats[i] += h_block_stats[b * GPU_SEARCH_STAT_COUNT + i];
     }
   }
-
   CUDA_SAFE_CALL(cudaFree(d_queries));
   CUDA_SAFE_CALL(cudaFree(d_data));
   CUDA_SAFE_CALL(cudaFree(d_results));
