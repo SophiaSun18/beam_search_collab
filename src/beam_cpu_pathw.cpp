@@ -138,6 +138,7 @@ SearchResult beam_cpu_pathw(
     res.neighbors = move(result);
     res.dist_cmps = dist_cmps;
     res.dist_est = dist_est;
+    res.extra_dist_cmps = 0;
     res.iters = iter;
     res.neighbor_pruned = neighbor_pruned;
     return res;
@@ -193,6 +194,8 @@ RunStats run_ann_experiment_pathw(
     stats.recall = compute_avg_recall(all_results, groundtruth, n_query, K, dim_gt);
     stats.total_dc = total_count_dc;
     stats.total_ds = total_count_ds;
+    stats.total_extra_dc = 0;
+    stats.total_full_dc = total_count_dc;
     stats.total_iter = total_hop;
     stats.total_pruned = total_pruned;
 

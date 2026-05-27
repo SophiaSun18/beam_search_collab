@@ -20,11 +20,12 @@ $(shell mkdir -p $(BIN_DIR))   # ensure bin exists
 SRC_BASE = $(SRC_DIR)/beam_cpu_base.cpp
 SRC_PATHW = $(SRC_DIR)/beam_cpu_pathw.cpp
 SRC_RABITQ = $(SRC_DIR)/beam_cpu_rabitq.cpp
+SRC_RABITQ_PRUNED = $(SRC_DIR)/beam_cpu_rabitq_pruned.cpp
 SRC_PREPROCESS_RABITQ = $(SRC_DIR)/preprocess_rabitq.cpp
 SRC_PREPARE_PATHW_SIGNBIT = $(SRC_DIR)/prepare_pathw_signbit.cpp
 
 # CPU executables
-CPU_TARGETS = cpu_base cpu_pathw cpu_rabitq preprocess_rabitq prepare_pathw_signbit
+CPU_TARGETS = cpu_base cpu_pathw cpu_rabitq cpu_rabitq_pruned preprocess_rabitq prepare_pathw_signbit
 
 # GPU source files
 GPU_SOURCES = main.cu beam_gpu_base.cu beam_gpu_pathw.cu beam_gpu_rabitq.cu
@@ -52,6 +53,10 @@ cpu_pathw: $(SRC_PATHW)
 	mv $@ $(BIN_DIR)/
 
 cpu_rabitq: $(SRC_RABITQ)
+	$(CXX) $(CXXFLAGS) $^ -o $@
+	mv $@ $(BIN_DIR)/
+
+cpu_rabitq_pruned: $(SRC_RABITQ_PRUNED)
 	$(CXX) $(CXXFLAGS) $^ -o $@
 	mv $@ $(BIN_DIR)/
 
