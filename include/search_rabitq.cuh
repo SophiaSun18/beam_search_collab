@@ -238,12 +238,12 @@ void QuantizedBeamSearch(
     for (int iter = 0; iter < MAX_ITERATIONS; iter++) {
 
         // forgettable hash table management according to the CARGA paper
-        if ((iter + 1) % SMALL_HASH_RESET_INTERVAL == 0) {
-            hashtable_init(HASH_TABLE, bitlen);
-            __syncthreads();
-            hashtable_restore_expand_only(HASH_TABLE, bitlen, TOP_K_INDEX, beam_sz);
-        }
-        __syncthreads();
+        // if ((iter + 1) % SMALL_HASH_RESET_INTERVAL == 0) {
+        //     hashtable_init(HASH_TABLE, bitlen);
+        //     __syncthreads();
+        //     hashtable_restore_expand_only(HASH_TABLE, bitlen, TOP_K_INDEX, beam_sz);
+        // }
+        // __syncthreads();
 
         dispatch_topk_by_sort_candidates_and_merge<2>(
             ALL_INDEX, ALL_DISTANCE, MERGED_TOPK_INDEX, MERGED_TOPK_DISTANCE,

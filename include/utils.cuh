@@ -727,7 +727,7 @@ __device__ void dispatch_topk_by_sort_candidates_and_merge(
     uint32_t candidate_buffer_size,
     uint32_t internal_topk,
     bool first) {
-  switch (internal_topk / WARP_SIZE) {
+  switch ((internal_topk + WARP_SIZE - 1) / WARP_SIZE) {
     case 1:
       topk_by_sort_candidates_and_merge_case<N_1, 1>(
           result_indices_ptr, result_distances_ptr,

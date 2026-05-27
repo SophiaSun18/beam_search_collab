@@ -453,6 +453,12 @@ public:
                     GpuRunStats* gpu_stats = nullptr,
                     bool debug_mode = false);
 
+    void gpu_search_pruned(int nq, const float* queries, int K, float* result_vec,
+                           vidType* result_idx, int beam_sz, float prune_ratio,
+                           float approx_ratio, double& elapsed,
+                           GpuRunStats* gpu_stats = nullptr,
+                           bool debug_mode = false);
+
 private:
     void init_layout(bool bins_mode) {
         padded_dim_ = 1ULL << static_cast<size_t>(std::ceil(std::log2(dim_)));
