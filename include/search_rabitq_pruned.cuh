@@ -1,10 +1,112 @@
 #pragma once
+#include "utils.cuh"
+#include "distance.cuh"
+#include <cuda_runtime.h>
+#if defined(__CUDA_ARCH__) || defined(__CUDACC__)
+#include <cuda_pipeline_primitives.h>
+#endif
 
-#include "search_rabitq.cuh"
+#ifndef INTERNAL_TOPK
+#define INTERNAL_TOPK 128
+#endif
+
+#ifndef SEARCH_WIDTH
+#define SEARCH_WIDTH 1
+#endif
+
+#define MAX_ITERATIONS (1 << 15)
+
+#ifndef CANDIDATE_BUFFER_SIZE
+#define CANDIDATE_BUFFER_SIZE 64
+#endif
+
+#define GPU_RABITQ_PRUNED_SPEC_KERNEL 0
+
+#ifndef GPU_RABITQ_FASTSCAN_SUBWARP_LANES
+#define GPU_RABITQ_FASTSCAN_SUBWARP_LANES 32
+#endif
+
+#if !GPU_RABITQ_USE_LUT && GPU_RABITQ_FASTSCAN_SUBWARP_LANES != 32
+#error "GPU_RABITQ_USE_LUT=0 currently supports only GPU_RABITQ_FASTSCAN_SUBWARP_LANES=32"
+#endif
+
+#if GPU_RABITQ_FASTSCAN_SUBWARP_LANES != 2 && GPU_RABITQ_FASTSCAN_SUBWARP_LANES != 4 && \
+    GPU_RABITQ_FASTSCAN_SUBWARP_LANES != 8 && GPU_RABITQ_FASTSCAN_SUBWARP_LANES != 16 && \
+    GPU_RABITQ_FASTSCAN_SUBWARP_LANES != 32
+#error "GPU_RABITQ_FASTSCAN_SUBWARP_LANES must be one of 2, 4, 8, 16, or 32"
+#endif
+
+template <typename T>
+static __device__ inline void staged_copy_async_begin_or_sync(
+    T* __restrict__ dst,
+    const T* __restrict__ src,
+    int count) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    for (int i = threadIdx.x; i < count; i += blockDim.x) {
+        __pipeline_memcpy_async(dst + i, src + i, sizeof(T));
+    }
+    __pipeline_commit();
+#else
+    for (int i = threadIdx.x; i < count; i += blockDim.x) {
+        dst[i] = src[i];
+    }
+#endif
+}
+
+static __device__ inline void staged_copy_async_finish_or_sync() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    __pipeline_wait_prior(0);
+#endif
+}
+
+static __host__ __device__ inline uint32_t rabitq_pruned_candidate_buffer_size(
+    uint32_t, float prune_ratio = 0.0f, float approx_ratio = 1.0f) {
+    (void)prune_ratio;
+    (void)approx_ratio;
+    return CANDIDATE_BUFFER_SIZE;
+}
+
+static __host__ inline uint32_t calculate_pruned_shared_mem_size(int dim, int beam_sz, int result_k,
+                                                                 int max_deg, int bitlen,
+                                                                 float prune_ratio = 0.0f,
+                                                                 float approx_ratio = 1.0f) {
+    auto align_up = [](size_t value, size_t alignment) -> size_t {
+        return (value + alignment - 1) & ~(alignment - 1);
+    };
+    size_t padded_dim = 1ULL << static_cast<size_t>(ceilf(log2f(dim)));
+    size_t code_words = padded_dim / 64;
+    const size_t result_buffer_size = static_cast<size_t>(beam_sz) + CANDIDATE_BUFFER_SIZE;
+    size_t size = 0;
+    size += hashtable_getsize(bitlen) * sizeof(INDEX_T);
+    size += result_buffer_size * sizeof(INDEX_T);
+    size += result_buffer_size * sizeof(DISTANCE_T);
+    size += SEARCH_WIDTH * sizeof(INDEX_T);
+    size += dim * sizeof(DATA_T);
+    size += padded_dim * sizeof(float);
+    size += padded_dim * sizeof(uint8_t);
+    size += (padded_dim << 2) * sizeof(uint8_t);
+    size += 3 * sizeof(float);
+    size += sizeof(int32_t);
+    size = align_up(size, alignof(uint64_t));
+    size += static_cast<size_t>(max_deg) * code_words * sizeof(uint64_t);
+    size += 3 * static_cast<size_t>(max_deg) * sizeof(float);
+    size += sizeof(uint32_t);
+    if (GPU_SEARCH_STATS) {
+        size += GPU_SEARCH_STAT_COUNT * sizeof(uint32_t);
+    }
+    size = align_up(size, alignof(INDEX_T));
+    size += beam_sz * sizeof(INDEX_T);
+    size = align_up(size, alignof(DISTANCE_T));
+    size += beam_sz * sizeof(DISTANCE_T);
+    (void)result_k;
+    (void)prune_ratio;
+    (void)approx_ratio;
+    return static_cast<uint32_t>(size);
+}
 
 static __global__ GPU_LAUNCH_BOUNDS(BLOCK_SIZE)
 void QuantizedPrunedBeamSearch(
-    int K, int nq, int dim, int beam_sz, int bitlen, int max_degree,
+    int K, int nq, int dim, int beam_sz, int bitlen, int max_degree, size_t,
     const float* __restrict__ d_queries,
     const float* __restrict__ d_qg_data,
     const float* __restrict__ d_qg_signs,
@@ -33,17 +135,19 @@ void QuantizedPrunedBeamSearch(
 
     size_t padded_dim = 1ULL << static_cast<size_t>(ceilf(log2f(dim)));
     size_t code_words = padded_dim / 64;
+    const uint32_t logical_beam_size = static_cast<uint32_t>(beam_sz);
+    const uint32_t padded_beam_size = gpu_effective_sort_beam_size(logical_beam_size, static_cast<uint32_t>(K));
 
     // initialize the shared memory
     extern __shared__ char shared_memory[];
     INDEX_T* ALL_INDEX = reinterpret_cast<INDEX_T*>(shared_memory);
     INDEX_T* TOP_K_INDEX = ALL_INDEX;
-    INDEX_T* CANDIDATE_INDEX = ALL_INDEX + beam_sz;
+    INDEX_T* CANDIDATE_INDEX = ALL_INDEX + padded_beam_size;
 
-    const uint32_t result_buffer_size = static_cast<uint32_t>(beam_sz + CANDIDATE_BUFFER_SIZE);
+    const uint32_t result_buffer_size = padded_beam_size + CANDIDATE_BUFFER_SIZE;
     DISTANCE_T* ALL_DISTANCE = reinterpret_cast<DISTANCE_T*>(ALL_INDEX + result_buffer_size);
     DISTANCE_T* TOP_K_DISTANCE = ALL_DISTANCE;
-    DISTANCE_T* CANDIDATE_DISTANCE = ALL_DISTANCE + beam_sz;
+    DISTANCE_T* CANDIDATE_DISTANCE = ALL_DISTANCE + padded_beam_size;
 
     INDEX_T* HASH_TABLE = reinterpret_cast<INDEX_T*>(ALL_DISTANCE + result_buffer_size);
     INDEX_T* PARENT_LIST = HASH_TABLE + hashtable_getsize(bitlen);
@@ -66,7 +170,7 @@ void QuantizedPrunedBeamSearch(
     uint32_t* hops = reinterpret_cast<uint32_t*>(STAGED_FACTOR_BUFFER + 3 * max_degree);
     uint32_t* stats = hops + 1;
     INDEX_T* MERGED_TOPK_INDEX = reinterpret_cast<INDEX_T*>(stats + (GPU_SEARCH_STATS ? GPU_SEARCH_STAT_COUNT : 0));
-    DISTANCE_T* MERGED_TOPK_DISTANCE = reinterpret_cast<DISTANCE_T*>(MERGED_TOPK_INDEX + beam_sz);
+    DISTANCE_T* MERGED_TOPK_DISTANCE = reinterpret_cast<DISTANCE_T*>(MERGED_TOPK_INDEX + padded_beam_size);
 
     __shared__ QueryFactors qf;
     __shared__ uint32_t keep_expanding;
@@ -97,7 +201,7 @@ void QuantizedPrunedBeamSearch(
     }
 
     // load the top k list and candidate list with dummy initial values
-    for (int i = tid; i < beam_sz; i += blockDim.x) {
+    for (int i = tid; i < static_cast<int>(padded_beam_size); i += blockDim.x) {
         TOP_K_INDEX[i] = MAX_INDEX;
         TOP_K_DISTANCE[i] = FLT_MAX;
     }
@@ -138,7 +242,13 @@ void QuantizedPrunedBeamSearch(
 
         dispatch_topk_by_sort_candidates_and_merge<2>(
             ALL_INDEX, ALL_DISTANCE, MERGED_TOPK_INDEX, MERGED_TOPK_DISTANCE,
-            result_buffer_size, CANDIDATE_BUFFER_SIZE, beam_sz, (iter == 0));
+            result_buffer_size, CANDIDATE_BUFFER_SIZE, padded_beam_size, (iter == 0));
+        __syncthreads();
+
+        for (uint32_t i = logical_beam_size + tid; i < padded_beam_size; i += blockDim.x) {
+            TOP_K_INDEX[i] = MAX_INDEX;
+            TOP_K_DISTANCE[i] = FLT_MAX;
+        }
         __syncthreads();
 
         // clear the candidate buffer before next iteration to avoid stale entries
@@ -149,7 +259,7 @@ void QuantizedPrunedBeamSearch(
         __syncthreads();
 
         if (warp_id == 0) {
-            keep_expanding = pick_expanders(SEARCH_WIDTH, PARENT_LIST, beam_sz, TOP_K_INDEX);
+            keep_expanding = pick_expanders(SEARCH_WIDTH, PARENT_LIST, logical_beam_size, TOP_K_INDEX);
         }
         __syncthreads();
 
@@ -220,27 +330,6 @@ void QuantizedPrunedBeamSearch(
             const int bytes_per_neighbor = padded_dim >> 3;
             uint32_t warp_dist_est_count = 0;
 
-#if GPU_RABITQ_FASTSCAN_SUBWARP_LANES == 32
-            for (int i = warp_id; i < max_degree; i += WARPS_PER_BLOCK) {
-                if (CANDIDATE_INDEX[i] == MAX_INDEX) continue;
-
-                const int batch = i / WARP_SIZE;
-                const int neighbor_idx = i & (WARP_SIZE - 1);
-                const uint8_t* packed_codes_block = reinterpret_cast<const uint8_t*>(STAGED_CODE_BUFFER) + batch * padded_dim * 4;
-                const float* triple_x = STAGED_FACTOR_BUFFER + i;
-                const float* factor_dq = STAGED_FACTOR_BUFFER + max_degree + i;
-                const float* factor_vq = STAGED_FACTOR_BUFFER + 2 * max_degree + i;
-
-                const DISTANCE_T est_dist = scan_one_neighbor_lanes_gpu<32>(
-                    qf, packed_codes_block, neighbor_idx, triple_x, factor_dq, factor_vq,
-                    exact_dist, padded_dim, bytes_per_neighbor);
-                if (lane_id == 0) {
-                    CANDIDATE_DISTANCE[i] = isfinite(est_dist) ? est_dist : FLT_MAX;
-                    if (GPU_SEARCH_STATS) warp_dist_est_count++;
-                }
-                __syncwarp();
-            }
-#else
             constexpr int lanes_per_neighbor = GPU_RABITQ_FASTSCAN_SUBWARP_LANES;
             constexpr int groups_per_warp = WARP_SIZE / lanes_per_neighbor;
             const int group_lane = lane_id & (lanes_per_neighbor - 1);
@@ -276,7 +365,6 @@ void QuantizedPrunedBeamSearch(
                     warp_dist_est_count += __shfl_down_sync(FULL_MASK, warp_dist_est_count, offset);
                 }
             }
-#endif
             if (lane_id == 0 && GPU_SEARCH_STATS) {
                 local_dist_est_count += warp_dist_est_count;
             }
@@ -331,7 +419,7 @@ void QuantizedPrunedBeamSearch(
 
     dispatch_topk_by_sort_candidates_and_merge<2>(
         ALL_INDEX, ALL_DISTANCE, MERGED_TOPK_INDEX, MERGED_TOPK_DISTANCE,
-        result_buffer_size, CANDIDATE_BUFFER_SIZE, beam_sz, false);
+        result_buffer_size, CANDIDATE_BUFFER_SIZE, padded_beam_size, false);
     __syncthreads();
 
     if (tid == 0) {

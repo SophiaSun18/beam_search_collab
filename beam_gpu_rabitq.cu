@@ -44,12 +44,19 @@ void QuantizationGraph::gpu_search(int nq, const float* queries, int K, float* r
   auto dim = this->dim_;
   auto npoints = this->num_nodes_;
   auto max_degree = this->degree_;
-  auto beam_size = beam_sz;
-  auto bitlen = GPU_HASH_BITLEN_FOR_TOPK(beam_size);
+  auto requested_beam_size = beam_sz;
+  auto beam_size = requested_beam_size;
+  auto padded_beam_size = static_cast<int>(gpu_effective_sort_beam_size(static_cast<uint32_t>(beam_size), static_cast<uint32_t>(K)));
+  auto bitlen = GPU_HASH_BITLEN_FOR_TOPK(padded_beam_size);
   const bool use_ip = (this->get_metric() == METRIC_IP);
   const int active_nq = nq;
-  printf("\nBeam search on GPU: K=%d, nq=%d, dim=%ld, npoints=%ld, beam_size=%d, internal_topk=%d\n", K, active_nq, dim, npoints, beam_size, INTERNAL_TOPK);
+  printf("\nBeam search on GPU: K=%d, nq=%d, dim=%ld, npoints=%ld, beam_size=%d, padded_beam_size=%d, internal_topk=%d\n",
+         K, active_nq, dim, npoints, beam_size, padded_beam_size, INTERNAL_TOPK);
   printf("Metric: %s\n", metric_name(this->get_metric()));
+  const size_t candidate_work_count = static_cast<size_t>(SEARCH_WIDTH) * max_degree;
+  const size_t candidate_buffer_size = round_up_power2_u32(static_cast<uint32_t>(candidate_work_count));
+  printf("GPU rabitq speculation: search_width=%d, candidate_work_count=%zu, candidate_buffer_size=%zu\n",
+         SEARCH_WIDTH, candidate_work_count, candidate_buffer_size);
   size_t num_threads = BLOCK_SIZE;
   size_t num_blocks = active_nq;
   std::cout << "\nnum_blocks = " << num_blocks << " num_threads = " << num_threads << "\n";
@@ -110,7 +117,7 @@ void QuantizationGraph::gpu_search(int nq, const float* queries, int K, float* r
   }
   printf("GPU rabitq entry point: %u\n", entry_point);
 
-  uint32_t shm_size = calculate_shared_mem_size(static_cast<int>(dim), beam_size, K,
+  uint32_t shm_size = calculate_shared_mem_size(static_cast<int>(dim), padded_beam_size, K,
                                                 static_cast<int>(max_degree), bitlen);
   CUDA_SAFE_CALL(cudaFuncSetAttribute(
       QuantizedBeamSearch,
@@ -129,7 +136,7 @@ void QuantizationGraph::gpu_search(int nq, const float* queries, int K, float* r
   auto start = std::chrono::high_resolution_clock::now();
   QuantizedBeamSearch<<<num_blocks, num_threads, shm_size>>>(
       K, active_nq, static_cast<int>(dim), beam_size, bitlen, static_cast<int>(max_degree),
-      d_queries, d_qg_data, d_qg_signs, d_results, d_total_stats,
+      npoints, d_queries, d_qg_data, d_qg_signs, d_results, d_total_stats,
       entry_point, this->get_row_offset(), this->get_neighbor_offset(),
       this->get_code_offset(), this->get_factor_offset(), use_ip);
   CUDA_SAFE_CALL(cudaGetLastError());

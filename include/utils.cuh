@@ -35,6 +35,14 @@
 #define GPU_RABITQ_USE_LUT 1
 #endif
 
+#if defined(GPU_SEARCH_MODE) && GPU_SEARCH_MODE == 3
+#define GPU_RABITQ_SEARCH_NOINLINE __noinline__
+#define GPU_RABITQ_SEARCH_INLINE_ATTR __noinline__
+#else
+#define GPU_RABITQ_SEARCH_NOINLINE
+#define GPU_RABITQ_SEARCH_INLINE_ATTR inline
+#endif
+
 #define MAX_INDEX UINT_MAX
 
 #define SHFL_DOWN(val, offset) __shfl_down_sync(FULL_MASK, val, offset)
@@ -927,7 +935,7 @@ __device__ __noinline__ void topk_by_sort_candidates_and_merge_case(
 }
 
 template <unsigned N_1>
-__device__ void dispatch_topk_by_sort_candidates_and_merge(
+__device__ GPU_RABITQ_SEARCH_INLINE_ATTR void dispatch_topk_by_sort_candidates_and_merge(
     INDEX_T* result_indices_ptr,
     DISTANCE_T* result_distances_ptr,
     INDEX_T* merged_topk_index_shared,
@@ -1289,7 +1297,7 @@ static __device__ uint32_t pick_expanders(int N, INDEX_T* output_list, int M, IN
   return num_exp;
 }
 
-static __device__ inline void result_pool_recompute_worst(
+static __device__ GPU_RABITQ_SEARCH_INLINE_ATTR void result_pool_recompute_worst(
     const DISTANCE_T* pool_distance,
     uint32_t pool_size,
     uint32_t* worst_idx,
@@ -1311,7 +1319,7 @@ static __device__ inline void result_pool_recompute_worst(
   *worst_dist = local_worst_dist;
 }
 
-static __device__ inline void result_pool_push_unique_unsorted(
+static __device__ GPU_RABITQ_SEARCH_INLINE_ATTR void result_pool_push_unique_unsorted(
     INDEX_T* pool_index,
     DISTANCE_T* pool_distance,
     uint32_t* pool_size,
@@ -1340,7 +1348,7 @@ static __device__ inline void result_pool_push_unique_unsorted(
   result_pool_recompute_worst(pool_distance, size, worst_idx, worst_dist);
 }
 
-static __device__ inline void result_pool_sort_small(
+static __device__ GPU_RABITQ_SEARCH_INLINE_ATTR void result_pool_sort_small(
     INDEX_T* pool_index,
     DISTANCE_T* pool_distance,
     uint32_t pool_size) {
@@ -1392,7 +1400,7 @@ static __device__ inline void rotate_vector_gpu(const float* src, float* dst,
   }
 }
 
-static __device__ void query_prepare_gpu(const float* query_raw, QueryFactors& scratch,
+static __device__ GPU_RABITQ_SEARCH_NOINLINE void query_prepare_gpu(const float* query_raw, QueryFactors& scratch,
     const float* signs_ptr, int dim, int padded_dim) {
   constexpr float kQueryLevelsInv = 1.0f / static_cast<float>((1 << QG_BQUERY) - 1);
 
@@ -1561,7 +1569,7 @@ static __device__ __forceinline__ uint8_t fastscan_decode_code_for_neighbor_seq_
                             : static_cast<uint8_t>(packed & 0x0f);
 }
 
-static __device__ inline void pack_lut_gpu(
+static __device__ GPU_RABITQ_SEARCH_INLINE_ATTR void pack_lut_gpu(
     int dim, const uint8_t* __restrict__ quantized_query, uint8_t* __restrict__ lut) {
   const int tid = threadIdx.x;
   const int num_codebook = dim >> 2;

@@ -28,9 +28,12 @@ SRC_PREPARE_PATHW_SIGNBIT = $(SRC_DIR)/prepare_pathw_signbit.cpp
 CPU_TARGETS = cpu_base cpu_pathw cpu_rabitq cpu_rabitq_pruned preprocess_rabitq prepare_pathw_signbit
 
 # GPU source files
-GPU_SOURCES = main.cu beam_gpu_base.cu beam_gpu_pathw.cu beam_gpu_rabitq.cu beam_gpu_rabitq_pruned.cu
-GPU_HEADERS = $(HEADERS_DIR)index.hpp $(HEADERS_DIR)qg.hpp $(HEADERS_DIR)utils.h $(HEADERS_DIR)search_bitonic.cuh $(HEADERS_DIR)search_pathw.cuh $(HEADERS_DIR)search_rabitq.cuh $(HEADERS_DIR)search_rabitq_pruned.cuh
-GPU_TARGET = gpu_search
+GPU_HEADERS = $(HEADERS_DIR)index.hpp $(HEADERS_DIR)qg.hpp $(HEADERS_DIR)utils.h $(HEADERS_DIR)utils.cuh $(HEADERS_DIR)distance.cuh
+GPU_MODE_TARGETS = gpu_base gpu_pathw gpu_rabitq gpu_rabitq_pruned
+GPU_BASE_FLAGS = -DGPU_SEARCH_MODE=1
+GPU_PATHW_FLAGS = -DGPU_SEARCH_MODE=2
+GPU_RABITQ_FLAGS = -DGPU_SEARCH_MODE=3
+GPU_RABITQ_PRUNED_FLAGS = -DGPU_SEARCH_MODE=4
 
 .PHONY: all cpu gpu clean
 
@@ -71,10 +74,22 @@ prepare_pathw_signbit: $(SRC_PREPARE_PATHW_SIGNBIT)
 # --------------------------------------------
 # GPU build
 # --------------------------------------------
-gpu: $(GPU_TARGET)
+gpu: $(GPU_MODE_TARGETS)
 
-$(GPU_TARGET): $(GPU_SOURCES) $(GPU_HEADERS)
-	$(NVCC) $(NVFLAGS) $(PTXAS_FLAGS) $(INCLUDES) -o $@ $(GPU_SOURCES)
+gpu_base: main.cu beam_gpu_base.cu $(GPU_HEADERS) $(HEADERS_DIR)search_bitonic.cuh
+	$(NVCC) $(NVFLAGS) $(PTXAS_FLAGS) $(INCLUDES) $(GPU_BASE_FLAGS) -o $@ main.cu beam_gpu_base.cu
+	mv $@ $(BIN_DIR)/
+
+gpu_pathw: main.cu beam_gpu_pathw.cu $(GPU_HEADERS) $(HEADERS_DIR)search_pathw.cuh
+	$(NVCC) $(NVFLAGS) $(PTXAS_FLAGS) $(INCLUDES) $(GPU_PATHW_FLAGS) -o $@ main.cu beam_gpu_pathw.cu
+	mv $@ $(BIN_DIR)/
+
+gpu_rabitq: main.cu beam_gpu_rabitq.cu $(GPU_HEADERS) $(HEADERS_DIR)search_rabitq.cuh
+	$(NVCC) $(NVFLAGS) $(PTXAS_FLAGS) $(INCLUDES) $(GPU_RABITQ_FLAGS) -o $@ main.cu beam_gpu_rabitq.cu
+	mv $@ $(BIN_DIR)/
+
+gpu_rabitq_pruned: main.cu beam_gpu_rabitq_pruned.cu $(GPU_HEADERS) $(HEADERS_DIR)search_rabitq_pruned.cuh $(HEADERS_DIR)search_rabitq_pruned_spec.cuh
+	$(NVCC) $(NVFLAGS) $(PTXAS_FLAGS) $(INCLUDES) $(GPU_RABITQ_PRUNED_FLAGS) -o $@ main.cu beam_gpu_rabitq_pruned.cu
 	mv $@ $(BIN_DIR)/
 
 # --------------------------------------------
@@ -82,4 +97,5 @@ $(GPU_TARGET): $(GPU_SOURCES) $(GPU_HEADERS)
 # --------------------------------------------
 clean:
 	rm -f $(CPU_TARGETS) $(addprefix $(BIN_DIR)/,$(CPU_TARGETS)) \
-	      $(BIN_DIR)/$(GPU_TARGET) *.o
+	      $(GPU_MODE_TARGETS) $(addprefix $(BIN_DIR)/,$(GPU_MODE_TARGETS)) \
+	      gpu_search $(BIN_DIR)/gpu_search *.o

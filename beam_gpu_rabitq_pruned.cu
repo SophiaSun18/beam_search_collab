@@ -1,7 +1,13 @@
 //#include <cuda_profiler_api.h>
 
 #include "include/qg.hpp"
+
+#if (defined(SEARCH_WIDTH) && SEARCH_WIDTH > 1) || defined(GPU_RABITQ_PRUNED_SPEC) || \
+    (defined(GPU_RABITQ_SPECULATION_WIDTH1) && GPU_RABITQ_SPECULATION_WIDTH1)
+#include "include/search_rabitq_pruned_spec.cuh"
+#else
 #include "include/search_rabitq_pruned.cuh"
+#endif
 
 #include <chrono>
 #include <cstddef>
@@ -44,36 +50,33 @@ void QuantizationGraph::gpu_search_pruned(int nq, const float* queries, int K,
   if (this->is_bins_mode()) {
     throw std::runtime_error("gpu_search_pruned currently supports only codebook-mode QuantizationGraph");
   }
-  if (K > beam_sz) {
-    throw std::runtime_error("GPU RaBitQ-pruned requires K <= beam_size");
-  }
   if (beam_sz <= 0) {
     throw std::runtime_error("GPU RaBitQ-pruned requires beam_size > 0");
   }
-  if (beam_sz > INTERNAL_TOPK) {
-    throw std::runtime_error(
-        "GPU RaBitQ-pruned requires beam_size <= compiled INTERNAL_TOPK (" +
-        std::to_string(INTERNAL_TOPK) + ")");
+  int padded_beam_size = static_cast<int>(gpu_effective_sort_beam_size(static_cast<uint32_t>(beam_sz), static_cast<uint32_t>(K)));
+  const size_t candidate_work_count = static_cast<size_t>(SEARCH_WIDTH) * this->degree_;
+  const size_t candidate_buffer_size = rabitq_pruned_candidate_buffer_size(static_cast<uint32_t>(this->degree_), prune_ratio, approx_ratio);
+#if !GPU_RABITQ_PRUNED_SPEC_KERNEL
+  if (candidate_work_count > candidate_buffer_size) {
+    throw std::runtime_error("GPU RaBitQ-pruned clean kernel requires degree <= candidate buffer size");
   }
-  if (this->degree_ > CANDIDATE_BUFFER_SIZE) {
-    throw std::runtime_error(
-        "GPU RaBitQ-pruned degree exceeds CANDIDATE_BUFFER_SIZE (" +
-        std::to_string(CANDIDATE_BUFFER_SIZE) + ")");
-  }
-
+#endif
   auto dim = this->dim_;
   auto npoints = this->num_nodes_;
   auto max_degree = this->degree_;
   auto beam_size = beam_sz;
-  auto bitlen = GPU_HASH_BITLEN_FOR_TOPK(beam_size);
+  auto bitlen = GPU_HASH_BITLEN_FOR_TOPK(padded_beam_size);
   const bool use_ip = (this->get_metric() == METRIC_IP);
   const int active_nq = nq;
 
-  printf("\nBeam search RaBitQ-pruned on GPU: K=%d, nq=%d, dim=%ld, npoints=%ld, beam_size=%d, internal_topk=%d\n",
-         K, active_nq, dim, npoints, beam_size, INTERNAL_TOPK);
+  printf("\nBeam search RaBitQ-pruned on GPU: K=%d, nq=%d, dim=%ld, npoints=%ld, beam_size=%d, padded_beam_size=%d, internal_topk=%d\n",
+         K, active_nq, dim, npoints, beam_size, padded_beam_size, INTERNAL_TOPK);
   printf("Metric: %s\n", metric_name(this->get_metric()));
   printf("RaBitQ-pruned params: prune_ratio=%.4f, keep_fraction=%.4f, prune_iteration_ratio=%.4f\n",
          prune_ratio, 1.0f - prune_ratio, approx_ratio);
+  printf("GPU rabitq-pruned mode: %s, search_width=%d, candidate_work_count=%zu, candidate_buffer_size=%zu\n",
+         GPU_RABITQ_PRUNED_SPEC_KERNEL ? "spec" : "clean", SEARCH_WIDTH,
+         candidate_work_count, candidate_buffer_size);
 
   size_t num_threads = BLOCK_SIZE;
   size_t num_blocks = active_nq;
@@ -136,8 +139,10 @@ void QuantizationGraph::gpu_search_pruned(int nq, const float* queries, int K,
   }
   printf("GPU rabitq-pruned entry point: %u\n", entry_point);
 
-  uint32_t shm_size = calculate_shared_mem_size(static_cast<int>(dim), beam_size, K,
-                                                static_cast<int>(max_degree), bitlen);
+  uint32_t shm_size = calculate_pruned_shared_mem_size(
+      static_cast<int>(dim), padded_beam_size, K, static_cast<int>(max_degree), bitlen,
+      prune_ratio, approx_ratio);
+  printf("Dynamic shared memory size = %u bytes\n", shm_size);
   CUDA_SAFE_CALL(cudaFuncSetAttribute(
       QuantizedPrunedBeamSearch,
       cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -155,7 +160,7 @@ void QuantizationGraph::gpu_search_pruned(int nq, const float* queries, int K,
   auto start = std::chrono::high_resolution_clock::now();
   QuantizedPrunedBeamSearch<<<num_blocks, num_threads, shm_size>>>(
       K, active_nq, static_cast<int>(dim), beam_size, bitlen, static_cast<int>(max_degree),
-      d_queries, d_qg_data, d_qg_signs, d_results, d_total_stats,
+      npoints, d_queries, d_qg_data, d_qg_signs, d_results, d_total_stats,
       entry_point, this->get_row_offset(), this->get_neighbor_offset(),
       this->get_code_offset(), this->get_factor_offset(), use_ip, prune_ratio, approx_ratio);
   CUDA_SAFE_CALL(cudaGetLastError());

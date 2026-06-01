@@ -8,12 +8,13 @@
 #ifndef INTERNAL_TOPK
 #define INTERNAL_TOPK   128
 #endif
-#define SEARCH_WIDTH    1     // MAX: 2 nodes * 32 degree = 64 neighbors = CANDIDATE_BUFFER_SIZE
+#ifndef SEARCH_WIDTH
+#define SEARCH_WIDTH    1
+#endif
 // #define BITLEN          GPU_HASH_BITLEN_FOR_TOPK(INTERNAL_TOPK)
 #define MAX_ITERATIONS (1 << 15)
 // #define TEAM_SIZE       8
 // #define HASH_TABLE_CONFIG   1
-#define CANDIDATE_BUFFER_SIZE 64
 // #define RESULT_BUFFER_SIZE (INTERNAL_TOPK + CANDIDATE_BUFFER_SIZE)
 
 #ifndef GPU_RABITQ_FASTSCAN_SUBWARP_LANES
@@ -30,29 +31,6 @@
 #error "GPU_RABITQ_FASTSCAN_SUBWARP_LANES must be one of 2, 4, 8, 16, or 32"
 #endif
 
-template <typename T>
-static __device__ inline void staged_copy_async_begin_or_sync(
-    T* __restrict__ dst,
-    const T* __restrict__ src,
-    int count) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
-    for (int i = threadIdx.x; i < count; i += blockDim.x) {
-        __pipeline_memcpy_async(dst + i, src + i, sizeof(T));
-    }
-    __pipeline_commit();
-#else
-    for (int i = threadIdx.x; i < count; i += blockDim.x) {
-        dst[i] = src[i];
-    }
-#endif
-}
-
-static __device__ inline void staged_copy_async_finish_or_sync() {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
-    __pipeline_wait_prior(0);
-#endif
-}
-
 static __host__ inline uint32_t calculate_shared_mem_size(int dim, int beam_sz, int result_k,
                                                            int max_deg, int bitlen) {
     auto align_up = [](size_t value, size_t alignment) {
@@ -60,12 +38,15 @@ static __host__ inline uint32_t calculate_shared_mem_size(int dim, int beam_sz, 
     };
     size_t padded_dim = 1ULL << static_cast<size_t>(ceilf(log2f(dim)));
     size_t code_words = padded_dim / 64;
-    const size_t result_buffer_size = static_cast<size_t>(beam_sz) + CANDIDATE_BUFFER_SIZE;
+    const size_t candidate_work_count = static_cast<size_t>(SEARCH_WIDTH) * static_cast<size_t>(max_deg);
+    const size_t candidate_buffer_size = round_up_power2_u32(static_cast<uint32_t>(candidate_work_count));
+    const size_t result_buffer_size = static_cast<size_t>(beam_sz) + candidate_buffer_size;
     size_t size = 0;
     size += hashtable_getsize(bitlen) * sizeof(INDEX_T);    // hash table
     size += result_buffer_size * sizeof(INDEX_T);           // top k and candidate index
     size += result_buffer_size * sizeof(DISTANCE_T);        // top k and candidate distance
-    size += SEARCH_WIDTH * sizeof(INDEX_T);                 // next expanders / parent buffer
+    size += SEARCH_WIDTH * sizeof(INDEX_T);                 // parent ranks / node ids
+    size += SEARCH_WIDTH * sizeof(DISTANCE_T);              // expanded parent exact distances
     size += dim * 4;                                        // query buffer size
     size += padded_dim * sizeof(float);                     // rotated query
     size += padded_dim * sizeof(uint8_t);                   // quantized query
@@ -75,8 +56,8 @@ static __host__ inline uint32_t calculate_shared_mem_size(int dim, int beam_sz, 
     size += 3 * sizeof(float);                              // low/high/width
     size += sizeof(int32_t);                                // sum_q
     size = align_up(size, alignof(uint64_t));               // align staged candidate codes
-    size += max_deg * code_words * sizeof(uint64_t);        // staged candidate codes
-    size += 3 * max_deg * sizeof(float);                    // staged candidate factors
+    size += candidate_work_count * code_words * sizeof(uint64_t); // staged candidate codes
+    size += 3 * candidate_work_count * sizeof(float);       // staged candidate factors
     size += sizeof(uint32_t);                               // hops
     if (GPU_SEARCH_STATS) {
         size += GPU_SEARCH_STAT_COUNT * sizeof(uint32_t);   // search stats
@@ -93,7 +74,7 @@ static __host__ inline uint32_t calculate_shared_mem_size(int dim, int beam_sz, 
 
 static __global__ GPU_LAUNCH_BOUNDS(BLOCK_SIZE)
 void QuantizedBeamSearch(
-    int K, int nq, int dim, int beam_sz, int bitlen, int max_degree,
+    int K, int nq, int dim, int beam_sz, int bitlen, int max_degree, size_t npoints,
     const float* __restrict__ d_queries,
     const float* __restrict__ d_qg_data,
     const float* __restrict__ d_qg_signs,
@@ -119,21 +100,28 @@ void QuantizedBeamSearch(
     
     size_t padded_dim = 1ULL << static_cast<size_t>(ceilf(log2f(dim)));
     size_t code_words = padded_dim / 64;
+    const uint32_t candidate_work_count = static_cast<uint32_t>(SEARCH_WIDTH) * static_cast<uint32_t>(max_degree);
+    const uint32_t candidate_buffer_size = round_up_power2_u32(candidate_work_count);
+    const uint32_t logical_beam_size = static_cast<uint32_t>(beam_sz);
+    const uint32_t padded_beam_size = gpu_effective_sort_beam_size(logical_beam_size, static_cast<uint32_t>(K));
+    constexpr unsigned candidate_sort_items_per_thread =
+        (SEARCH_WIDTH <= 1) ? 1 : ((SEARCH_WIDTH <= 2) ? 2 : 4);
 
     // initialize the shared memory
     extern __shared__ char shared_memory[];
     INDEX_T* ALL_INDEX = (INDEX_T*)shared_memory;
     INDEX_T* TOP_K_INDEX      = ALL_INDEX;
-    INDEX_T* CANDIDATE_INDEX  = ALL_INDEX + beam_sz;
+    INDEX_T* CANDIDATE_INDEX  = ALL_INDEX + padded_beam_size;
 
-    const uint32_t result_buffer_size = static_cast<uint32_t>(beam_sz + CANDIDATE_BUFFER_SIZE);
+    const uint32_t result_buffer_size = padded_beam_size + candidate_buffer_size;
     DISTANCE_T* ALL_DISTANCE = (DISTANCE_T*)(ALL_INDEX + result_buffer_size);
     DISTANCE_T* TOP_K_DISTANCE      = ALL_DISTANCE;
-    DISTANCE_T* CANDIDATE_DISTANCE  = ALL_DISTANCE + beam_sz;
+    DISTANCE_T* CANDIDATE_DISTANCE  = ALL_DISTANCE + padded_beam_size;
 
     INDEX_T* HASH_TABLE = (INDEX_T*)(ALL_DISTANCE + result_buffer_size);
     INDEX_T* PARENT_LIST = (INDEX_T*)(HASH_TABLE + hashtable_getsize(bitlen));
-    DATA_T* QUERY_BUFFER = (DATA_T*)(PARENT_LIST + SEARCH_WIDTH);
+    DISTANCE_T* PARENT_DISTANCE_LIST = reinterpret_cast<DISTANCE_T*>(PARENT_LIST + SEARCH_WIDTH);
+    DATA_T* QUERY_BUFFER = reinterpret_cast<DATA_T*>(PARENT_DISTANCE_LIST + SEARCH_WIDTH);
 
     float* ROTATED_QUERY_BUFFER = reinterpret_cast<float*>(QUERY_BUFFER + dim);
     uint8_t* QUANTIZED_QUERY_BUFFER = reinterpret_cast<uint8_t*>(ROTATED_QUERY_BUFFER + padded_dim);
@@ -149,13 +137,13 @@ void QuantizedBeamSearch(
     char* staged_base = reinterpret_cast<char*>(sum_q + 1);
     staged_base = reinterpret_cast<char*>((reinterpret_cast<uintptr_t>(staged_base) + alignof(uint64_t) - 1) & ~(static_cast<uintptr_t>(alignof(uint64_t)) - 1));
     uint64_t* STAGED_CODE_BUFFER = reinterpret_cast<uint64_t*>(staged_base);
-    float* STAGED_FACTOR_BUFFER = reinterpret_cast<float*>(STAGED_CODE_BUFFER + max_degree * code_words);
+    float* STAGED_FACTOR_BUFFER = reinterpret_cast<float*>(STAGED_CODE_BUFFER + static_cast<size_t>(candidate_work_count) * code_words);
 
-    uint32_t* hops = reinterpret_cast<uint32_t*>(STAGED_FACTOR_BUFFER + 3 * max_degree);
+    uint32_t* hops = reinterpret_cast<uint32_t*>(STAGED_FACTOR_BUFFER + 3 * candidate_work_count);
     uint32_t* stats = hops + 1;
     INDEX_T* MERGED_TOPK_INDEX = reinterpret_cast<INDEX_T*>(stats + (GPU_SEARCH_STATS ? GPU_SEARCH_STAT_COUNT : 0));
-    DISTANCE_T* MERGED_TOPK_DISTANCE = reinterpret_cast<DISTANCE_T*>(MERGED_TOPK_INDEX + beam_sz);
-    INDEX_T* RESULT_POOL_INDEX = reinterpret_cast<INDEX_T*>(MERGED_TOPK_DISTANCE + beam_sz);
+    DISTANCE_T* MERGED_TOPK_DISTANCE = reinterpret_cast<DISTANCE_T*>(MERGED_TOPK_INDEX + padded_beam_size);
+    INDEX_T* RESULT_POOL_INDEX = reinterpret_cast<INDEX_T*>(MERGED_TOPK_DISTANCE + padded_beam_size);
     DISTANCE_T* RESULT_POOL_DISTANCE = reinterpret_cast<DISTANCE_T*>(RESULT_POOL_INDEX + K);
     uint32_t* result_pool_size = reinterpret_cast<uint32_t*>(RESULT_POOL_DISTANCE + K);
     uint32_t* result_pool_worst_idx = result_pool_size + 1;
@@ -202,13 +190,17 @@ void QuantizedBeamSearch(
     }
 
     // load the top k list and candidate list with dummy initial values
-    for (int i = tid; i < beam_sz; i += blockDim.x) {
+    for (int i = tid; i < static_cast<int>(padded_beam_size); i += blockDim.x) {
         TOP_K_INDEX[i] = MAX_INDEX;
         TOP_K_DISTANCE[i] = FLT_MAX;
     }
-    for (int i = tid; i < CANDIDATE_BUFFER_SIZE; i += blockDim.x) {
+    for (int i = tid; i < candidate_buffer_size; i += blockDim.x) {
         CANDIDATE_INDEX[i] = MAX_INDEX;
         CANDIDATE_DISTANCE[i] = FLT_MAX;
+    }
+    for (int i = tid; i < SEARCH_WIDTH; i += blockDim.x) {
+        PARENT_LIST[i] = MAX_INDEX;
+        PARENT_DISTANCE_LIST[i] = FLT_MAX;
     }
     for (int i = tid; i < K; i += blockDim.x) {
         RESULT_POOL_INDEX[i] = MAX_INDEX;
@@ -236,7 +228,6 @@ void QuantizedBeamSearch(
 
     // loop end condition: either entire topK expanded, or reach max iteration limit
     for (int iter = 0; iter < MAX_ITERATIONS; iter++) {
-
         // forgettable hash table management according to the CARGA paper
         // if ((iter + 1) % SMALL_HASH_RESET_INTERVAL == 0) {
         //     hashtable_init(HASH_TABLE, bitlen);
@@ -245,20 +236,30 @@ void QuantizedBeamSearch(
         // }
         // __syncthreads();
 
-        dispatch_topk_by_sort_candidates_and_merge<2>(
+        dispatch_topk_by_sort_candidates_and_merge<candidate_sort_items_per_thread>(
             ALL_INDEX, ALL_DISTANCE, MERGED_TOPK_INDEX, MERGED_TOPK_DISTANCE,
-            result_buffer_size, CANDIDATE_BUFFER_SIZE, beam_sz, (iter == 0));
+            result_buffer_size, candidate_buffer_size, padded_beam_size, (iter == 0));
+        __syncthreads();
+
+        for (uint32_t i = logical_beam_size + tid; i < padded_beam_size; i += blockDim.x) {
+            TOP_K_INDEX[i] = MAX_INDEX;
+            TOP_K_DISTANCE[i] = FLT_MAX;
+        }
         __syncthreads();
 
         // clear the candidate buffer before next iteration to avoid stale entries
-        for (int i = tid; i < CANDIDATE_BUFFER_SIZE; i += blockDim.x) {
+        for (int i = tid; i < candidate_buffer_size; i += blockDim.x) {
             CANDIDATE_INDEX[i] = MAX_INDEX;
             CANDIDATE_DISTANCE[i] = FLT_MAX;
+        }
+        for (int i = tid; i < SEARCH_WIDTH; i += blockDim.x) {
+            PARENT_LIST[i] = MAX_INDEX;
+            PARENT_DISTANCE_LIST[i] = FLT_MAX;
         }
         __syncthreads();
 
         if (warp_id == 0) {
-            keep_expanding = pick_expanders(SEARCH_WIDTH, PARENT_LIST, beam_sz, TOP_K_INDEX);
+            keep_expanding = pick_expanders(SEARCH_WIDTH, PARENT_LIST, logical_beam_size, TOP_K_INDEX);
         }
         __syncthreads();
 
@@ -269,9 +270,22 @@ void QuantizedBeamSearch(
             break;
         }
 
-        INDEX_T current_node = TOP_K_INDEX[PARENT_LIST[0]] & 0x7fffffffu;
         if (tid == 0) {
-            current_expanded = hashtable_insert(HASH_TABLE, bitlen, current_node);
+            current_expanded = 0;
+            for (int p = 0; p < SEARCH_WIDTH; ++p) {
+                if (p >= static_cast<int>(keep_expanding)) {
+                    PARENT_LIST[p] = MAX_INDEX;
+                    continue;
+                }
+                const INDEX_T parent_node = TOP_K_INDEX[PARENT_LIST[p]] & 0x7fffffffu;
+                if (parent_node != MAX_INDEX && parent_node < npoints &&
+                    hashtable_insert(HASH_TABLE, bitlen, parent_node)) {
+                    PARENT_LIST[p] = parent_node;
+                    ++current_expanded;
+                } else {
+                    PARENT_LIST[p] = MAX_INDEX;
+                }
+            }
         }
         __syncthreads();
 
@@ -279,35 +293,89 @@ void QuantizedBeamSearch(
             continue;
         }
 
-        const float* current_row = d_qg_data + static_cast<size_t>(current_node) * row_offset;
-        const vidType* current_neighbors = reinterpret_cast<const vidType*>(current_row + neighbor_offset);
-        const uint64_t* current_codes = reinterpret_cast<const uint64_t*>(current_row + code_offset);
-        const float* current_factors = current_row + factor_offset;
+        const size_t parent_code_words = static_cast<size_t>(max_degree) * code_words;
+        const size_t parent_factor_count = 3ULL * static_cast<size_t>(max_degree);
+        for (int p = 0; p < SEARCH_WIDTH; ++p) {
+            const INDEX_T parent_node = PARENT_LIST[p];
+            if (parent_node == MAX_INDEX) continue;
 
-        staged_copy_async_begin_or_sync(STAGED_CODE_BUFFER, current_codes, static_cast<int>(max_degree * code_words));
-        staged_copy_async_begin_or_sync(STAGED_FACTOR_BUFFER, current_factors, 3 * max_degree);
-
-        DISTANCE_T exact_dist = warp_distance(dim, query, current_row, use_ip);
-        if (GPU_SEARCH_STATS && tid == 0) {
-            stats[GPU_SEARCH_STAT_ITERATIONS]++;
-            local_exact_count++;
-        }
-        if (tid == 0) {
-            result_pool_push_unique_unsorted(RESULT_POOL_INDEX, RESULT_POOL_DISTANCE, result_pool_size,
-                result_pool_worst_idx, result_pool_worst_dist, K, current_node, exact_dist);
-        }
-        for (int i = tid; i < CANDIDATE_BUFFER_SIZE; i += blockDim.x) {
-            INDEX_T child_id = (i < max_degree) ? current_neighbors[i] : MAX_INDEX;
-            if (child_id != MAX_INDEX && hashtable_contains(HASH_TABLE, bitlen, child_id)) {
-                child_id = MAX_INDEX;
+            const float* parent_row = d_qg_data + static_cast<size_t>(parent_node) * row_offset;
+            const uint64_t* parent_codes = reinterpret_cast<const uint64_t*>(parent_row + code_offset);
+            const float* parent_factors = parent_row + factor_offset;
+            uint64_t* staged_codes = STAGED_CODE_BUFFER + static_cast<size_t>(p) * parent_code_words;
+            float* staged_factors = STAGED_FACTOR_BUFFER + static_cast<size_t>(p) * parent_factor_count;
+            for (int i = tid; i < static_cast<int>(parent_code_words); i += blockDim.x) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+                __pipeline_memcpy_async(staged_codes + i, parent_codes + i, sizeof(uint64_t));
+#else
+                staged_codes[i] = parent_codes[i];
+#endif
             }
-            CANDIDATE_INDEX[i] = child_id;
-            CANDIDATE_DISTANCE[i] = (child_id == MAX_INDEX) ? FLT_MAX : 0;
+            for (int i = tid; i < static_cast<int>(parent_factor_count); i += blockDim.x) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+                __pipeline_memcpy_async(staged_factors + i, parent_factors + i, sizeof(float));
+#else
+                staged_factors[i] = parent_factors[i];
+#endif
+            }
+        }
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+        __pipeline_commit();
+#endif
+
+        for (int p = warp_id; p < SEARCH_WIDTH; p += WARPS_PER_BLOCK) {
+            if (p >= static_cast<int>(keep_expanding)) continue;
+            const INDEX_T parent_node = PARENT_LIST[p];
+            if (parent_node == MAX_INDEX) continue;
+
+            const float* parent_row = d_qg_data + static_cast<size_t>(parent_node) * row_offset;
+            DISTANCE_T exact_dist = warp_distance(dim, query, parent_row, use_ip);
+            if (lane_id == 0) {
+                PARENT_DISTANCE_LIST[p] = exact_dist;
+                if (GPU_SEARCH_STATS) local_exact_count++;
+            }
         }
         __syncthreads();
 
-        // wait for the async copy to finish before move on to computation
-        staged_copy_async_finish_or_sync();
+        if (tid == 0) {
+            if (GPU_SEARCH_STATS) {
+                stats[GPU_SEARCH_STAT_ITERATIONS] += current_expanded;
+            }
+            for (int p = 0; p < SEARCH_WIDTH; ++p) {
+                if (p >= static_cast<int>(keep_expanding)) continue;
+                const INDEX_T parent_node = PARENT_LIST[p];
+                if (parent_node == MAX_INDEX) continue;
+                result_pool_push_unique_unsorted(
+                    RESULT_POOL_INDEX, RESULT_POOL_DISTANCE, result_pool_size,
+                    result_pool_worst_idx, result_pool_worst_dist, K,
+                    parent_node, PARENT_DISTANCE_LIST[p]);
+            }
+        }
+        __syncthreads();
+
+        for (int p = 0; p < SEARCH_WIDTH; ++p) {
+            const INDEX_T parent_node = PARENT_LIST[p];
+            if (parent_node == MAX_INDEX) continue;
+
+            const float* parent_row = d_qg_data + static_cast<size_t>(parent_node) * row_offset;
+            const vidType* parent_neighbors = reinterpret_cast<const vidType*>(parent_row + neighbor_offset);
+            const uint32_t candidate_base = static_cast<uint32_t>(p) * static_cast<uint32_t>(max_degree);
+            for (int neighbor_idx = tid; neighbor_idx < max_degree; neighbor_idx += blockDim.x) {
+                INDEX_T child_id = parent_neighbors[neighbor_idx];
+                if (child_id >= npoints) {
+                    child_id = MAX_INDEX;
+                }
+                if (child_id != MAX_INDEX && hashtable_contains(HASH_TABLE, bitlen, child_id)) {
+                    child_id = MAX_INDEX;
+                }
+                const uint32_t candidate_idx = candidate_base + static_cast<uint32_t>(neighbor_idx);
+                CANDIDATE_INDEX[candidate_idx] = child_id;
+                CANDIDATE_DISTANCE[candidate_idx] = (child_id == MAX_INDEX) ? FLT_MAX : 0;
+            }
+        }
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+        __pipeline_wait_prior(0);
+#endif
         __syncthreads();
 
         // all warps work together to compute candidate distance
@@ -316,25 +384,33 @@ void QuantizedBeamSearch(
             uint32_t warp_dist_est_count = 0;
 
 #if GPU_RABITQ_FASTSCAN_SUBWARP_LANES == 32
-            for (int i = warp_id; i < max_degree; i += WARPS_PER_BLOCK) {
-                if (CANDIDATE_INDEX[i] == MAX_INDEX) continue;
+            for (int p = 0; p < SEARCH_WIDTH; ++p) {
+                if (PARENT_LIST[p] == MAX_INDEX) continue;
+                const uint32_t candidate_base = static_cast<uint32_t>(p) * static_cast<uint32_t>(max_degree);
+                const uint64_t* parent_code_base = STAGED_CODE_BUFFER + static_cast<size_t>(p) * parent_code_words;
+                const float* parent_factor_base = STAGED_FACTOR_BUFFER + static_cast<size_t>(p) * parent_factor_count;
+                const DISTANCE_T parent_distance = PARENT_DISTANCE_LIST[p];
+                for (int neighbor_idx = warp_id; neighbor_idx < max_degree; neighbor_idx += WARPS_PER_BLOCK) {
+                    const uint32_t candidate_idx = candidate_base + static_cast<uint32_t>(neighbor_idx);
+                    if (CANDIDATE_INDEX[candidate_idx] == MAX_INDEX) continue;
 
-                const int batch = i / WARP_SIZE;
-                const int neighbor_idx = i & (WARP_SIZE - 1);
-                const uint8_t* packed_codes_block =
-                    reinterpret_cast<const uint8_t*>(STAGED_CODE_BUFFER) + batch * padded_dim * 4;
-                const float* triple_x = STAGED_FACTOR_BUFFER + i;
-                const float* factor_dq = STAGED_FACTOR_BUFFER + max_degree + i;
-                const float* factor_vq = STAGED_FACTOR_BUFFER + 2 * max_degree + i;
+                    const int batch = neighbor_idx / WARP_SIZE;
+                    const int batch_neighbor_idx = neighbor_idx & (WARP_SIZE - 1);
+                    const uint8_t* packed_codes_block =
+                        reinterpret_cast<const uint8_t*>(parent_code_base) + batch * padded_dim * 4;
+                    const float* triple_x = parent_factor_base + neighbor_idx;
+                    const float* factor_dq = parent_factor_base + max_degree + neighbor_idx;
+                    const float* factor_vq = parent_factor_base + 2 * max_degree + neighbor_idx;
 
-                const DISTANCE_T est_dist = scan_one_neighbor_lanes_gpu<32>(
-                    qf, packed_codes_block, neighbor_idx, triple_x, factor_dq, factor_vq,
-                    exact_dist, padded_dim, bytes_per_neighbor);
-                if (lane_id == 0) {
-                    CANDIDATE_DISTANCE[i] = est_dist;
-                    if (GPU_SEARCH_STATS) warp_dist_est_count++;
+                    const DISTANCE_T est_dist = scan_one_neighbor_lanes_gpu<32>(
+                        qf, packed_codes_block, batch_neighbor_idx, triple_x, factor_dq, factor_vq,
+                        parent_distance, padded_dim, bytes_per_neighbor);
+                    if (lane_id == 0) {
+                        CANDIDATE_DISTANCE[candidate_idx] = est_dist;
+                        if (GPU_SEARCH_STATS) warp_dist_est_count++;
+                    }
+                    __syncwarp();
                 }
-                __syncwarp();
             }
 #else
             constexpr int lanes_per_neighbor = GPU_RABITQ_FASTSCAN_SUBWARP_LANES;
@@ -343,27 +419,35 @@ void QuantizedBeamSearch(
             const int warp_group = lane_id / lanes_per_neighbor;
             uint32_t group_dist_est_count = 0;
 
-            for (int base = warp_id * groups_per_warp; base < max_degree; base += WARPS_PER_BLOCK * groups_per_warp) {
-                const int i = base + warp_group;
-                const bool valid_candidate = i < max_degree && CANDIDATE_INDEX[i] != MAX_INDEX;
-                if (valid_candidate) {
-                    const int batch = i / WARP_SIZE;
-                    const int neighbor_idx = i & (WARP_SIZE - 1);
-                    const uint8_t* packed_codes_block =
-                        reinterpret_cast<const uint8_t*>(STAGED_CODE_BUFFER) + batch * padded_dim * 4;
-                    const float* triple_x = STAGED_FACTOR_BUFFER + i;
-                    const float* factor_dq = STAGED_FACTOR_BUFFER + max_degree + i;
-                    const float* factor_vq = STAGED_FACTOR_BUFFER + 2 * max_degree + i;
+            for (int p = 0; p < SEARCH_WIDTH; ++p) {
+                if (PARENT_LIST[p] == MAX_INDEX) continue;
+                const uint32_t candidate_base = static_cast<uint32_t>(p) * static_cast<uint32_t>(max_degree);
+                const uint64_t* parent_code_base = STAGED_CODE_BUFFER + static_cast<size_t>(p) * parent_code_words;
+                const float* parent_factor_base = STAGED_FACTOR_BUFFER + static_cast<size_t>(p) * parent_factor_count;
+                const DISTANCE_T parent_distance = PARENT_DISTANCE_LIST[p];
+                for (int base = warp_id * groups_per_warp; base < max_degree; base += WARPS_PER_BLOCK * groups_per_warp) {
+                    const int neighbor_idx = base + warp_group;
+                    const uint32_t candidate_idx = candidate_base + static_cast<uint32_t>(neighbor_idx);
+                    const bool valid_candidate = neighbor_idx < max_degree && CANDIDATE_INDEX[candidate_idx] != MAX_INDEX;
+                    if (valid_candidate) {
+                        const int batch = neighbor_idx / WARP_SIZE;
+                        const int batch_neighbor_idx = neighbor_idx & (WARP_SIZE - 1);
+                        const uint8_t* packed_codes_block =
+                            reinterpret_cast<const uint8_t*>(parent_code_base) + batch * padded_dim * 4;
+                        const float* triple_x = parent_factor_base + neighbor_idx;
+                        const float* factor_dq = parent_factor_base + max_degree + neighbor_idx;
+                        const float* factor_vq = parent_factor_base + 2 * max_degree + neighbor_idx;
 
-                    const DISTANCE_T est_dist = scan_one_neighbor_lanes_gpu<lanes_per_neighbor>(
-                        qf, packed_codes_block, neighbor_idx, triple_x, factor_dq, factor_vq,
-                        exact_dist, padded_dim, bytes_per_neighbor);
-                    if (group_lane == 0) {
-                        CANDIDATE_DISTANCE[i] = est_dist;
-                        if (GPU_SEARCH_STATS) group_dist_est_count++;
+                        const DISTANCE_T est_dist = scan_one_neighbor_lanes_gpu<lanes_per_neighbor>(
+                            qf, packed_codes_block, batch_neighbor_idx, triple_x, factor_dq, factor_vq,
+                            parent_distance, padded_dim, bytes_per_neighbor);
+                        if (group_lane == 0) {
+                            CANDIDATE_DISTANCE[candidate_idx] = est_dist;
+                            if (GPU_SEARCH_STATS) group_dist_est_count++;
+                        }
                     }
+                    __syncwarp();
                 }
-                __syncwarp();
             }
 
             if (GPU_SEARCH_STATS) {
@@ -378,27 +462,35 @@ void QuantizedBeamSearch(
             }
         } else { // no LUT, all warps compute independently
             uint32_t warp_dist_est_count = 0;
-            for (int i = warp_id; i < max_degree; i += WARPS_PER_BLOCK) {
-                if (CANDIDATE_INDEX[i] == MAX_INDEX) continue;
+            for (int p = 0; p < SEARCH_WIDTH; ++p) {
+                if (PARENT_LIST[p] == MAX_INDEX) continue;
+                const uint32_t candidate_base = static_cast<uint32_t>(p) * static_cast<uint32_t>(max_degree);
+                const uint64_t* parent_code_base = STAGED_CODE_BUFFER + static_cast<size_t>(p) * parent_code_words;
+                const float* parent_factor_base = STAGED_FACTOR_BUFFER + static_cast<size_t>(p) * parent_factor_count;
+                const DISTANCE_T parent_distance = PARENT_DISTANCE_LIST[p];
+                for (int neighbor_idx = warp_id; neighbor_idx < max_degree; neighbor_idx += WARPS_PER_BLOCK) {
+                    const uint32_t candidate_idx = candidate_base + static_cast<uint32_t>(neighbor_idx);
+                    if (CANDIDATE_INDEX[candidate_idx] == MAX_INDEX) continue;
 
-                const uint64_t* packed_code = STAGED_CODE_BUFFER + static_cast<size_t>(i) * code_words;
-                float triple_x = 0.0f;
-                float factor_dq = 0.0f;
-                float factor_vq = 0.0f;
-                if (lane_id == 0) {
-                    triple_x = STAGED_FACTOR_BUFFER[i];
-                    factor_dq = STAGED_FACTOR_BUFFER[max_degree + i];
-                    factor_vq = STAGED_FACTOR_BUFFER[2 * max_degree + i];
-                }
-                triple_x = SHFL(triple_x, 0);
-                factor_dq = SHFL(factor_dq, 0);
-                factor_vq = SHFL(factor_vq, 0);
+                    const uint64_t* packed_code = parent_code_base + static_cast<size_t>(neighbor_idx) * code_words;
+                    float triple_x = 0.0f;
+                    float factor_dq = 0.0f;
+                    float factor_vq = 0.0f;
+                    if (lane_id == 0) {
+                        triple_x = parent_factor_base[neighbor_idx];
+                        factor_dq = parent_factor_base[max_degree + neighbor_idx];
+                        factor_vq = parent_factor_base[2 * max_degree + neighbor_idx];
+                    }
+                    triple_x = SHFL(triple_x, 0);
+                    factor_dq = SHFL(factor_dq, 0);
+                    factor_vq = SHFL(factor_vq, 0);
 
-                const DISTANCE_T est_dist = estimate_one_neighbor_warp_no_lut_gpu(
-                    qf, packed_code, triple_x, factor_dq, factor_vq, exact_dist, padded_dim);
-                if (lane_id == 0) {
-                    CANDIDATE_DISTANCE[i] = isfinite(est_dist) ? est_dist : FLT_MAX;
-                    if (GPU_SEARCH_STATS) warp_dist_est_count++;
+                    const DISTANCE_T est_dist = estimate_one_neighbor_warp_no_lut_gpu(
+                        qf, packed_code, triple_x, factor_dq, factor_vq, parent_distance, padded_dim);
+                    if (lane_id == 0) {
+                        CANDIDATE_DISTANCE[candidate_idx] = isfinite(est_dist) ? est_dist : FLT_MAX;
+                        if (GPU_SEARCH_STATS) warp_dist_est_count++;
+                    }
                 }
             }
             if (lane_id == 0) {
@@ -409,9 +501,9 @@ void QuantizedBeamSearch(
     }
 
     // final sort before writeback
-    dispatch_topk_by_sort_candidates_and_merge<2>(
+    dispatch_topk_by_sort_candidates_and_merge<candidate_sort_items_per_thread>(
         ALL_INDEX, ALL_DISTANCE, MERGED_TOPK_INDEX, MERGED_TOPK_DISTANCE,
-        result_buffer_size, CANDIDATE_BUFFER_SIZE, beam_sz, false);
+        result_buffer_size, candidate_buffer_size, padded_beam_size, false);
     __syncthreads();
 
     if (tid == 0) {
@@ -448,7 +540,9 @@ void QuantizedBeamSearch(
                 if (nbr_idx < max_degree) {
                     if (lane_id == 0) {
                         child_node = parent_neighbors[nbr_idx];
-                        inserted = hashtable_insert(HASH_TABLE, bitlen, child_node);
+                        if (child_node != MAX_INDEX) {
+                            inserted = hashtable_insert(HASH_TABLE, bitlen, child_node);
+                        }
                     }
                     child_node = __shfl_sync(FULL_MASK, child_node, 0);
                     inserted = __shfl_sync(FULL_MASK, inserted, 0);
