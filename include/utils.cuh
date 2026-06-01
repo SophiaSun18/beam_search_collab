@@ -13,11 +13,15 @@
 #define WARP_SIZE     32
 #define LOG_WARP_SIZE 5
 #define WARPS_PER_BLOCK (BLOCK_SIZE / WARP_SIZE)
+#define TEAM_SIZE_DEFAULT 8
 
 #define GPU_HASH_BASE_BITLEN 11
 #define GPU_HASH_BITLEN_FOR_TOPK(topk)                                            \
   (((topk) * 4 > 3 * (1 << GPU_HASH_BASE_BITLEN)) ? (GPU_HASH_BASE_BITLEN + 1) : GPU_HASH_BASE_BITLEN)
-   
+
+#define GPU_FAST_BITONIC_TOPK_CAP 128
+#define GPU_RABITQ_USE_BLOCK_CANDIDATE_SORT 0
+
 //#define FLT_MAX 3.40282347e+38
 #ifndef GPU_SEARCH_STATS
 #define GPU_SEARCH_STATS 0
@@ -36,6 +40,31 @@
 #define SHFL_DOWN(val, offset) __shfl_down_sync(FULL_MASK, val, offset)
 #define SHFL(val, lane) __shfl_sync(FULL_MASK, val, lane)
 #define SHFL_XOR(val, mask) __shfl_xor_sync(FULL_MASK, val, mask)
+
+__host__ __device__ inline uint32_t round_up_power2_u32(uint32_t x) {
+  if (x <= 1) return 1;
+  --x;
+  x |= x >> 1;
+  x |= x >> 2;
+  x |= x >> 4;
+  x |= x >> 8;
+  x |= x >> 16;
+  return x + 1;
+}
+
+__host__ __device__ inline bool is_power2_u32(uint32_t x) {
+  return x != 0 && (x & (x - 1)) == 0;
+}
+
+__host__ __device__ inline uint32_t gpu_effective_sort_beam_size(uint32_t beam_size, uint32_t K) {
+  (void)K;
+  if (beam_size == 0) return 0;
+  const uint32_t rounded = round_up_power2_u32(beam_size);
+  if (rounded <= GPU_FAST_BITONIC_TOPK_CAP) {
+    return rounded < WARP_SIZE ? WARP_SIZE : rounded;
+  }
+  return beam_size;
+}
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890) && (__CUDA_ARCH__ < 900)
 #define GPU_MAX_WARPS_PER_SM 48
@@ -109,6 +138,12 @@ public:
     CUDA_SAFE_CALL(cudaMalloc((void **)&d_edges, n * d * sizeof(vidType)));
     CUDA_SAFE_CALL(cudaMemcpy(d_edges, h_edges, n * d * sizeof(vidType), cudaMemcpyHostToDevice));
     CUDA_SAFE_CALL(cudaDeviceSynchronize());
+  }
+  void release() {
+    if (d_edges != nullptr) {
+      CUDA_SAFE_CALL(cudaFree(d_edges));
+      d_edges = nullptr;
+    }
   }
   inline __device__ __host__ vidType V() { return nv; }
   inline __device__ __host__ vidType get_max_degree() { return maxDeg; }
@@ -198,7 +233,18 @@ __device__ inline void swap_if_needed(K& k0, V& v0, K& k1, V& v1, const bool asc
 
 template <class K, class V, unsigned _N, unsigned warp_size>
 __device__ inline void warp_merge_core(K k[2], V v[2], const std::uint32_t range, const bool asc) {
-  if (_N == 2) {
+  if (_N == 1) {
+    const auto lane_id = threadIdx.x % warp_size;
+    if (range == 1) {
+      return;
+    }
+
+    const std::uint32_t b = range;
+    for (std::uint32_t c = b / 2; c >= 1; c >>= 1) {
+      const auto p = static_cast<bool>(lane_id & b) == static_cast<bool>(lane_id & c);
+      swap_if_needed<float, uint32_t>(k[0], v[0], c, p);
+    }
+  } else if (_N == 2) {
     constexpr unsigned N = 2;
     const auto lane_id   = threadIdx.x % warp_size;
 
@@ -218,8 +264,8 @@ __device__ inline void warp_merge_core(K k[2], V v[2], const std::uint32_t range
     }
     const auto p = ((lane_id & b) == 0);
     swap_if_needed<float, uint32_t>(k[0], v[0], k[1], v[1], p);
-  } else if (_N == 4) {
-    constexpr unsigned N = 4;
+  } else {
+    constexpr unsigned N = _N;
     const auto lane_id = threadIdx.x % warp_size;
     if (range == 1) {
       for (std::uint32_t b = 2; b <= N; b <<= 1) {
@@ -279,8 +325,8 @@ __device__ void candidate_by_bitonic_sort(
 
   // sort 1
   if (warp_id > 0) return;
-  if (CANDIDATE_BUFFER_SIZE > 64) {
-    printf("CANDIDATE_BUFFER_SIZE must be <= 64\n");
+  if (CANDIDATE_BUFFER_SIZE > N_1 * WARP_SIZE) {
+    printf("CANDIDATE_BUFFER_SIZE must be <= %u\n", N_1 * WARP_SIZE);
     assert(false);
   }
   // constexpr unsigned N_1 = 2;
@@ -310,6 +356,50 @@ __device__ void candidate_by_bitonic_sort(
   }
 }
 
+__device__ inline void candidate_by_bitonic_sort_runtime(
+    INDEX_T* candidate_indices,
+    DISTANCE_T* candidate_distances,
+    uint32_t candidate_buffer_size) {
+  const uint32_t items_per_thread =
+      (candidate_buffer_size + WARP_SIZE - 1) / WARP_SIZE;
+  if (GPU_RABITQ_USE_BLOCK_CANDIDATE_SORT || items_per_thread > 4) {
+    if (!is_power2_u32(candidate_buffer_size)) {
+      printf("block candidate sort requires power-of-two buffer size, got %u\n",
+             candidate_buffer_size);
+      assert(false);
+    }
+    for (uint32_t k = 2; k <= candidate_buffer_size; k <<= 1) {
+      for (uint32_t j = k >> 1; j > 0; j >>= 1) {
+        for (uint32_t i = threadIdx.x; i < candidate_buffer_size; i += blockDim.x) {
+          const uint32_t ixj = i ^ j;
+          if (ixj > i && ixj < candidate_buffer_size) {
+            const bool up = ((i & k) == 0);
+            const DISTANCE_T di = candidate_distances[i];
+            const DISTANCE_T dj = candidate_distances[ixj];
+            if ((di > dj) == up) {
+              candidate_distances[i] = dj;
+              candidate_distances[ixj] = di;
+              const INDEX_T ti = candidate_indices[i];
+              candidate_indices[i] = candidate_indices[ixj];
+              candidate_indices[ixj] = ti;
+            }
+          }
+        }
+        __syncthreads();
+      }
+    }
+  } else if (items_per_thread <= 1) {
+    candidate_by_bitonic_sort<1, 0>(
+        candidate_indices, candidate_distances, candidate_buffer_size);
+  } else if (items_per_thread <= 2) {
+    candidate_by_bitonic_sort<2, 0>(
+        candidate_indices, candidate_distances, candidate_buffer_size);
+  } else {
+    candidate_by_bitonic_sort<4, 0>(
+        candidate_indices, candidate_distances, candidate_buffer_size);
+  }
+}
+
 template <unsigned N_1, unsigned N_2>
 __device__ void candidate_by_bitonic_sort_inverse(
     INDEX_T* candidate_indices,
@@ -320,8 +410,8 @@ __device__ void candidate_by_bitonic_sort_inverse(
 
   // sort 1
   if (warp_id > 0) { return; }
-  if (CANDIDATE_BUFFER_SIZE > 64) {
-    printf("CANDIDATE_BUFFER_SIZE must be <= 64\n");
+  if (CANDIDATE_BUFFER_SIZE > N_1 * WARP_SIZE) {
+    printf("CANDIDATE_BUFFER_SIZE must be <= %u\n", N_1 * WARP_SIZE);
     assert(false);
   }
   // constexpr unsigned N_1 = 2;
@@ -351,6 +441,50 @@ __device__ void candidate_by_bitonic_sort_inverse(
   }
 }
 
+__device__ inline void candidate_by_bitonic_sort_inverse_runtime(
+    INDEX_T* candidate_indices,
+    DISTANCE_T* candidate_distances,
+    uint32_t candidate_buffer_size) {
+  const uint32_t items_per_thread =
+      (candidate_buffer_size + WARP_SIZE - 1) / WARP_SIZE;
+  if (GPU_RABITQ_USE_BLOCK_CANDIDATE_SORT || items_per_thread > 4) {
+    if (!is_power2_u32(candidate_buffer_size)) {
+      printf("block inverse candidate sort requires power-of-two buffer size, got %u\n",
+             candidate_buffer_size);
+      assert(false);
+    }
+    for (uint32_t k = 2; k <= candidate_buffer_size; k <<= 1) {
+      for (uint32_t j = k >> 1; j > 0; j >>= 1) {
+        for (uint32_t i = threadIdx.x; i < candidate_buffer_size; i += blockDim.x) {
+          const uint32_t ixj = i ^ j;
+          if (ixj > i && ixj < candidate_buffer_size) {
+            const bool up = ((i & k) != 0);
+            const DISTANCE_T di = candidate_distances[i];
+            const DISTANCE_T dj = candidate_distances[ixj];
+            if ((di > dj) == up) {
+              candidate_distances[i] = dj;
+              candidate_distances[ixj] = di;
+              const INDEX_T ti = candidate_indices[i];
+              candidate_indices[i] = candidate_indices[ixj];
+              candidate_indices[ixj] = ti;
+            }
+          }
+        }
+        __syncthreads();
+      }
+    }
+  } else if (items_per_thread <= 1) {
+    candidate_by_bitonic_sort_inverse<1, 0>(
+        candidate_indices, candidate_distances, candidate_buffer_size);
+  } else if (items_per_thread <= 2) {
+    candidate_by_bitonic_sort_inverse<2, 0>(
+        candidate_indices, candidate_distances, candidate_buffer_size);
+  } else {
+    candidate_by_bitonic_sort_inverse<4, 0>(
+        candidate_indices, candidate_distances, candidate_buffer_size);
+  }
+}
+
 template <unsigned N_1, unsigned N_2>
 __device__ void topk_128_by_bitonic_sort(
     INDEX_T* result_indices_ptr,
@@ -364,7 +498,7 @@ __device__ void topk_128_by_bitonic_sort(
 
   // Sort part 1
   if (warp_id > 0) return;
-  assert (CANDIDATE_BUFFER_SIZE <= 64);
+  assert(CANDIDATE_BUFFER_SIZE <= N_1 * WARP_SIZE);
   
   DISTANCE_T key_1[N_1];
   INDEX_T val_1[N_1];
@@ -550,6 +684,74 @@ __device__ void topk_by_candidate_sort_and_merge(
   (void)first;
 }
 
+static __device__ inline void topk_by_block_candidate_sort_and_merge(
+    INDEX_T* result_indices_ptr,
+    DISTANCE_T* result_distances_ptr,
+    INDEX_T* merged_topk_index_shared,
+    DISTANCE_T* merged_topk_dist_shared,
+    uint32_t RESULT_BUFFER_SIZE,
+    uint32_t CANDIDATE_BUFFER_SIZE,
+    uint32_t internal_topk,
+    bool first) {
+  auto candidate_indices = result_indices_ptr + internal_topk;
+  auto candidate_distances = result_distances_ptr + internal_topk;
+
+  candidate_by_bitonic_sort_runtime(candidate_indices, candidate_distances, CANDIDATE_BUFFER_SIZE);
+  __syncthreads();
+
+  constexpr int kItemsPerThread = 4;
+  int active_threads = (internal_topk + kItemsPerThread - 1) / kItemsPerThread;
+  active_threads = min(static_cast<int>(blockDim.x),
+                       ((active_threads + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE);
+
+  if (threadIdx.x < active_threads) {
+    const int out_begin =
+        min(static_cast<int>(internal_topk), (static_cast<int>(threadIdx.x) * static_cast<int>(internal_topk)) / active_threads);
+    const int out_end =
+        min(static_cast<int>(internal_topk), (static_cast<int>(threadIdx.x + 1) * static_cast<int>(internal_topk)) / active_threads);
+
+    const int top_begin = merge_path_partition(
+        result_distances_ptr, static_cast<int>(internal_topk),
+        candidate_distances, static_cast<int>(CANDIDATE_BUFFER_SIZE),
+        out_begin);
+    const int top_end = merge_path_partition(
+        result_distances_ptr, static_cast<int>(internal_topk),
+        candidate_distances, static_cast<int>(CANDIDATE_BUFFER_SIZE),
+        out_end);
+
+    int top_i = top_begin;
+    int cand_i = out_begin - top_begin;
+    const int cand_end = out_end - top_end;
+
+    for (int out_i = out_begin; out_i < out_end; ++out_i) {
+      const bool take_topk =
+          (cand_i >= cand_end) ||
+          (top_i < top_end &&
+           result_distances_ptr[top_i] <= candidate_distances[cand_i]);
+
+      if (take_topk) {
+        merged_topk_dist_shared[out_i] = result_distances_ptr[top_i];
+        merged_topk_index_shared[out_i] = result_indices_ptr[top_i];
+        ++top_i;
+      } else {
+        merged_topk_dist_shared[out_i] = candidate_distances[cand_i];
+        merged_topk_index_shared[out_i] = candidate_indices[cand_i];
+        ++cand_i;
+      }
+    }
+  }
+  __syncthreads();
+
+  for (unsigned i = threadIdx.x; i < internal_topk; i += blockDim.x) {
+    result_distances_ptr[i] = merged_topk_dist_shared[i];
+    result_indices_ptr[i] = merged_topk_index_shared[i];
+  }
+  __syncthreads();
+
+  (void)RESULT_BUFFER_SIZE;
+  (void)first;
+}
+
 template <unsigned kPerThread>
 __device__ __forceinline__ void merge_tail_candidates(
     INDEX_T* result_indices_ptr,
@@ -664,7 +866,7 @@ __device__ void topk_by_sort_candidates_and_merge(
     uint32_t CANDIDATE_BUFFER_SIZE,
     uint32_t internal_topk,
     bool first) {
-  if constexpr (N_2 == 2 || N_2 == 4) {
+  if constexpr (N_2 == 1 || N_2 == 2 || N_2 == 4) {
     topk_128_by_bitonic_sort<N_1, N_2>(
         result_indices_ptr, result_distances_ptr, RESULT_BUFFER_SIZE,
         CANDIDATE_BUFFER_SIZE, internal_topk, first);
@@ -687,7 +889,7 @@ __device__ void topk_by_sort_candidates_and_merge(
     uint32_t CANDIDATE_BUFFER_SIZE,
     uint32_t internal_topk,
     bool first) {
-  if constexpr (N_2 == 2 || N_2 == 4) {
+  if constexpr (N_2 == 1 || N_2 == 2 || N_2 == 4) {
     topk_by_sort_candidates_and_merge<N_1, N_2>(
         result_indices_ptr, result_distances_ptr, nullptr, nullptr,
         RESULT_BUFFER_SIZE, CANDIDATE_BUFFER_SIZE, internal_topk, first);
@@ -711,10 +913,17 @@ __device__ __noinline__ void topk_by_sort_candidates_and_merge_case(
     uint32_t candidate_buffer_size,
     uint32_t internal_topk,
     bool first) {
-  topk_by_sort_candidates_and_merge<N_1, N_2>(
-      result_indices_ptr, result_distances_ptr,
-      merged_topk_index_shared, merged_topk_dist_shared, result_buffer_size,
-      candidate_buffer_size, internal_topk, first);
+  if (internal_topk % WARP_SIZE == 0) {
+    topk_by_sort_candidates_and_merge<N_1, N_2>(
+        result_indices_ptr, result_distances_ptr,
+        merged_topk_index_shared, merged_topk_dist_shared, result_buffer_size,
+        candidate_buffer_size, internal_topk, first);
+  } else {
+    topk_by_candidate_sort_and_merge<N_1, N_2>(
+        result_indices_ptr, result_distances_ptr,
+        merged_topk_index_shared, merged_topk_dist_shared, result_buffer_size,
+        candidate_buffer_size, internal_topk, first);
+  }
 }
 
 template <unsigned N_1>
@@ -1011,10 +1220,45 @@ __device__ inline void hashtable_restore_expand_only(
   }
 }
 
+__device__ inline void dispatch_topk_by_sort_candidates_and_merge_runtime(
+    INDEX_T* result_indices_ptr,
+    DISTANCE_T* result_distances_ptr,
+    INDEX_T* merged_topk_index_shared,
+    DISTANCE_T* merged_topk_dist_shared,
+    uint32_t result_buffer_size,
+    uint32_t candidate_buffer_size,
+    uint32_t internal_topk,
+    bool first) {
+  const uint32_t items_per_thread =
+      (candidate_buffer_size + WARP_SIZE - 1) / WARP_SIZE;
+  if (GPU_RABITQ_USE_BLOCK_CANDIDATE_SORT || items_per_thread > 4) {
+    topk_by_block_candidate_sort_and_merge(
+        result_indices_ptr, result_distances_ptr,
+        merged_topk_index_shared, merged_topk_dist_shared,
+        result_buffer_size, candidate_buffer_size, internal_topk, first);
+  } else if (items_per_thread <= 1) {
+    dispatch_topk_by_sort_candidates_and_merge<1>(
+        result_indices_ptr, result_distances_ptr,
+        merged_topk_index_shared, merged_topk_dist_shared,
+        result_buffer_size, candidate_buffer_size, internal_topk, first);
+  } else if (items_per_thread <= 2) {
+    dispatch_topk_by_sort_candidates_and_merge<2>(
+        result_indices_ptr, result_distances_ptr,
+        merged_topk_index_shared, merged_topk_dist_shared,
+        result_buffer_size, candidate_buffer_size, internal_topk, first);
+  } else {
+    dispatch_topk_by_sort_candidates_and_merge<4>(
+        result_indices_ptr, result_distances_ptr,
+        merged_topk_index_shared, merged_topk_dist_shared,
+        result_buffer_size, candidate_buffer_size, internal_topk, first);
+  }
+}
+
 // select top-N un-expanded nodes in the priority queue of size M
 static __device__ uint32_t pick_expanders(int N, INDEX_T* output_list, int M, INDEX_T* pri_queue) {
   uint32_t num_exp = 0; // number of expanders actually seleceted; must be <= N
   constexpr INDEX_T index_msb_1_mask = 0x80000000;
+  const uint32_t lane_id = threadIdx.x & (WARP_SIZE - 1);
   uint32_t itopk_max = M;
   if (itopk_max % 32) { itopk_max += 32 - (itopk_max % 32); }   // round up to be multiple of 32
   for (uint32_t j = threadIdx.x; j < itopk_max; j += 32) {
@@ -1028,7 +1272,7 @@ static __device__ uint32_t pick_expanders(int N, INDEX_T* output_list, int M, IN
     }
     const std::uint32_t ballot_mask = __ballot_sync(0xffffffff, new_parent);
     if (new_parent) {
-      const auto i = __popc(ballot_mask & ((1 << threadIdx.x) - 1)) + num_exp;
+      const auto i = __popc(ballot_mask & ((1u << lane_id) - 1u)) + num_exp;
       if (i < N) {
         output_list[i] = j;
         //if (blockIdx.x == 0) printf("pick %d-th node %d as the %d-th parent\n", j, pri_queue[j], i);
@@ -1037,6 +1281,9 @@ static __device__ uint32_t pick_expanders(int N, INDEX_T* output_list, int M, IN
       }
     }
     num_exp += __popc(ballot_mask);
+    if (num_exp > static_cast<uint32_t>(N)) {
+      num_exp = static_cast<uint32_t>(N);
+    }
     if (num_exp >= N) { break; }
   }
   return num_exp;

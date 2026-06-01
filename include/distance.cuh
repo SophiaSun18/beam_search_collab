@@ -366,7 +366,7 @@ __device__ void compute_distance_to_child_nodes(
     const DATA_T* d_dataset_ptr,
     INDEX_T* d_graph_ptr,
     uint32_t GRAPH_DEGREE,
-    uint32_t SEARCH_WIDTH,
+    uint32_t search_width,
     uint32_t CANDIDATE_BUFFER_SIZE,
     INDEX_T* visited_hash_ptr,
     uint32_t BITLEN,
@@ -410,10 +410,10 @@ __device__ void compute_distance_to_child_nodes(
   // Compute half of the distance to child nodes
   __syncthreads();
   if (THRESHOLD_CONFIG == 0) {
-    std::uint32_t max_i = GRAPH_DEGREE * SEARCH_WIDTH;
+    std::uint32_t max_i = GRAPH_DEGREE * search_width;
     for (std::uint32_t tid = threadIdx.x; tid < max_i * TEAM_SIZE; tid += blockDim.x) {
       const auto i       = tid / TEAM_SIZE;
-      const bool valid_i = (i < (GRAPH_DEGREE * SEARCH_WIDTH));
+      const bool valid_i = (i < (GRAPH_DEGREE * search_width));
       INDEX_T child_id   = invalid_index;
       if (valid_i) { child_id = candidate_indices_ptr[i]; }
       // each team of threads do a distance computation
@@ -433,10 +433,10 @@ __device__ void compute_distance_to_child_nodes(
     }
   } else {
     DISTANCE_T threshold = candidate_distances_ptr[-1];
-    std::uint32_t max_i = GRAPH_DEGREE * SEARCH_WIDTH;
+    std::uint32_t max_i = GRAPH_DEGREE * search_width;
     for (std::uint32_t tid = threadIdx.x; tid < max_i * TEAM_SIZE; tid += blockDim.x) {
       const auto i       = tid / TEAM_SIZE;
-      const bool valid_i = (i < (GRAPH_DEGREE * SEARCH_WIDTH));
+      const bool valid_i = (i < (GRAPH_DEGREE * search_width));
       INDEX_T child_id   = invalid_index;
       if (valid_i) { child_id = candidate_indices_ptr[i]; }
       DISTANCE_T norm2 = compute_similarity_vector_load_partial<TEAM_SIZE, 4/*compute 75%*/>
