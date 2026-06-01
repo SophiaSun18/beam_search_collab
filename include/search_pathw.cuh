@@ -9,8 +9,9 @@
 #define INTERNAL_TOPK 128
 #endif
 
+#ifndef SEARCH_WIDTH
 #define SEARCH_WIDTH 1
-#define CANDIDATE_BUFFER_SIZE 64
+#endif
 #define TEAM_SIZE 8
 #define INDEX_MSB_1_MASK 0x80000000u
 
@@ -26,7 +27,7 @@ static __host__ inline int pathw_hash_bitlen_for_topk(int beam_sz) {
 }
 
 static __host__ inline uint32_t calculate_pathw_shared_mem_size(int dim, int beam_sz, int bitlen, uint32_t max_degree) {
-    const size_t candidate_buffer_size = static_cast<size_t>(SEARCH_WIDTH * max_degree);
+    const size_t candidate_buffer_size = round_up_power2_u32(static_cast<uint32_t>(SEARCH_WIDTH) * max_degree);
     const size_t result_buffer_size = static_cast<size_t>(beam_sz) + candidate_buffer_size;
     const size_t packed_dim = (static_cast<size_t>(dim) + 31) / 32;
     size_t size = 0;
@@ -35,7 +36,7 @@ static __host__ inline uint32_t calculate_pathw_shared_mem_size(int dim, int bea
     size += result_buffer_size * sizeof(DISTANCE_T);
     size += hashtable_getsize(bitlen) * sizeof(INDEX_T);
     size += SEARCH_WIDTH * sizeof(INDEX_T);
-    size += packed_dim * sizeof(uint32_t);
+    size += static_cast<size_t>(SEARCH_WIDTH) * packed_dim * sizeof(uint32_t);
     size += sizeof(uint32_t);  // hops
     size += GPU_SEARCH_STAT_COUNT * sizeof(uint32_t);
     size += sizeof(uint32_t);  // selected expander count
@@ -77,8 +78,7 @@ __device__ __forceinline__ bool pathw_is_in_internal_topk(INDEX_T child_id, cons
 template <typename T, uint32_t TEAM_WIDTH>
 __device__ __forceinline__ void pathw_compute_candidates_with_signbit_pruning(
     int dim,
-    INDEX_T current_node,
-    const vid_t* __restrict__ neighbors,
+    const INDEX_T* __restrict__ parent_list,
     const INDEX_T* __restrict__ internal_topk_list,
     INDEX_T* __restrict__ candidate_indices,
     DISTANCE_T* __restrict__ candidate_distances,
@@ -86,7 +86,10 @@ __device__ __forceinline__ void pathw_compute_candidates_with_signbit_pruning(
     const T* __restrict__ data,
     const uint32_t* __restrict__ sign_bits,
     uint32_t* __restrict__ query_sign_bits,
+    GraphGPU<vid_t> gg,
+    uint32_t num_expanders,
     uint32_t graph_degree,
+    uint32_t candidate_work_count,
     uint32_t candidate_buffer_size,
     uint32_t sign_bit_vector_size,
     uint32_t packed_dim,
@@ -95,13 +98,27 @@ __device__ __forceinline__ void pathw_compute_candidates_with_signbit_pruning(
     uint32_t& local_exact_count,
     uint32_t& local_est_count,
     uint32_t& local_pruned_count) {
-    // build the sign bits for the query and the current node
-    pathw_build_query_sign_bits<T>(
-        dim, query, data + static_cast<size_t>(current_node) * dim, query_sign_bits, packed_dim);
-    __syncthreads();
+    for (uint32_t parent_idx = 0; parent_idx < num_expanders; ++parent_idx) {
+        const INDEX_T parent_slot = parent_list[parent_idx];
+        const INDEX_T current_node = internal_topk_list[parent_slot] & ~INDEX_MSB_1_MASK;
+        pathw_build_query_sign_bits<T>(
+            dim, query, data + static_cast<size_t>(current_node) * dim,
+            query_sign_bits + static_cast<size_t>(parent_idx) * packed_dim, packed_dim);
+        __syncthreads();
+    }
 
     for (uint32_t i = threadIdx.x; i < candidate_buffer_size; i += blockDim.x) {
-        INDEX_T child_id = (i < graph_degree) ? neighbors[i] : MAX_INDEX;
+        const bool in_work_range = i < candidate_work_count;
+        const uint32_t parent_idx = in_work_range ? i / graph_degree : 0;
+        const uint32_t neighbor_idx = in_work_range ? i - parent_idx * graph_degree : 0;
+        const bool active_parent = in_work_range && parent_idx < num_expanders;
+        INDEX_T current_node = MAX_INDEX;
+        INDEX_T child_id = MAX_INDEX;
+        if (active_parent) {
+            const INDEX_T parent_slot = parent_list[parent_idx];
+            current_node = internal_topk_list[parent_slot] & ~INDEX_MSB_1_MASK;
+            child_id = gg.N(current_node)[neighbor_idx];
+        }
         bool valid_child = child_id != MAX_INDEX;
         if (valid_child && pathw_is_in_internal_topk(   // deduplication
             child_id, internal_topk_list, static_cast<int>(runtime_internal_topk))) {
@@ -113,9 +130,10 @@ __device__ __forceinline__ void pathw_compute_candidates_with_signbit_pruning(
         // load the precomputed sign bits of the child, and compute the matching score
         if (valid_child) {
             int direction = 0;
-            const uint32_t* neighbor_sign = sign_bits + static_cast<size_t>(current_node) * sign_bit_vector_size + static_cast<size_t>(i) * packed_dim;
+            const uint32_t* parent_query_sign = query_sign_bits + static_cast<size_t>(parent_idx) * packed_dim;
+            const uint32_t* neighbor_sign = sign_bits + static_cast<size_t>(current_node) * sign_bit_vector_size + static_cast<size_t>(neighbor_idx) * packed_dim;
             for (uint32_t word = 0; word < packed_dim; ++word) {
-                direction -= __popc(query_sign_bits[word] ^ neighbor_sign[word]);
+                direction -= __popc(parent_query_sign[word] ^ neighbor_sign[word]);
             }
             score = static_cast<DISTANCE_T>(direction);
             local_est_count++;
@@ -126,11 +144,12 @@ __device__ __forceinline__ void pathw_compute_candidates_with_signbit_pruning(
     }
     __syncthreads();
 
-    candidate_by_bitonic_sort_inverse<2, 0>(
+    candidate_by_bitonic_sort_inverse_runtime(
         candidate_indices, candidate_distances, candidate_buffer_size);
     __syncthreads();
 
-    int keep_count = static_cast<int>(static_cast<float>(candidate_buffer_size) * prune_ratio);
+    const uint32_t active_candidate_count = num_expanders * graph_degree;
+    int keep_count = static_cast<int>(static_cast<float>(active_candidate_count) * prune_ratio);
     if (keep_count < 1) keep_count = 1;
     if (keep_count > static_cast<int>(candidate_buffer_size)) {
         keep_count = static_cast<int>(candidate_buffer_size);
@@ -165,19 +184,31 @@ __device__ __forceinline__ void pathw_compute_candidates_with_signbit_pruning(
 template <typename T, uint32_t TEAM_WIDTH>
 __device__ __forceinline__ void pathw_compute_candidates_plain(
     int dim,
-    const vid_t* __restrict__ neighbors,
+    const INDEX_T* __restrict__ parent_list,
+    const INDEX_T* __restrict__ internal_topk_list,
     INDEX_T* __restrict__ candidate_indices,
     DISTANCE_T* __restrict__ candidate_distances,
     const T* __restrict__ query,
     const T* __restrict__ data,
     INDEX_T* __restrict__ visited_hash,
     int bitlen,
+    GraphGPU<vid_t> gg,
+    uint32_t num_expanders,
     uint32_t graph_degree,
+    uint32_t candidate_work_count,
     uint32_t candidate_buffer_size,
     uint32_t& local_exact_count) {
     // initialize the candidate buffer and filter out the visited ones
     for (uint32_t i = threadIdx.x; i < candidate_buffer_size; i += blockDim.x) {
-        INDEX_T child_id = (i < graph_degree) ? neighbors[i] : MAX_INDEX;
+        const bool in_work_range = i < candidate_work_count;
+        const uint32_t parent_idx = in_work_range ? i / graph_degree : 0;
+        const uint32_t neighbor_idx = in_work_range ? i - parent_idx * graph_degree : 0;
+        INDEX_T child_id = MAX_INDEX;
+        if (in_work_range && parent_idx < num_expanders) {
+            const INDEX_T parent_slot = parent_list[parent_idx];
+            const INDEX_T current_node = internal_topk_list[parent_slot] & ~INDEX_MSB_1_MASK;
+            child_id = gg.N(current_node)[neighbor_idx];
+        }
         if (child_id != MAX_INDEX) {
             if (hashtable_insert(visited_hash, bitlen, child_id) == 0) {
                 child_id = MAX_INDEX;
@@ -222,11 +253,15 @@ void PathWBeamSearch(
     float neighbor_keep_ratio, float iteration_prune_ratio)
 {
     const int query_id = blockIdx.x;
-    if (query_id >= nq || beam_sz <= 0 || beam_sz > INTERNAL_TOPK) return;
+    if (query_id >= nq || beam_sz <= 0) return;
 
+    const uint32_t logical_beam_size = static_cast<uint32_t>(beam_sz);
+    const uint32_t padded_beam_size = gpu_effective_sort_beam_size(logical_beam_size, static_cast<uint32_t>(K));
+    if (padded_beam_size > INTERNAL_TOPK) return;
     const uint32_t graph_degree = gg.get_max_degree();
-    const uint32_t candidate_buffer_size = SEARCH_WIDTH * graph_degree;
-    const uint32_t result_buffer_size = beam_sz + candidate_buffer_size;
+    const uint32_t candidate_work_count = static_cast<uint32_t>(SEARCH_WIDTH) * graph_degree;
+    const uint32_t candidate_buffer_size = round_up_power2_u32(candidate_work_count);
+    const uint32_t result_buffer_size = padded_beam_size + candidate_buffer_size;
     const uint32_t packed_dim = (dim + 31) / 32;
     const uint32_t sign_bit_vector_size = graph_degree * packed_dim;
     const int iteration_limit = beam_sz;
@@ -247,11 +282,11 @@ void PathWBeamSearch(
     INDEX_T* visited_hash_buffer = reinterpret_cast<INDEX_T*>(result_distances_buffer + result_buffer_size);
     INDEX_T* parent_list_buffer = visited_hash_buffer + hashtable_getsize(bitlen);
     uint32_t* query_sign_bits_buffer = reinterpret_cast<uint32_t*>(parent_list_buffer + SEARCH_WIDTH);
-    uint32_t* hops = query_sign_bits_buffer + packed_dim;
+    uint32_t* hops = query_sign_bits_buffer + static_cast<size_t>(SEARCH_WIDTH) * packed_dim;
     uint32_t* stats = hops + 1;
     uint32_t* num_expanders = stats + GPU_SEARCH_STAT_COUNT;
     INDEX_T* merged_topk_index_buffer = reinterpret_cast<INDEX_T*>(num_expanders + 1);
-    DISTANCE_T* merged_topk_distance_buffer = reinterpret_cast<DISTANCE_T*>(merged_topk_index_buffer + beam_sz);
+    DISTANCE_T* merged_topk_distance_buffer = reinterpret_cast<DISTANCE_T*>(merged_topk_index_buffer + padded_beam_size);
 
     __shared__ uint32_t stat_scratch[3 * PATHW_WARPS_PER_BLOCK];
     if (tid == 0) {
@@ -279,8 +314,8 @@ void PathWBeamSearch(
         const T* entry_ptr = valid_entry ? (d_data + static_cast<size_t>(entry_point) * dim) : d_data;
         DISTANCE_T entry_dist = valid_entry ? warp_distance(dim, query_buffer, entry_ptr, false) : FLT_MAX;
         if (tid == 0) {
-            result_indices_buffer[beam_sz] = valid_entry ? entry_point : MAX_INDEX;
-            result_distances_buffer[beam_sz] = entry_dist;
+            result_indices_buffer[padded_beam_size] = valid_entry ? entry_point : MAX_INDEX;
+            result_distances_buffer[padded_beam_size] = entry_dist;
             if (valid_entry) {
                 hashtable_insert(visited_hash_buffer, bitlen, entry_point);
                 local_exact_count++;
@@ -298,10 +333,16 @@ void PathWBeamSearch(
         __syncthreads();
 
         // sort the candidates and select the top-k
-        dispatch_topk_by_sort_candidates_and_merge<2>(
+        dispatch_topk_by_sort_candidates_and_merge_runtime(
             result_indices_buffer, result_distances_buffer,
             merged_topk_index_buffer, merged_topk_distance_buffer,
-            result_buffer_size, candidate_buffer_size, beam_sz, iter == 0);
+            result_buffer_size, candidate_buffer_size, padded_beam_size, iter == 0);
+        __syncthreads();
+
+        for (uint32_t i = logical_beam_size + tid; i < padded_beam_size; i += blockDim.x) {
+            result_indices_buffer[i] = MAX_INDEX;
+            result_distances_buffer[i] = FLT_MAX;
+        }
         __syncthreads();
 
         // check termination condition
@@ -313,7 +354,7 @@ void PathWBeamSearch(
         // pick the next expander
         if (tid < WARP_SIZE) {
             const uint32_t picked = pick_expanders(
-                SEARCH_WIDTH, parent_list_buffer, beam_sz, result_indices_buffer);
+                SEARCH_WIDTH, parent_list_buffer, logical_beam_size, result_indices_buffer);
             if (tid == 0) {
                 num_expanders[0] = picked;
             }
@@ -327,7 +368,7 @@ void PathWBeamSearch(
                 visited_hash_buffer,
                 bitlen,
                 result_indices_buffer,
-                beam_sz,
+                logical_beam_size,
                 first_tid);
         }
         __syncthreads();
@@ -337,37 +378,37 @@ void PathWBeamSearch(
             break;
         }
         if (tid == 0) {
-            stats[GPU_SEARCH_STAT_ITERATIONS]++;
+            stats[GPU_SEARCH_STAT_ITERATIONS] += num_expanders[0];
         }
-
-        const INDEX_T current_node = result_indices_buffer[parent_list_buffer[0]] & ~INDEX_MSB_1_MASK;
-        const vid_t* neighbors = gg.N(current_node);
 
         if (d_sign_bit != nullptr && neighbor_keep_ratio > 0.0f &&
             neighbor_keep_ratio < 1.0f && iter < prune_iteration_limit) {
             pathw_compute_candidates_with_signbit_pruning<T, TEAM_SIZE>(
-                dim, current_node, neighbors, result_indices_buffer,
-                result_indices_buffer + beam_sz,
-                result_distances_buffer + beam_sz,
+                dim, parent_list_buffer, result_indices_buffer,
+                result_indices_buffer + padded_beam_size,
+                result_distances_buffer + padded_beam_size,
                 query_buffer, d_data, d_sign_bit, query_sign_bits_buffer,
-                graph_degree, candidate_buffer_size, sign_bit_vector_size, packed_dim,
-                neighbor_keep_ratio, beam_sz,
+                gg, num_expanders[0], graph_degree, candidate_work_count,
+                candidate_buffer_size, sign_bit_vector_size, packed_dim,
+                neighbor_keep_ratio, logical_beam_size,
                 local_exact_count, local_est_count, local_pruned_count);
         } else {
             pathw_compute_candidates_plain<T, TEAM_SIZE>(
-                dim, neighbors, result_indices_buffer + beam_sz,
-                result_distances_buffer + beam_sz, query_buffer, d_data,
-                visited_hash_buffer, bitlen, graph_degree, candidate_buffer_size,
+                dim, parent_list_buffer, result_indices_buffer,
+                result_indices_buffer + padded_beam_size,
+                result_distances_buffer + padded_beam_size, query_buffer, d_data,
+                visited_hash_buffer, bitlen, gg, num_expanders[0], graph_degree,
+                candidate_work_count, candidate_buffer_size,
                 local_exact_count);
         }
         __syncthreads();
     }
 
     // final sorting and write back the result
-    dispatch_topk_by_sort_candidates_and_merge<2>(
+    dispatch_topk_by_sort_candidates_and_merge_runtime(
         result_indices_buffer, result_distances_buffer,
         merged_topk_index_buffer, merged_topk_distance_buffer,
-        result_buffer_size, candidate_buffer_size, beam_sz, false);
+        result_buffer_size, candidate_buffer_size, padded_beam_size, false);
     __syncthreads();
 
     for (uint32_t i = tid; i < static_cast<uint32_t>(K); i += blockDim.x) {

@@ -61,7 +61,8 @@ void IndexGraph<T>::search_pathw(int nq, const T* queries, int K, T* result_vec,
   auto npoints = this->ntotal;
   auto max_degree = this->maxDeg;
   auto beam_size = beam_sz;
-  auto bitlen = pathw_hash_bitlen_for_topk(beam_size);
+  auto padded_beam_size = static_cast<int>(gpu_effective_sort_beam_size(static_cast<uint32_t>(beam_size), static_cast<uint32_t>(K)));
+  auto bitlen = pathw_hash_bitlen_for_topk(padded_beam_size);
   const bool use_ip = (this->metric == METRIC_IP);
   const int active_nq = nq;
   if (use_ip) {
@@ -73,22 +74,15 @@ void IndexGraph<T>::search_pathw(int nq, const T* queries, int K, T* result_vec,
   if (beam_size <= 0) {
     throw std::runtime_error("GPU PathW requires beam_size > 0");
   }
-  if (beam_size > INTERNAL_TOPK) {
-    throw std::runtime_error(
-        "GPU PathW requires beam_size <= compiled INTERNAL_TOPK (" +
-        std::to_string(INTERNAL_TOPK) + ")");
-  }
-  if (max_degree > CANDIDATE_BUFFER_SIZE) {
-    throw std::runtime_error(
-        "GPU PathW graph degree exceeds CANDIDATE_BUFFER_SIZE (" +
-        std::to_string(CANDIDATE_BUFFER_SIZE) + ")");
-  }
+  const size_t candidate_buffer_size = round_up_power2_u32(static_cast<uint32_t>(SEARCH_WIDTH) * static_cast<uint32_t>(max_degree));
 
-  printf("Beam search PathW on GPU: K=%d, nq=%d, dim=%d, npoints=%ld, beam_size=%d, compiled_internal_topk=%d\n",
-         K, active_nq, dim, npoints, beam_size, INTERNAL_TOPK);
+  printf("Beam search PathW on GPU: K=%d, nq=%d, dim=%d, npoints=%ld, beam_size=%d, padded_beam_size=%d, compiled_internal_topk=%d\n",
+         K, active_nq, dim, npoints, beam_size, padded_beam_size, INTERNAL_TOPK);
   printf("Metric: %s\n", metric_name(this->metric));
   printf("PathW params: neighbor_keep_ratio=%.4f, iteration_prune_ratio=%.4f, iteration_limit=beam_size\n",
          neighbor_keep_ratio, iteration_prune_ratio);
+  printf("GPU PathW speculation: search_width=%d, candidate_buffer_size=%zu\n",
+         SEARCH_WIDTH, candidate_buffer_size);
 
   size_t sign_n = 0;
   size_t sign_width = 0;
@@ -168,7 +162,7 @@ void IndexGraph<T>::search_pathw(int nq, const T* queries, int K, T* result_vec,
     printf("GPU pathw seed node: %u\n", search_entry_point);
   }
 
-  uint32_t shm_size = calculate_pathw_shared_mem_size(dim, beam_size, bitlen, max_degree);
+  uint32_t shm_size = calculate_pathw_shared_mem_size(dim, padded_beam_size, bitlen, max_degree);
   int numBlocksPerSM = 0;
   CUDA_SAFE_CALL(cudaFuncSetAttribute(PathWBeamSearch<T>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(shm_size)));
   CUDA_SAFE_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocksPerSM, PathWBeamSearch<T>, num_threads, shm_size));
@@ -200,6 +194,7 @@ void IndexGraph<T>::search_pathw(int nq, const T* queries, int K, T* result_vec,
   CUDA_SAFE_CALL(cudaFree(d_results));
   CUDA_SAFE_CALL(cudaFree(d_sign_bit));
   CUDA_SAFE_CALL(cudaFree(d_total_stats));
+  gg.release();
 
   std::cout << "total # exact distance computations: " << total_stats[GPU_SEARCH_STAT_DIST_CMPS] << "\n";
   std::cout << "average # exact distance computations: "
