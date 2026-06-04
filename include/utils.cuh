@@ -1666,3 +1666,95 @@ static __device__ inline DISTANCE_T scan_one_neighbor_lanes_gpu(
   est_dist += factor_vq[0] * qf.low_val;
   return est_dist;
 }
+
+template <int LANES_PER_NEIGHBOR>
+static __device__ inline DISTANCE_T scan_one_neighbor_fastscan_lut_lanes_gpu(
+    const QueryFactors &qf, const uint8_t *packed_codes_block, int neighbor_idx,
+    const float *triple_x, const float *factor_dq, const float *factor_vq,
+    float exact_dist, int padded_dim) {
+  static_assert(LANES_PER_NEIGHBOR == 2 || LANES_PER_NEIGHBOR == 4 ||
+                    LANES_PER_NEIGHBOR == 8 || LANES_PER_NEIGHBOR == 16 ||
+                    LANES_PER_NEIGHBOR == 32,
+                "LANES_PER_NEIGHBOR must be one of 2, 4, 8, 16, or 32");
+  const float triple_x_value = triple_x[0];
+  if (triple_x_value == FLT_MAX) return FLT_MAX;
+
+  const int lane_id = threadIdx.x & (WARP_SIZE - 1);
+  const int group_lane = lane_id & (LANES_PER_NEIGHBOR - 1);
+  unsigned group_mask = FULL_MASK;
+  if constexpr (LANES_PER_NEIGHBOR != WARP_SIZE) {
+    const int group_start = lane_id - group_lane;
+    constexpr unsigned group_bits = (1u << LANES_PER_NEIGHBOR) - 1u;
+    group_mask = group_bits << group_start;
+  }
+
+  const int num_codebook = padded_dim >> 2;
+  uint32_t local_raw_sum = 0;
+  for (int cb = group_lane; cb < num_codebook; cb += LANES_PER_NEIGHBOR) {
+    const uint8_t code = fastscan_decode_code_for_neighbor_gpu(
+        packed_codes_block, neighbor_idx, cb);
+    local_raw_sum += static_cast<uint32_t>(qf.lut[(cb << 4) + code]);
+  }
+
+  for (int offset = LANES_PER_NEIGHBOR / 2; offset > 0; offset >>= 1) {
+    local_raw_sum += __shfl_down_sync(group_mask, local_raw_sum, offset, LANES_PER_NEIGHBOR);
+  }
+
+  if (group_lane != 0) return 0.0f;
+
+  const float result_float = static_cast<float>((static_cast<int32_t>(local_raw_sum) << 1) - qf.sum_q);
+  DISTANCE_T est_dist = triple_x_value + exact_dist;
+  est_dist += factor_dq[0] * qf.width * result_float;
+  est_dist += factor_vq[0] * qf.low_val;
+  return est_dist;
+}
+
+static __device__ __forceinline__ bool warp_keep_topk_smallest_f32(float value, bool valid, int keep_k) {
+  const int lane_id = threadIdx.x & (WARP_SIZE - 1);
+  const int valid_int = valid ? 1 : 0;
+  const float my_value = valid ? value : FLT_MAX;
+  int rank = 0;
+
+#pragma unroll
+  for (int src = 0; src < WARP_SIZE; ++src) {
+    const float other_value = __shfl_sync(FULL_MASK, my_value, src);
+    const int other_valid = __shfl_sync(FULL_MASK, valid_int, src);
+    if (other_valid && (other_value < my_value || (other_value == my_value && src < lane_id))) {
+      rank++;
+    }
+  }
+
+  return valid && keep_k > 0 && rank < keep_k;
+}
+
+static __device__ inline DISTANCE_T scan_one_neighbor_lane_seq_lut_gpu(
+    const QueryFactors &qf, const uint8_t *parent_code_base, int neighbor_idx,
+    float triple_x, float factor_dq, float factor_vq,
+    float exact_dist, int padded_dim, int bytes_per_neighbor) {
+  if (triple_x == FLT_MAX) return FLT_MAX;
+
+  constexpr int lut_layout_neighbors = WARP_SIZE / GPU_RABITQ_FASTSCAN_SEQ_LUT_LAYOUT_LANES;
+  const uint8_t *seq_lut_tile = parent_code_base;
+  int seq_lut_neighbor_in_tile = 0;
+  if constexpr (GPU_RABITQ_FASTSCAN_SEQ_LUT_LAYOUT_LANES == 32) {
+    seq_lut_tile = parent_code_base + neighbor_idx * bytes_per_neighbor;
+  } else {
+    const int tile_idx = neighbor_idx / lut_layout_neighbors;
+    seq_lut_neighbor_in_tile = neighbor_idx & (lut_layout_neighbors - 1);
+    seq_lut_tile = parent_code_base + tile_idx * lut_layout_neighbors * bytes_per_neighbor;
+  }
+
+  const int num_codebook = padded_dim >> 2;
+  uint32_t raw_sum = 0;
+  for (int cb = 0; cb < num_codebook; ++cb) {
+    const uint8_t code = fastscan_decode_code_for_neighbor_seq_lut_gpu(
+        seq_lut_tile, cb, seq_lut_neighbor_in_tile);
+    raw_sum += static_cast<uint32_t>(qf.lut[(cb << 4) + code]);
+  }
+
+  const float result_float = static_cast<float>((static_cast<int32_t>(raw_sum) << 1) - qf.sum_q);
+  DISTANCE_T est_dist = triple_x + exact_dist;
+  est_dist += factor_dq * qf.width * result_float;
+  est_dist += factor_vq * qf.low_val;
+  return est_dist;
+}
