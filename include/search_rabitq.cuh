@@ -25,10 +25,10 @@
 #error "GPU_RABITQ_USE_LUT=0 currently supports only GPU_RABITQ_FASTSCAN_SUBWARP_LANES=32"
 #endif
 
-#if GPU_RABITQ_FASTSCAN_SUBWARP_LANES != 2 && GPU_RABITQ_FASTSCAN_SUBWARP_LANES != 4 && \
+#if GPU_RABITQ_FASTSCAN_SUBWARP_LANES != 1 && GPU_RABITQ_FASTSCAN_SUBWARP_LANES != 2 && GPU_RABITQ_FASTSCAN_SUBWARP_LANES != 4 && \
     GPU_RABITQ_FASTSCAN_SUBWARP_LANES != 8 && GPU_RABITQ_FASTSCAN_SUBWARP_LANES != 16 && \
     GPU_RABITQ_FASTSCAN_SUBWARP_LANES != 32
-#error "GPU_RABITQ_FASTSCAN_SUBWARP_LANES must be one of 2, 4, 8, 16, or 32"
+#error "GPU_RABITQ_FASTSCAN_SUBWARP_LANES must be one of 1, 2, 4, 8, 16, or 32"
 #endif
 
 static __host__ inline uint32_t calculate_shared_mem_size(int dim, int beam_sz, int result_k,
@@ -383,7 +383,53 @@ void QuantizedBeamSearch(
             const int bytes_per_neighbor = padded_dim >> 3;
             uint32_t warp_dist_est_count = 0;
 
-#if GPU_RABITQ_FASTSCAN_SUBWARP_LANES == 32
+#if GPU_RABITQ_FASTSCAN_SUBWARP_LANES == 1
+            for (int p = 0; p < SEARCH_WIDTH; ++p) {
+                if (PARENT_LIST[p] == MAX_INDEX) continue;
+                const uint32_t candidate_base = static_cast<uint32_t>(p) * static_cast<uint32_t>(max_degree);
+                const uint64_t* parent_code_base = STAGED_CODE_BUFFER + static_cast<size_t>(p) * parent_code_words;
+                const float* parent_factor_base = STAGED_FACTOR_BUFFER + static_cast<size_t>(p) * parent_factor_count;
+                const DISTANCE_T parent_distance = PARENT_DISTANCE_LIST[p];
+                const int num_batches = (max_degree + WARP_SIZE - 1) / WARP_SIZE;
+
+                for (int batch = warp_id; batch < num_batches; batch += WARPS_PER_BLOCK) {
+                    const int batch_begin = batch * WARP_SIZE;
+                    const int active_neighbors = min(WARP_SIZE, max_degree - batch_begin);
+                    const uint32_t candidate_base_in_batch = candidate_base + static_cast<uint32_t>(batch_begin);
+                    const uint8_t* packed_codes_block =
+                        reinterpret_cast<const uint8_t*>(parent_code_base) + batch * padded_dim * 4;
+                    const float* triple_x = parent_factor_base + batch_begin;
+                    const float* factor_dq = parent_factor_base + max_degree + batch_begin;
+                    const float* factor_vq = parent_factor_base + 2 * max_degree + batch_begin;
+
+                    scan_all_neighbors_32_gpu(
+                        qf, packed_codes_block, triple_x, factor_dq, factor_vq,
+                        parent_distance, padded_dim, CANDIDATE_DISTANCE + candidate_base_in_batch,
+                        active_neighbors);
+
+                    if (lane_id < active_neighbors) {
+                        const uint32_t candidate_idx = candidate_base_in_batch + static_cast<uint32_t>(lane_id);
+                        const bool invalid_candidate = CANDIDATE_INDEX[candidate_idx] == MAX_INDEX;
+                        const bool invalid_factor = triple_x[lane_id] == FLT_MAX;
+                        const bool invalid_distance = !isfinite(CANDIDATE_DISTANCE[candidate_idx]);
+                        if (invalid_candidate || invalid_factor || invalid_distance) {
+                            CANDIDATE_DISTANCE[candidate_idx] = FLT_MAX;
+                        }
+                    }
+
+                    if (lane_id == 0) {
+                        uint32_t active_count = 0;
+                        for (int i = 0; i < active_neighbors; ++i) {
+                            if (CANDIDATE_INDEX[candidate_base_in_batch + static_cast<uint32_t>(i)] != MAX_INDEX) {
+                                active_count++;
+                            }
+                        }
+                        if (GPU_SEARCH_STATS) warp_dist_est_count += active_count;
+                    }
+                    __syncwarp();
+                }
+            }
+#elif GPU_RABITQ_FASTSCAN_SUBWARP_LANES == 32
             for (int p = 0; p < SEARCH_WIDTH; ++p) {
                 if (PARENT_LIST[p] == MAX_INDEX) continue;
                 const uint32_t candidate_base = static_cast<uint32_t>(p) * static_cast<uint32_t>(max_degree);

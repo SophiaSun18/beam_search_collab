@@ -119,13 +119,14 @@ void BeamSearch(
         TOP_K_INDEX[i] = MAX_INDEX;
         TOP_K_DISTANCE[i] = FLT_MAX;
     }
+    __syncthreads();
 
     // load the candidate buffer with starting points
     for (int i = warp_id; i < candidate_buffer_size; i += WARPS_PER_BLOCK) {
         CANDIDATE_INDEX[i] = d_starting_points[i];
         DISTANCE_T dist = FLT_MAX;
         if (CANDIDATE_INDEX[i] != MAX_INDEX) {
-            dist = warp_distance(dim, query, d_data + CANDIDATE_INDEX[i] * dim, use_ip);
+            dist = warp_distance(dim, QUERY_BUFFER, d_data + CANDIDATE_INDEX[i] * dim, use_ip);
         }
         if (lane_id == 0) {     // warp computes, only lane 0 writes
             if (CANDIDATE_INDEX[i] != MAX_INDEX) {
@@ -210,7 +211,7 @@ void BeamSearch(
             if (CANDIDATE_INDEX[i] == MAX_INDEX) continue;
 
             // if current node is new in hash table, compute and store its distance
-            DISTANCE_T dist = warp_distance(dim, query, d_data + CANDIDATE_INDEX[i] * dim, use_ip);
+            DISTANCE_T dist = warp_distance(dim, QUERY_BUFFER, d_data + CANDIDATE_INDEX[i] * dim, use_ip);
             if (lane_id == 0) {
                 if (GPU_SEARCH_STATS) local_exact_count++;
                 CANDIDATE_DISTANCE[i] = dist;
