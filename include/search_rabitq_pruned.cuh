@@ -75,30 +75,31 @@ static __host__ inline uint32_t calculate_pruned_shared_mem_size(int dim, int be
     };
     size_t padded_dim = 1ULL << static_cast<size_t>(ceilf(log2f(dim)));
     size_t code_words = padded_dim / 64;
-    const size_t result_buffer_size = static_cast<size_t>(beam_sz) + CANDIDATE_BUFFER_SIZE;
+    const uint32_t padded_beam_size = gpu_effective_sort_beam_size(static_cast<uint32_t>(beam_sz), static_cast<uint32_t>(result_k));
+    const size_t result_buffer_size = static_cast<size_t>(padded_beam_size) + CANDIDATE_BUFFER_SIZE;
     size_t size = 0;
-    size += hashtable_getsize(bitlen) * sizeof(INDEX_T);
-    size += result_buffer_size * sizeof(INDEX_T);
-    size += result_buffer_size * sizeof(DISTANCE_T);
-    size += SEARCH_WIDTH * sizeof(INDEX_T);
-    size += dim * sizeof(DATA_T);
-    size += padded_dim * sizeof(float);
-    size += padded_dim * sizeof(uint8_t);
-    size += (padded_dim << 2) * sizeof(uint8_t);
-    size += 3 * sizeof(float);
-    size += sizeof(int32_t);
-    size = align_up(size, alignof(uint64_t));
-    size += static_cast<size_t>(max_deg) * code_words * sizeof(uint64_t);
-    size += 3 * static_cast<size_t>(max_deg) * sizeof(float);
-    size += sizeof(uint32_t);
+    size += hashtable_getsize(bitlen) * sizeof(INDEX_T);       // HASH_TABLE: visited-node table
+    size += result_buffer_size * sizeof(INDEX_T);              // TOP_K_INDEX + CANDIDATE_INDEX
+    size += result_buffer_size * sizeof(DISTANCE_T);           // TOP_K_DISTANCE + CANDIDATE_DISTANCE
+    size += SEARCH_WIDTH * sizeof(INDEX_T);                    // PARENT_LIST: beam positions/ranks selected by pick_expanders
+    size += dim * sizeof(DATA_T);                              // QUERY_BUFFER: query staged in shared memory
+    size += padded_dim * sizeof(float);                        // ROTATED_QUERY_BUFFER
+    size += (padded_dim << 2) * sizeof(uint8_t);               // LUT_BUFFER: 4-byte lookup table per padded dimension
+    size += 3 * sizeof(float);                                 // qf low/high/width
+    size += sizeof(int32_t);                                   // qf sum_q
+    size = align_up(size, alignof(uint64_t));                  // align staged candidate codes
+    size += static_cast<size_t>(max_deg) * code_words * sizeof(uint64_t); // STAGED_CODE_BUFFER for one parent neighborhood
+    size += 3 * static_cast<size_t>(max_deg) * sizeof(float);  // STAGED_FACTOR_BUFFER for one parent neighborhood
+    size += sizeof(uint32_t);                                  // hops
     if (GPU_SEARCH_STATS) {
-        size += GPU_SEARCH_STAT_COUNT * sizeof(uint32_t);
+        size += GPU_SEARCH_STAT_COUNT * sizeof(uint32_t);      // search stats
     }
     size = align_up(size, alignof(INDEX_T));
-    size += beam_sz * sizeof(INDEX_T);
-    size = align_up(size, alignof(DISTANCE_T));
-    size += beam_sz * sizeof(DISTANCE_T);
-    (void)result_k;
+    if (gpu_topk_external_merge_scratch_needed(padded_beam_size)) {
+        size += padded_beam_size * sizeof(INDEX_T);            // MERGED_TOPK_INDEX scratch
+        size = align_up(size, alignof(DISTANCE_T));
+        size += padded_beam_size * sizeof(DISTANCE_T);         // MERGED_TOPK_DISTANCE scratch
+    }
     (void)prune_ratio;
     (void)approx_ratio;
     return static_cast<uint32_t>(size);
@@ -154,8 +155,7 @@ void QuantizedPrunedBeamSearch(
     DATA_T* QUERY_BUFFER = reinterpret_cast<DATA_T*>(PARENT_LIST + SEARCH_WIDTH);
 
     float* ROTATED_QUERY_BUFFER = reinterpret_cast<float*>(QUERY_BUFFER + dim);
-    uint8_t* QUANTIZED_QUERY_BUFFER = reinterpret_cast<uint8_t*>(ROTATED_QUERY_BUFFER + padded_dim);
-    uint8_t* LUT_BUFFER = QUANTIZED_QUERY_BUFFER + padded_dim;
+    uint8_t* LUT_BUFFER = reinterpret_cast<uint8_t*>(ROTATED_QUERY_BUFFER + padded_dim);
     char* query_factor_base = reinterpret_cast<char*>(LUT_BUFFER);
     query_factor_base += (padded_dim << 2) * sizeof(uint8_t);
     float* low_val = reinterpret_cast<float*>(query_factor_base);
@@ -169,8 +169,16 @@ void QuantizedPrunedBeamSearch(
 
     uint32_t* hops = reinterpret_cast<uint32_t*>(STAGED_FACTOR_BUFFER + 3 * max_degree);
     uint32_t* stats = hops + 1;
-    INDEX_T* MERGED_TOPK_INDEX = reinterpret_cast<INDEX_T*>(stats + (GPU_SEARCH_STATS ? GPU_SEARCH_STAT_COUNT : 0));
-    DISTANCE_T* MERGED_TOPK_DISTANCE = reinterpret_cast<DISTANCE_T*>(MERGED_TOPK_INDEX + padded_beam_size);
+    char* tail_base = reinterpret_cast<char*>(stats + (GPU_SEARCH_STATS ? GPU_SEARCH_STAT_COUNT : 0));
+    tail_base = reinterpret_cast<char*>(align_up_uintptr(reinterpret_cast<uintptr_t>(tail_base), alignof(INDEX_T)));
+    INDEX_T* MERGED_TOPK_INDEX = nullptr;
+    DISTANCE_T* MERGED_TOPK_DISTANCE = nullptr;
+    if (gpu_topk_external_merge_scratch_needed(padded_beam_size)) {
+        MERGED_TOPK_INDEX = reinterpret_cast<INDEX_T*>(tail_base);
+        tail_base = reinterpret_cast<char*>(MERGED_TOPK_INDEX + padded_beam_size);
+        tail_base = reinterpret_cast<char*>(align_up_uintptr(reinterpret_cast<uintptr_t>(tail_base), alignof(DISTANCE_T)));
+        MERGED_TOPK_DISTANCE = reinterpret_cast<DISTANCE_T*>(tail_base);
+    }
 
     __shared__ QueryFactors qf;
     __shared__ uint32_t keep_expanding;
@@ -178,7 +186,7 @@ void QuantizedPrunedBeamSearch(
 
     if (tid == 0) {
         qf.rotated_query = ROTATED_QUERY_BUFFER;
-        qf.quantized_query = QUANTIZED_QUERY_BUFFER;
+        qf.quantized_query = nullptr;
         qf.lut = LUT_BUFFER;
         qf.low_val = FLT_MAX;
         qf.high_val = -FLT_MAX;
@@ -213,7 +221,7 @@ void QuantizedPrunedBeamSearch(
 
     // only the first slot in candidate list is actually initialized with valid entry point
     if (warp_id == 0) {
-        DISTANCE_T entry_dist = warp_distance(dim, query, d_qg_data + static_cast<size_t>(entry_point) * row_offset, use_ip);
+        DISTANCE_T entry_dist = warp_distance(dim, QUERY_BUFFER, d_qg_data + static_cast<size_t>(entry_point) * row_offset, use_ip);
         if (lane_id == 0) {
             CANDIDATE_INDEX[0] = entry_point;
             CANDIDATE_DISTANCE[0] = entry_dist;
@@ -224,8 +232,7 @@ void QuantizedPrunedBeamSearch(
     __syncthreads();
 
     // query preparation, quantize the query and prepare the LUT for RaBitQ distance estimation
-    query_prepare_gpu(QUERY_BUFFER, qf, d_qg_signs, dim, padded_dim);
-    pack_lut_gpu(static_cast<int>(padded_dim), qf.quantized_query, qf.lut);
+    query_prepare_lut_gpu(QUERY_BUFFER, qf, d_qg_signs, dim, padded_dim);
     __syncthreads();
 
     // loop end condition: either entire topK expanded, or reach max iteration
@@ -303,7 +310,7 @@ void QuantizedPrunedBeamSearch(
 
                 DISTANCE_T child_dist = FLT_MAX;
                 if (inserted && child_id != MAX_INDEX) {
-                    child_dist = warp_distance(dim, query, d_qg_data + static_cast<size_t>(child_id) * row_offset, use_ip);
+                    child_dist = warp_distance(dim, QUERY_BUFFER, d_qg_data + static_cast<size_t>(child_id) * row_offset, use_ip);
                 }
                 if (lane_id == 0) {
                     CANDIDATE_INDEX[i] = child_id;
@@ -406,7 +413,7 @@ void QuantizedPrunedBeamSearch(
 
                 DISTANCE_T child_dist = FLT_MAX;
                 if (inserted && child_id != MAX_INDEX) {
-                    child_dist = warp_distance(dim, query, d_qg_data + static_cast<size_t>(child_id) * row_offset, use_ip);
+                    child_dist = warp_distance(dim, QUERY_BUFFER, d_qg_data + static_cast<size_t>(child_id) * row_offset, use_ip);
                 }
                 if (lane_id == 0 && inserted && child_id != MAX_INDEX) {
                     CANDIDATE_DISTANCE[i] = child_dist;
