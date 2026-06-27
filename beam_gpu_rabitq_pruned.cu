@@ -2,8 +2,37 @@
 
 #include "include/qg.hpp"
 
-#if (defined(SEARCH_WIDTH) && SEARCH_WIDTH > 1) || defined(GPU_RABITQ_PRUNED_SPEC) || \
-    (defined(GPU_RABITQ_SPECULATION_WIDTH1) && GPU_RABITQ_SPECULATION_WIDTH1)
+#ifndef GPU_RABITQ_PRUNED_SPEC
+#define GPU_RABITQ_PRUNED_SPEC 0
+#endif
+
+#ifndef GPU_RABITQ_PRUNED_SPEC_ADAPTIVE
+#define GPU_RABITQ_PRUNED_SPEC_ADAPTIVE 0
+#endif
+
+#ifndef SEARCH_WIDTH
+#if GPU_RABITQ_PRUNED_SPEC_ADAPTIVE
+#define SEARCH_WIDTH 16
+#else
+#define SEARCH_WIDTH 1
+#endif
+#endif
+
+#if GPU_RABITQ_PRUNED_SPEC_ADAPTIVE && (SEARCH_WIDTH != 16)
+#error "GPU RaBitQ-pruned adaptive mode requires SEARCH_WIDTH=16 for max-width shared-memory capacity"
+#endif
+
+#if !GPU_RABITQ_PRUNED_SPEC_ADAPTIVE && !GPU_RABITQ_PRUNED_SPEC && (SEARCH_WIDTH != 1)
+#error "GPU RaBitQ-pruned clean mode requires SEARCH_WIDTH=1; use GPU_RABITQ_PRUNED_SPEC=1 for wider fixed-width search"
+#endif
+
+#if !GPU_RABITQ_PRUNED_SPEC_ADAPTIVE && GPU_RABITQ_PRUNED_SPEC && (SEARCH_WIDTH < 1 || SEARCH_WIDTH > 16)
+#error "GPU RaBitQ-pruned spec mode requires SEARCH_WIDTH in [1, 16]"
+#endif
+
+#if GPU_RABITQ_PRUNED_SPEC_ADAPTIVE
+#include "include/search_rabitq_pruned_spec_adaptive.cuh"
+#elif GPU_RABITQ_PRUNED_SPEC && (SEARCH_WIDTH > 1)
 #include "include/search_rabitq_pruned_spec.cuh"
 #else
 #include "include/search_rabitq_pruned.cuh"
@@ -53,10 +82,14 @@ void QuantizationGraph::gpu_search_pruned(int nq, const float* queries, int K,
   if (beam_sz <= 0) {
     throw std::runtime_error("GPU RaBitQ-pruned requires beam_size > 0");
   }
-  int padded_beam_size = static_cast<int>(gpu_effective_sort_beam_size(static_cast<uint32_t>(beam_sz), static_cast<uint32_t>(K)));
+  int padded_beam_size = static_cast<int>(gpu_effective_sort_beam_size(static_cast<uint32_t>(beam_sz)));
   const size_t candidate_work_count = static_cast<size_t>(SEARCH_WIDTH) * this->degree_;
+#if GPU_RABITQ_PRUNED_SPEC_ADAPTIVE
+  const size_t candidate_buffer_size = rabitq_pruned_candidate_buffer_size(static_cast<uint32_t>(this->degree_));
+#else
   const size_t candidate_buffer_size = rabitq_pruned_candidate_buffer_size(static_cast<uint32_t>(this->degree_), prune_ratio, approx_ratio);
-#if !GPU_RABITQ_PRUNED_SPEC_KERNEL
+#endif
+#if !(GPU_RABITQ_PRUNED_SPEC_ADAPTIVE || (GPU_RABITQ_PRUNED_SPEC && (SEARCH_WIDTH > 1)))
   if (candidate_work_count > candidate_buffer_size) {
     throw std::runtime_error("GPU RaBitQ-pruned clean kernel requires degree <= candidate buffer size");
   }
@@ -65,7 +98,10 @@ void QuantizationGraph::gpu_search_pruned(int nq, const float* queries, int K,
   auto npoints = this->num_nodes_;
   auto max_degree = this->degree_;
   auto beam_size = beam_sz;
-  auto bitlen = GPU_HASH_BITLEN_FOR_TOPK(padded_beam_size);
+  auto bitlen = gpu_hash_bitlen_for_pruned_workload(
+      static_cast<uint32_t>(padded_beam_size),
+      static_cast<uint32_t>(candidate_buffer_size),
+      static_cast<uint32_t>(SMALL_HASH_RESET_INTERVAL));
   const bool use_ip = (this->get_metric() == METRIC_IP);
   const int active_nq = nq;
 
@@ -74,9 +110,37 @@ void QuantizationGraph::gpu_search_pruned(int nq, const float* queries, int K,
   printf("Metric: %s\n", metric_name(this->get_metric()));
   printf("RaBitQ-pruned params: prune_ratio=%.4f, keep_fraction=%.4f, prune_iteration_ratio=%.4f\n",
          prune_ratio, 1.0f - prune_ratio, approx_ratio);
-  printf("GPU rabitq-pruned mode: %s, search_width=%d, candidate_work_count=%zu, candidate_buffer_size=%zu\n",
-         GPU_RABITQ_PRUNED_SPEC_KERNEL ? "spec" : "clean", SEARCH_WIDTH,
-         candidate_work_count, candidate_buffer_size);
+#if GPU_RABITQ_PRUNED_SPEC_ADAPTIVE
+  constexpr const char* mode_name = "spec_adaptive";
+#elif GPU_RABITQ_PRUNED_SPEC && (SEARCH_WIDTH > 1)
+  constexpr const char* mode_name = "spec";
+#elif GPU_RABITQ_PRUNED_SPEC
+  constexpr const char* mode_name = "clean_spec_width1_fallback";
+#else
+  constexpr const char* mode_name = "clean";
+#endif
+  printf("GPU rabitq-pruned mode: %s, search_width=%d, candidate_work_count=%zu, candidate_buffer_size=%zu, hash_bitlen=%d, hash_size=%u\n",
+         mode_name, SEARCH_WIDTH, candidate_work_count, candidate_buffer_size, bitlen, hashtable_getsize(bitlen));
+#if GPU_RABITQ_PRUNED_SPEC_ADAPTIVE
+  printf("RaBitQ-pruned adaptive params: width_min=%d, width_start=%d, width_step=%d, width_max=%d, stage_widths=%d/%d/%d, stall_widen=%d, prune_min=%.4f, prune_max=%.4f, prune_policy=base(deg16 %.4f / deg32 %.4f), fill_relax %.4f, escape_tighten %.4f, keep_min=%d, keep_max=%d, target_candidates=%d, fill_rule=100%% beam, admitted_low=<50%% target\n",
+         static_cast<int>(RABITQ_ADAPTIVE_WIDTH_MIN),
+         static_cast<int>(RABITQ_ADAPTIVE_WIDTH_START),
+         static_cast<int>(RABITQ_ADAPTIVE_WIDTH_STEP),
+         static_cast<int>(RABITQ_ADAPTIVE_WIDTH_MAX),
+         static_cast<int>(RABITQ_ADAPTIVE_FILL_WIDTH),
+         static_cast<int>(RABITQ_ADAPTIVE_CRUISE_WIDTH),
+         static_cast<int>(RABITQ_ADAPTIVE_ESCAPE_WIDTH),
+         static_cast<int>(RABITQ_ADAPTIVE_STALL_WIDEN_1),
+         static_cast<double>(RABITQ_ADAPTIVE_PRUNE_MIN),
+         static_cast<double>(RABITQ_ADAPTIVE_PRUNE_MAX),
+         static_cast<double>(RABITQ_ADAPTIVE_BASE_PRUNE_RATIO_DEG16),
+         static_cast<double>(RABITQ_ADAPTIVE_BASE_PRUNE_RATIO_DEG32),
+         static_cast<double>(RABITQ_ADAPTIVE_FILL_PRUNE_RELAX_STEP),
+         static_cast<double>(RABITQ_ADAPTIVE_ESCAPE_PRUNE_TIGHTEN_STEP),
+         static_cast<int>(RABITQ_ADAPTIVE_KEEP_MIN),
+         static_cast<int>(RABITQ_ADAPTIVE_KEEP_MAX),
+         static_cast<int>(RABITQ_ADAPTIVE_TARGET_CANDIDATES));
+#endif
 
   size_t num_threads = BLOCK_SIZE;
   size_t num_blocks = active_nq;

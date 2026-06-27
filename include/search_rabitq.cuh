@@ -33,9 +33,6 @@
 
 static __host__ inline uint32_t calculate_shared_mem_size(int dim, int beam_sz, int result_k,
                                                            int max_deg, int bitlen) {
-    auto align_up = [](size_t value, size_t alignment) {
-        return (value + alignment - 1) & ~(alignment - 1);
-    };
     size_t padded_dim = 1ULL << static_cast<size_t>(ceilf(log2f(dim)));
     size_t code_words = padded_dim / 64;
     const size_t candidate_work_count = static_cast<size_t>(SEARCH_WIDTH) * static_cast<size_t>(max_deg);
@@ -55,7 +52,7 @@ static __host__ inline uint32_t calculate_shared_mem_size(int dim, int beam_sz, 
 #endif
     size += 3 * sizeof(float);                              // low/high/width
     size += sizeof(int32_t);                                // sum_q
-    size = align_up(size, alignof(uint64_t));               // align staged candidate codes
+    size = static_cast<size_t>(align_up_uintptr(size, alignof(uint64_t)));               // align staged candidate codes
     size += candidate_work_count * code_words * sizeof(uint64_t); // staged candidate codes
     size += 3 * candidate_work_count * sizeof(float);       // staged candidate factors
     size += sizeof(uint32_t);                               // hops
@@ -103,7 +100,7 @@ void QuantizedBeamSearch(
     const uint32_t candidate_work_count = static_cast<uint32_t>(SEARCH_WIDTH) * static_cast<uint32_t>(max_degree);
     const uint32_t candidate_buffer_size = round_up_power2_u32(candidate_work_count);
     const uint32_t logical_beam_size = static_cast<uint32_t>(beam_sz);
-    const uint32_t padded_beam_size = gpu_effective_sort_beam_size(logical_beam_size, static_cast<uint32_t>(K));
+    const uint32_t padded_beam_size = gpu_effective_sort_beam_size(logical_beam_size);
     constexpr unsigned candidate_sort_items_per_thread =
         (SEARCH_WIDTH <= 1) ? 1 : ((SEARCH_WIDTH <= 2) ? 2 : 4);
 

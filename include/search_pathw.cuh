@@ -256,7 +256,7 @@ void PathWBeamSearch(
     if (query_id >= nq || beam_sz <= 0) return;
 
     const uint32_t logical_beam_size = static_cast<uint32_t>(beam_sz);
-    const uint32_t padded_beam_size = gpu_effective_sort_beam_size(logical_beam_size, static_cast<uint32_t>(K));
+    const uint32_t padded_beam_size = gpu_effective_sort_beam_size(logical_beam_size);
     if (padded_beam_size > INTERNAL_TOPK) return;
     const uint32_t graph_degree = gg.get_max_degree();
     const uint32_t candidate_work_count = static_cast<uint32_t>(SEARCH_WIDTH) * graph_degree;

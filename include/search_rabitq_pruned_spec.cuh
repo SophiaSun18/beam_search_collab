@@ -13,15 +13,6 @@
 
 #define MAX_ITERATIONS (1 << 15)
 
-#if SEARCH_WIDTH <= 1
-
-#define GPU_RABITQ_PRUNED_SPEC_WIDTH1_SPECIALIZED 1
-#include "search_rabitq_pruned.cuh"
-
-#else
-
-#define GPU_RABITQ_PRUNED_SPEC_KERNEL 1
-
 #ifndef GPU_RABITQ_FASTSCAN_SUBWARP_LANES
 #define GPU_RABITQ_FASTSCAN_SUBWARP_LANES 32
 #endif
@@ -40,34 +31,13 @@
 #define GPU_RABITQ_PRUNED_USE_LOCAL_GATE (SEARCH_WIDTH >= GPU_RABITQ_PRUNED_LOCAL_GATE_MIN_WIDTH)
 #endif
 
-static __host__ __device__ inline uint32_t rabitq_pruned_keep_count_for_tile(uint32_t active_neighbors, float prune_ratio) {
-    float keep_fraction = 1.0f - prune_ratio;
-    if (keep_fraction < 0.0f) keep_fraction = 0.0f;
-    if (keep_fraction > 1.0f) keep_fraction = 1.0f;
-
-    uint32_t keep_count = static_cast<uint32_t>(ceilf(static_cast<float>(active_neighbors) * keep_fraction));
-    if (keep_count < 1) keep_count = 1;
-    if (keep_count > active_neighbors) keep_count = active_neighbors;
-    return keep_count;
-}
-
-static __host__ __device__ inline uint32_t rabitq_pruned_local_gate_keep_count(uint32_t max_degree, float prune_ratio) {
-    uint32_t keep_per_parent = 0;
-    for (uint32_t begin = 0; begin < max_degree; begin += WARP_SIZE) {
-        uint32_t active_neighbors = max_degree - begin;
-        if (active_neighbors > WARP_SIZE) active_neighbors = WARP_SIZE;
-        keep_per_parent += rabitq_pruned_keep_count_for_tile(active_neighbors, prune_ratio);
-    }
-    return static_cast<uint32_t>(SEARCH_WIDTH) * keep_per_parent;
-}
-
 static __host__ __device__ inline uint32_t rabitq_pruned_candidate_buffer_size(uint32_t max_degree, float prune_ratio = 0.0f, float approx_ratio = 1.0f) {
     const uint32_t work_count = static_cast<uint32_t>(SEARCH_WIDTH) * max_degree;
 #if GPU_RABITQ_PRUNED_USE_LOCAL_GATE
     if (prune_ratio <= 0.0f || approx_ratio < 1.0f) {
         return round_up_power2_u32(work_count);
     }
-    return round_up_power2_u32(rabitq_pruned_local_gate_keep_count(max_degree, prune_ratio));
+    return round_up_power2_u32(static_cast<uint32_t>(SEARCH_WIDTH) * keep_count_per_parent(max_degree, prune_ratio));
 #elif GPU_RABITQ_USE_BLOCK_CANDIDATE_SORT || SEARCH_WIDTH > 4
     return round_up_power2_u32(work_count);
 #else
@@ -77,15 +47,12 @@ static __host__ __device__ inline uint32_t rabitq_pruned_candidate_buffer_size(u
 
 static __host__ inline uint32_t calculate_pruned_shared_mem_size(int dim, int beam_sz, int result_k, int max_deg,
     int bitlen, float prune_ratio = 0.0f, float approx_ratio = 1.0f) {
-    auto align_up = [](size_t value, size_t alignment) -> size_t {
-        return (value + alignment - 1) & ~(alignment - 1);
-    };
     size_t padded_dim = 1ULL << static_cast<size_t>(ceilf(log2f(dim)));
 #if !GPU_RABITQ_PRUNED_USE_LOCAL_GATE
     size_t code_words = padded_dim / 64;
 #endif
     const size_t candidate_buffer_size = rabitq_pruned_candidate_buffer_size(static_cast<uint32_t>(max_deg), prune_ratio, approx_ratio);
-    const uint32_t padded_beam_size = gpu_effective_sort_beam_size(static_cast<uint32_t>(beam_sz), static_cast<uint32_t>(result_k));
+    const uint32_t padded_beam_size = gpu_effective_sort_beam_size(static_cast<uint32_t>(beam_sz));
     const size_t result_buffer_size = static_cast<size_t>(padded_beam_size) + candidate_buffer_size;
     size_t size = 0;
     size += hashtable_getsize(bitlen) * sizeof(INDEX_T);       // visited-node hash table
@@ -99,7 +66,7 @@ static __host__ inline uint32_t calculate_pruned_shared_mem_size(int dim, int be
     size += (padded_dim << 2) * sizeof(uint8_t);               // LUT_BUFFER
     size += 3 * sizeof(float);                                 // qf low/high/width
     size += sizeof(int32_t);                                   // qf sum_q
-    size = align_up(size, alignof(uint64_t));
+    size = static_cast<size_t>(align_up_uintptr(size, alignof(uint64_t)));
 #if !GPU_RABITQ_PRUNED_USE_LOCAL_GATE
     size += candidate_buffer_size * code_words * sizeof(uint64_t); // STAGED_CODE_BUFFER for candidate gate/rescore
     size += 3 * candidate_buffer_size * sizeof(float);          // STAGED_FACTOR_BUFFER for candidate gate/rescore
@@ -108,10 +75,10 @@ static __host__ inline uint32_t calculate_pruned_shared_mem_size(int dim, int be
     if (GPU_SEARCH_STATS) {
         size += GPU_SEARCH_STAT_COUNT * sizeof(uint32_t);       // search stats
     }
-    size = align_up(size, alignof(INDEX_T));
+    size = static_cast<size_t>(align_up_uintptr(size, alignof(INDEX_T)));
     if (gpu_topk_external_merge_scratch_needed(padded_beam_size)) {
         size += padded_beam_size * sizeof(INDEX_T);             // MERGED_TOPK_INDEX scratch
-        size = align_up(size, alignof(DISTANCE_T));
+        size = static_cast<size_t>(align_up_uintptr(size, alignof(DISTANCE_T)));
         size += padded_beam_size * sizeof(DISTANCE_T);        // MERGED_TOPK_DISTANCE scratch
     }
     return static_cast<uint32_t>(size);
@@ -153,7 +120,7 @@ void QuantizedPrunedBeamSearch(
     const uint32_t candidate_work_count = static_cast<uint32_t>(SEARCH_WIDTH) * max_degree;
     const uint32_t candidate_buffer_size = rabitq_pruned_candidate_buffer_size(static_cast<uint32_t>(max_degree), prune_ratio, approx_ratio);
     const uint32_t logical_beam_size = static_cast<uint32_t>(beam_sz);
-    const uint32_t padded_beam_size = gpu_effective_sort_beam_size(logical_beam_size, static_cast<uint32_t>(K));
+    const uint32_t padded_beam_size = gpu_effective_sort_beam_size(logical_beam_size);
 
     // initialize the shared memory
     extern __shared__ char shared_memory[];
@@ -425,7 +392,7 @@ void QuantizedPrunedBeamSearch(
 
                     uint32_t active_neighbors = static_cast<uint32_t>(max_degree - tile_idx * WARP_SIZE);
                     if (active_neighbors > WARP_SIZE) active_neighbors = WARP_SIZE;
-                    const int keep_count = static_cast<int>(rabitq_pruned_keep_count_for_tile(active_neighbors, prune_ratio));
+                    const int keep_count = static_cast<int>(keep_count_per_parent(active_neighbors, prune_ratio));
 
                     const bool keep_lane = warp_keep_topk_smallest_f32(est_dist, valid_candidate, keep_count);
                     uint32_t inserted = 0;
@@ -671,5 +638,3 @@ void QuantizedPrunedBeamSearch(
         }
     }
 }
-
-#endif  // SEARCH_WIDTH <= 1

@@ -61,7 +61,7 @@ void IndexGraph<T>::search_pathw(int nq, const T* queries, int K, T* result_vec,
   auto npoints = this->ntotal;
   auto max_degree = this->maxDeg;
   auto beam_size = beam_sz;
-  auto padded_beam_size = static_cast<int>(gpu_effective_sort_beam_size(static_cast<uint32_t>(beam_size), static_cast<uint32_t>(K)));
+  auto padded_beam_size = static_cast<int>(gpu_effective_sort_beam_size(static_cast<uint32_t>(beam_size)));
   auto bitlen = pathw_hash_bitlen_for_topk(padded_beam_size);
   const bool use_ip = (this->metric == METRIC_IP);
   const int active_nq = nq;

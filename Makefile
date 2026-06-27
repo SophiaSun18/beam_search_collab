@@ -88,7 +88,7 @@ gpu_rabitq: main.cu beam_gpu_rabitq.cu $(GPU_HEADERS) $(HEADERS_DIR)search_rabit
 	$(NVCC) $(NVFLAGS) $(PTXAS_FLAGS) $(INCLUDES) $(GPU_RABITQ_FLAGS) -o $@ main.cu beam_gpu_rabitq.cu
 	mv $@ $(BIN_DIR)/
 
-gpu_rabitq_pruned: main.cu beam_gpu_rabitq_pruned.cu $(GPU_HEADERS) $(HEADERS_DIR)search_rabitq_pruned.cuh $(HEADERS_DIR)search_rabitq_pruned_spec.cuh
+gpu_rabitq_pruned: main.cu beam_gpu_rabitq_pruned.cu $(GPU_HEADERS) $(HEADERS_DIR)search_rabitq_pruned.cuh $(HEADERS_DIR)search_rabitq_pruned_spec.cuh $(HEADERS_DIR)search_rabitq_pruned_spec_adaptive.cuh $(HEADERS_DIR)search_rabitq_pruned_spec_adaptive_config.cuh
 	$(NVCC) $(NVFLAGS) $(PTXAS_FLAGS) $(INCLUDES) $(GPU_RABITQ_PRUNED_FLAGS) -o $@ main.cu beam_gpu_rabitq_pruned.cu
 	mv $@ $(BIN_DIR)/
 

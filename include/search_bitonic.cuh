@@ -64,7 +64,7 @@ void BeamSearch(
     const uint32_t maxDegree = gg.get_max_degree();
     const uint32_t candidate_buffer_size = round_up_power2_u32(static_cast<uint32_t>(SEARCH_WIDTH) * maxDegree);
     const uint32_t logical_beam_size = static_cast<uint32_t>(beam_sz);
-    const uint32_t padded_beam_size = gpu_effective_sort_beam_size(logical_beam_size, static_cast<uint32_t>(K));
+    const uint32_t padded_beam_size = gpu_effective_sort_beam_size(logical_beam_size);
     INDEX_T* d_graph_ptr = gg.N(0);
 
     const int tid = threadIdx.x;

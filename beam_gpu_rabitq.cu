@@ -46,7 +46,7 @@ void QuantizationGraph::gpu_search(int nq, const float* queries, int K, float* r
   auto max_degree = this->degree_;
   auto requested_beam_size = beam_sz;
   auto beam_size = requested_beam_size;
-  auto padded_beam_size = static_cast<int>(gpu_effective_sort_beam_size(static_cast<uint32_t>(beam_size), static_cast<uint32_t>(K)));
+  auto padded_beam_size = static_cast<int>(gpu_effective_sort_beam_size(static_cast<uint32_t>(beam_size)));
   auto bitlen = GPU_HASH_BITLEN_FOR_TOPK(padded_beam_size);
   const bool use_ip = (this->get_metric() == METRIC_IP);
   const int active_nq = nq;

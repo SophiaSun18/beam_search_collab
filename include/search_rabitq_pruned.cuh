@@ -20,7 +20,6 @@
 #define CANDIDATE_BUFFER_SIZE 64
 #endif
 
-#define GPU_RABITQ_PRUNED_SPEC_KERNEL 0
 
 #ifndef GPU_RABITQ_FASTSCAN_SUBWARP_LANES
 #define GPU_RABITQ_FASTSCAN_SUBWARP_LANES 32
@@ -60,22 +59,17 @@ static __device__ inline void staged_copy_async_finish_or_sync() {
 }
 
 static __host__ __device__ inline uint32_t rabitq_pruned_candidate_buffer_size(
-    uint32_t, float prune_ratio = 0.0f, float approx_ratio = 1.0f) {
-    (void)prune_ratio;
-    (void)approx_ratio;
+    uint32_t, float = 0.0f, float = 1.0f) {
     return CANDIDATE_BUFFER_SIZE;
 }
 
 static __host__ inline uint32_t calculate_pruned_shared_mem_size(int dim, int beam_sz, int result_k,
                                                                  int max_deg, int bitlen,
-                                                                 float prune_ratio = 0.0f,
-                                                                 float approx_ratio = 1.0f) {
-    auto align_up = [](size_t value, size_t alignment) -> size_t {
-        return (value + alignment - 1) & ~(alignment - 1);
-    };
+                                                                 float = 0.0f,
+                                                                 float = 1.0f) {
     size_t padded_dim = 1ULL << static_cast<size_t>(ceilf(log2f(dim)));
     size_t code_words = padded_dim / 64;
-    const uint32_t padded_beam_size = gpu_effective_sort_beam_size(static_cast<uint32_t>(beam_sz), static_cast<uint32_t>(result_k));
+    const uint32_t padded_beam_size = gpu_effective_sort_beam_size(static_cast<uint32_t>(beam_sz));
     const size_t result_buffer_size = static_cast<size_t>(padded_beam_size) + CANDIDATE_BUFFER_SIZE;
     size_t size = 0;
     size += hashtable_getsize(bitlen) * sizeof(INDEX_T);       // HASH_TABLE: visited-node table
@@ -87,21 +81,19 @@ static __host__ inline uint32_t calculate_pruned_shared_mem_size(int dim, int be
     size += (padded_dim << 2) * sizeof(uint8_t);               // LUT_BUFFER: 4-byte lookup table per padded dimension
     size += 3 * sizeof(float);                                 // qf low/high/width
     size += sizeof(int32_t);                                   // qf sum_q
-    size = align_up(size, alignof(uint64_t));                  // align staged candidate codes
+    size = static_cast<size_t>(align_up_uintptr(size, alignof(uint64_t)));                  // align staged candidate codes
     size += static_cast<size_t>(max_deg) * code_words * sizeof(uint64_t); // STAGED_CODE_BUFFER for one parent neighborhood
     size += 3 * static_cast<size_t>(max_deg) * sizeof(float);  // STAGED_FACTOR_BUFFER for one parent neighborhood
     size += sizeof(uint32_t);                                  // hops
     if (GPU_SEARCH_STATS) {
         size += GPU_SEARCH_STAT_COUNT * sizeof(uint32_t);      // search stats
     }
-    size = align_up(size, alignof(INDEX_T));
+    size = static_cast<size_t>(align_up_uintptr(size, alignof(INDEX_T)));
     if (gpu_topk_external_merge_scratch_needed(padded_beam_size)) {
         size += padded_beam_size * sizeof(INDEX_T);            // MERGED_TOPK_INDEX scratch
-        size = align_up(size, alignof(DISTANCE_T));
+        size = static_cast<size_t>(align_up_uintptr(size, alignof(DISTANCE_T)));
         size += padded_beam_size * sizeof(DISTANCE_T);         // MERGED_TOPK_DISTANCE scratch
     }
-    (void)prune_ratio;
-    (void)approx_ratio;
     return static_cast<uint32_t>(size);
 }
 
@@ -137,7 +129,7 @@ void QuantizedPrunedBeamSearch(
     size_t padded_dim = 1ULL << static_cast<size_t>(ceilf(log2f(dim)));
     size_t code_words = padded_dim / 64;
     const uint32_t logical_beam_size = static_cast<uint32_t>(beam_sz);
-    const uint32_t padded_beam_size = gpu_effective_sort_beam_size(logical_beam_size, static_cast<uint32_t>(K));
+    const uint32_t padded_beam_size = gpu_effective_sort_beam_size(logical_beam_size);
 
     // initialize the shared memory
     extern __shared__ char shared_memory[];

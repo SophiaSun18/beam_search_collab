@@ -19,6 +19,23 @@
 #define GPU_HASH_BITLEN_FOR_TOPK(topk)                                            \
   (((topk) * 4 > 3 * (1 << GPU_HASH_BASE_BITLEN)) ? (GPU_HASH_BASE_BITLEN + 1) : GPU_HASH_BASE_BITLEN)
 
+__host__ __device__ inline uint32_t gpu_hash_bitlen_for_pruned_workload(
+    uint32_t beam_size, uint32_t candidate_buffer_size, uint32_t reset_interval) {
+  const uint64_t required64 = static_cast<uint64_t>(beam_size) +
+                              static_cast<uint64_t>(candidate_buffer_size) * reset_interval;
+  const uint32_t required = required64 > 0xffffffffull ? 0xffffffffu : static_cast<uint32_t>(required64);
+  uint32_t target_capacity = (required * 4u + 2u) / 3u;
+  uint32_t capacity = 1u << GPU_HASH_BASE_BITLEN;
+  while (capacity < target_capacity) {
+    capacity <<= 1;
+  }
+  uint32_t bitlen = 0;
+  while ((1u << bitlen) < capacity) {
+    ++bitlen;
+  }
+  return bitlen;
+}
+
 #define GPU_FAST_BITONIC_TOPK_CAP 128
 #define GPU_RABITQ_USE_BLOCK_CANDIDATE_SORT 0
 
@@ -35,11 +52,10 @@
 #define GPU_RABITQ_USE_LUT 1
 #endif
 
+// Active GPU modes are 1=base, 2=pathw, 3=rabitq, 4=rabitq_pruned.
 #if defined(GPU_SEARCH_MODE) && GPU_SEARCH_MODE == 3
-#define GPU_RABITQ_SEARCH_NOINLINE __noinline__
 #define GPU_RABITQ_SEARCH_INLINE_ATTR __noinline__
 #else
-#define GPU_RABITQ_SEARCH_NOINLINE
 #define GPU_RABITQ_SEARCH_INLINE_ATTR inline
 #endif
 
@@ -64,14 +80,53 @@ __host__ __device__ inline bool is_power2_u32(uint32_t x) {
   return x != 0 && (x & (x - 1)) == 0;
 }
 
-__host__ __device__ inline uint32_t gpu_effective_sort_beam_size(uint32_t beam_size, uint32_t K) {
-  (void)K;
+__host__ __device__ inline uintptr_t align_up_uintptr(uintptr_t value, uintptr_t alignment) {
+  return (value + alignment - 1) & ~(alignment - 1);
+}
+
+__host__ __device__ inline int clamp_int(int value, int lo, int hi) {
+  if (value < lo) return lo;
+  if (value > hi) return hi;
+  return value;
+}
+
+__host__ __device__ inline float clamp_float(float value, float lo, float hi) {
+  if (value < lo) return lo;
+  if (value > hi) return hi;
+  return value;
+}
+
+__host__ __device__ inline int ceil_ratio_int(int value, int num, int den) {
+  if (value <= 0 || num <= 0 || den <= 0) return 0;
+  return (value * num + den - 1) / den;
+}
+
+__host__ __device__ inline uint32_t keep_count_per_parent(uint32_t max_degree, float prune_ratio) {
+  float keep_fraction = 1.0f - prune_ratio;
+  if (keep_fraction < 0.0f) keep_fraction = 0.0f;
+  if (keep_fraction > 1.0f) keep_fraction = 1.0f;
+
+  uint32_t keep_count = static_cast<uint32_t>(ceilf(static_cast<float>(max_degree) * keep_fraction));
+  if (keep_count < 1) keep_count = 1;
+  if (keep_count > max_degree) keep_count = max_degree;
+  return keep_count;
+}
+
+__host__ __device__ inline uint32_t gpu_effective_sort_beam_size(uint32_t beam_size) {
   if (beam_size == 0) return 0;
   const uint32_t rounded = round_up_power2_u32(beam_size);
   if (rounded <= GPU_FAST_BITONIC_TOPK_CAP) {
     return rounded < WARP_SIZE ? WARP_SIZE : rounded;
   }
   return beam_size;
+}
+
+__host__ __device__ inline bool gpu_topk_external_merge_scratch_needed(uint32_t internal_topk) {
+  return GPU_RABITQ_USE_BLOCK_CANDIDATE_SORT ||
+#if defined(SEARCH_WIDTH) && SEARCH_WIDTH > 4
+         true ||
+#endif
+         ((internal_topk + WARP_SIZE - 1) / WARP_SIZE) > 4;
 }
 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890) && (__CUDA_ARCH__ < 900)
@@ -1400,7 +1455,7 @@ static __device__ inline void rotate_vector_gpu(const float* src, float* dst,
   }
 }
 
-static __device__ GPU_RABITQ_SEARCH_NOINLINE void query_prepare_gpu(const float* query_raw, QueryFactors& scratch,
+static __device__ GPU_RABITQ_SEARCH_INLINE_ATTR void query_prepare_gpu(const float* query_raw, QueryFactors& scratch,
     const float* signs_ptr, int dim, int padded_dim) {
   constexpr float kQueryLevelsInv = 1.0f / static_cast<float>((1 << QG_BQUERY) - 1);
 
@@ -1583,6 +1638,107 @@ static __device__ GPU_RABITQ_SEARCH_INLINE_ATTR void pack_lut_gpu(
       const int lowbit = mask & -mask;
       const int pos = (lowbit == 8) ? 0 : ((lowbit == 4) ? 1 : ((lowbit == 2) ? 2 : 3));
       lut_chunk[mask] = static_cast<uint8_t>(lut_chunk[mask - lowbit] + query_chunk[pos]);
+    }
+  }
+}
+
+static __device__ GPU_RABITQ_SEARCH_INLINE_ATTR void query_prepare_lut_gpu(const float* query_raw, QueryFactors& scratch,
+    const float* signs_ptr, int dim, int padded_dim) {
+  constexpr float kQueryLevelsInv = 1.0f / static_cast<float>((1 << QG_BQUERY) - 1);
+
+  int tid = threadIdx.x;
+  int lane_id = tid % WARP_SIZE;
+  int warp_id = tid / WARP_SIZE;
+
+  // rotate the query
+  rotate_vector_gpu(query_raw, scratch.rotated_query, signs_ptr, dim, padded_dim);
+  __syncthreads();
+
+  __shared__ float warp_min[WARPS_PER_BLOCK];
+  __shared__ float warp_max[WARPS_PER_BLOCK];
+  float local_min = FLT_MAX;
+  float local_max = -FLT_MAX;
+
+  // data range: find the lowest and highest dimension in the rotated query
+  for (size_t i = tid; i < padded_dim; i += blockDim.x) {
+      float tmp = scratch.rotated_query[i];
+      local_min = fminf(local_min, tmp);
+      local_max = fmaxf(local_max, tmp);
+  }
+
+  for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+    local_min = fminf(local_min, __shfl_down_sync(FULL_MASK, local_min, offset));
+    local_max = fmaxf(local_max, __shfl_down_sync(FULL_MASK, local_max, offset));
+  }
+
+  if (lane_id == 0) {
+    warp_min[warp_id] = local_min;
+    warp_max[warp_id] = local_max;
+  }
+  __syncthreads();
+
+  if (warp_id == 0) {
+    local_min = (lane_id < WARPS_PER_BLOCK) ? warp_min[lane_id] : FLT_MAX;
+    local_max = (lane_id < WARPS_PER_BLOCK) ? warp_max[lane_id] : -FLT_MAX;
+
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+      local_min = fminf(local_min, __shfl_down_sync(FULL_MASK, local_min, offset));
+      local_max = fmaxf(local_max, __shfl_down_sync(FULL_MASK, local_max, offset));
+    }
+
+    if (lane_id == 0) {
+      scratch.low_val = local_min;
+      scratch.high_val = local_max;
+      const float query_span = scratch.high_val - scratch.low_val;
+      scratch.width = query_span * kQueryLevelsInv;
+    }
+  }
+  __syncthreads();
+
+  // quantize the query and build the LUT
+  const float inv_width = 1.0f / scratch.width;
+  __shared__ int32_t warp_sum[WARPS_PER_BLOCK];
+  int32_t local_sum = 0;
+  const int num_codebook = padded_dim >> 2;
+
+  for (int cb = tid; cb < num_codebook; cb += blockDim.x) {
+    uint8_t q[4];
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const int idx = (cb << 2) + j;
+      const float scaled = ((scratch.rotated_query[idx] - scratch.low_val) * inv_width) + 0.5f;
+      q[j] = static_cast<uint8_t>(lroundf(scaled));
+      local_sum += q[j];
+    }
+
+    // Store the 16 subset sums contiguously for this codebook chunk. The scan
+    // path later indexes qf.lut[(cb << 4) + code] directly for each neighbor.
+    uint8_t* lut_chunk = scratch.lut + (cb << 4);
+    lut_chunk[0] = 0;
+    for (int mask = 1; mask < 16; ++mask) {
+      const int lowbit = mask & -mask;
+      const int pos = (lowbit == 8) ? 0 : ((lowbit == 4) ? 1 : ((lowbit == 2) ? 2 : 3));
+      lut_chunk[mask] = static_cast<uint8_t>(lut_chunk[mask - lowbit] + q[pos]);
+    }
+  }
+
+  // compute the sum of quantized query values across all dimensions
+  for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+    local_sum += __shfl_down_sync(FULL_MASK, local_sum, offset);
+  }
+
+  if (lane_id == 0) {
+    warp_sum[warp_id] = local_sum;
+  }
+  __syncthreads();
+
+  if (warp_id == 0) {
+    local_sum = (lane_id < WARPS_PER_BLOCK) ? warp_sum[lane_id] : 0;
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+      local_sum += __shfl_down_sync(FULL_MASK, local_sum, offset);
+    }
+    if (lane_id == 0) {
+      scratch.sum_q = local_sum;
     }
   }
 }
