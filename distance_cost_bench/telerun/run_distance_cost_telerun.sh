@@ -4,7 +4,7 @@
 # RTX 4000 Ada (sm_89) executor that builds + runs the Part-1 distance
 # cost benchmark (CPU on host CPU, GPU sm_89), and tees the raw log locally.
 #
-# Usage: DATASETS=sift REPS=2000000 ./telerun/run_distance_cost_telerun.sh
+# Usage: DATASETS=sift RUN_TRACE_REPLAY=1 ./telerun/run_distance_cost_telerun.sh
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -19,6 +19,14 @@ DEGREE="${DEGREE:-32}"
 REPS="${REPS:-2000000}"
 NODES="${NODES:-256}"
 GPU_SCALE="${GPU_SCALE:-4}"
+RUN_PRIMITIVE="${RUN_PRIMITIVE:-1}"
+RUN_TRACE_REPLAY="${RUN_TRACE_REPLAY:-1}"
+TOPK="${TOPK:-100}"
+TRACE_BEAM="${TRACE_BEAM:-128}"
+TRACE_QUERY_LIMIT="${TRACE_QUERY_LIMIT:-100}"
+TRACE_CPU_REPEAT="${TRACE_CPU_REPEAT:-3}"
+TRACE_GPU_REPEAT="${TRACE_GPU_REPEAT:-10}"
+TRACE_WARMUP="${TRACE_WARMUP:-1}"
 STRICT_PRECHECK="${STRICT_PRECHECK:-1}"
 TELERUN_TIMEOUT="${TELERUN_TIMEOUT:-3600}"
 TELERUN_OVERRIDE_PENDING="${TELERUN_OVERRIDE_PENDING:-0}"
@@ -46,6 +54,7 @@ PERSIST_TAG="distance_cost_${TREE_LABEL}_${STAMP}"
   echo "=== local distance-cost telerun submission ==="
   echo "SRC_TAR=${SRC_TAR}"
   echo "DATASETS=${DATASETS}  DEGREE=${DEGREE}  REPS=${REPS}  NODES=${NODES}  GPU_SCALE=${GPU_SCALE}"
+  echo "RUN_PRIMITIVE=${RUN_PRIMITIVE}  RUN_TRACE_REPLAY=${RUN_TRACE_REPLAY}  TOPK=${TOPK}  TRACE_BEAM=${TRACE_BEAM}  TRACE_QUERY_LIMIT=${TRACE_QUERY_LIMIT}"
   echo "PERSIST_TAG=${PERSIST_TAG}"
 } | tee "${RAW_LOG}"
 
@@ -58,6 +67,14 @@ timeout "${TELERUN_TIMEOUT}" \
     REPS="${REPS}" \
     NODES="${NODES}" \
     GPU_SCALE="${GPU_SCALE}" \
+    RUN_PRIMITIVE="${RUN_PRIMITIVE}" \
+    RUN_TRACE_REPLAY="${RUN_TRACE_REPLAY}" \
+    TOPK="${TOPK}" \
+    TRACE_BEAM="${TRACE_BEAM}" \
+    TRACE_QUERY_LIMIT="${TRACE_QUERY_LIMIT}" \
+    TRACE_CPU_REPEAT="${TRACE_CPU_REPEAT}" \
+    TRACE_GPU_REPEAT="${TRACE_GPU_REPEAT}" \
+    TRACE_WARMUP="${TRACE_WARMUP}" \
     SOURCE_DIR_NAME="${tree_base}" \
     STRICT_PRECHECK="${STRICT_PRECHECK}" \
     PERSIST_TAG="${PERSIST_TAG}" \
