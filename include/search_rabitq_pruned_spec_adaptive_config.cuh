@@ -12,6 +12,34 @@
 //   6. Progress signals: head-stall transition and exact kth cutoff.
 //
 
+// Formal AP runs should not collect kernel-side profiling stats, clock64 timers,
+// or trace prints. This intentionally overrides stale build flags such as
+// -DGPU_SEARCH_STATS=1 or -DRABITQ_ADAPTIVE_TRACE=1 for formal AP binaries;
+// keep wall-clock elapsed timing outside the kernel for QPS. Set this to 0 only
+// for a separate, small validation binary.
+#ifndef RABITQ_ADAPTIVE_DISABLE_INSTRUMENTATION
+#define RABITQ_ADAPTIVE_DISABLE_INSTRUMENTATION 1
+#endif
+
+#if RABITQ_ADAPTIVE_DISABLE_INSTRUMENTATION
+#ifdef GPU_SEARCH_STATS
+#undef GPU_SEARCH_STATS
+#endif
+#define GPU_SEARCH_STATS 0
+#ifdef RABITQ_ADAPTIVE_TRACE
+#undef RABITQ_ADAPTIVE_TRACE
+#endif
+#define RABITQ_ADAPTIVE_TRACE 0
+#ifdef RABITQ_ADAPTIVE_BEAM_TRACE
+#undef RABITQ_ADAPTIVE_BEAM_TRACE
+#endif
+#define RABITQ_ADAPTIVE_BEAM_TRACE 0
+#ifdef RABITQ_ADAPTIVE_TRACE_VALID_PER_EXPANDER
+#undef RABITQ_ADAPTIVE_TRACE_VALID_PER_EXPANDER
+#endif
+#define RABITQ_ADAPTIVE_TRACE_VALID_PER_EXPANDER 0
+#endif
+
 // Build-time kernel shape. AP compiles enough parent slots for the largest
 // Stage II width we test.
 #ifndef INTERNAL_TOPK
