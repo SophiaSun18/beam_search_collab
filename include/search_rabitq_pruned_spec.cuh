@@ -171,6 +171,8 @@ void QuantizedPrunedBeamSearch(
     __shared__ uint32_t keep_expanding;
 #if GPU_RABITQ_PRUNED_USE_LOCAL_GATE
     __shared__ uint32_t compact_candidate_count;
+#else
+    __shared__ uint32_t valid_candidate_counts_by_warp[WARPS_PER_BLOCK];
 #endif
     __shared__ uint32_t warp_stat_counts[3 * WARPS_PER_BLOCK];
 
@@ -381,26 +383,35 @@ void QuantizedPrunedBeamSearch(
                         }
                     }
 
-                    DISTANCE_T est_dist = FLT_MAX;
-                    if (valid_candidate) {
-                        est_dist = scan_one_neighbor_lane_seq_lut_gpu(
-                            qf, parent_code_base, static_cast<int>(neighbor_idx),
-                            triple_x, factor_dq, factor_vq, PARENT_DISTANCE_LIST[parent_idx],
-                            padded_dim, bytes_per_neighbor);
-                        valid_candidate = isfinite(est_dist);
-                    }
-
                     uint32_t active_neighbors = static_cast<uint32_t>(max_degree - tile_idx * WARP_SIZE);
                     if (active_neighbors > WARP_SIZE) active_neighbors = WARP_SIZE;
                     const int keep_count = static_cast<int>(keep_count_per_parent(active_neighbors, prune_ratio));
 
-                    const bool keep_lane = warp_keep_topk_smallest_f32(est_dist, valid_candidate, keep_count);
+                    const uint32_t initial_valid_mask = __ballot_sync(FULL_MASK, valid_candidate);
+                    const uint32_t initial_valid_count = __popc(initial_valid_mask);
+                    const bool keep_all_valid = keep_count >= static_cast<int>(initial_valid_count);
+
+                    DISTANCE_T est_dist = FLT_MAX;
+                    uint32_t scored_count = initial_valid_count;
+                    bool keep_lane = valid_candidate;
+                    if (!keep_all_valid) {
+                        if (valid_candidate) {
+                            est_dist = scan_one_neighbor_lane_seq_lut_gpu(
+                                qf, parent_code_base, static_cast<int>(neighbor_idx),
+                                triple_x, factor_dq, factor_vq, PARENT_DISTANCE_LIST[parent_idx],
+                                padded_dim, bytes_per_neighbor);
+                            valid_candidate = isfinite(est_dist);
+                        }
+                        const uint32_t scored_mask = __ballot_sync(FULL_MASK, valid_candidate);
+                        scored_count = __popc(scored_mask);
+                        keep_lane = warp_keep_topk_smallest_f32(est_dist, valid_candidate, keep_count);
+                    }
+
                     uint32_t inserted = 0;
                     if (keep_lane) {
                         inserted = hashtable_insert(HASH_TABLE, bitlen, child_id);
                     }
 
-                    const uint32_t scored_mask = __ballot_sync(FULL_MASK, valid_candidate);
                     const uint32_t accepted_mask = __ballot_sync(FULL_MASK, inserted != 0);
                     const uint32_t accepted_count = __popc(accepted_mask);
                     uint32_t base_slot = 0;
@@ -422,9 +433,9 @@ void QuantizedPrunedBeamSearch(
                     }
 
                     if (lane_id == 0 && GPU_SEARCH_STATS) {
-                        const uint32_t scored_count = __popc(scored_mask);
-                        local_dist_est_count += scored_count;
-                        local_pruned_count += scored_count - accepted_count;
+                        if (!keep_all_valid) local_dist_est_count += initial_valid_count;
+                        const uint32_t admitted_count = keep_all_valid ? initial_valid_count : scored_count;
+                        local_pruned_count += admitted_count - accepted_count;
                     }
                 }
                 __syncthreads();
@@ -489,51 +500,6 @@ void QuantizedPrunedBeamSearch(
                 }
                 __syncthreads();
 
-                const int bytes_per_neighbor = padded_dim >> 3;
-                uint32_t warp_dist_est_count = 0;
-
-                constexpr int lanes_per_neighbor = GPU_RABITQ_FASTSCAN_SUBWARP_LANES;
-                constexpr int groups_per_warp = WARP_SIZE / lanes_per_neighbor;
-                const int group_lane = lane_id & (lanes_per_neighbor - 1);
-                const int warp_group = lane_id / lanes_per_neighbor;
-                uint32_t group_dist_est_count = 0;
-
-                for (int base = warp_id * groups_per_warp; base < static_cast<int>(candidate_work_count); base += WARPS_PER_BLOCK * groups_per_warp) {
-                    const int i = base + warp_group;
-                    const bool valid_candidate = i < static_cast<int>(candidate_work_count) && CANDIDATE_INDEX[i] != MAX_INDEX;
-                    if (valid_candidate) {
-                        const uint32_t parent_idx = static_cast<uint32_t>(i) / static_cast<uint32_t>(max_degree);
-                        const uint32_t neighbor_idx = static_cast<uint32_t>(i) - parent_idx * static_cast<uint32_t>(max_degree);
-                        const uint8_t* parent_code_base = reinterpret_cast<const uint8_t*>(
-                            STAGED_CODE_BUFFER + static_cast<size_t>(parent_idx) * parent_code_words);
-                        const float* triple_x = STAGED_FACTOR_BUFFER + i;
-                        const float* factor_dq = STAGED_FACTOR_BUFFER + candidate_buffer_size + i;
-                        const float* factor_vq = STAGED_FACTOR_BUFFER + 2 * candidate_buffer_size + i;
-
-                        DISTANCE_T est_dist = FLT_MAX;
-                        est_dist = scan_one_neighbor_lanes_gpu<lanes_per_neighbor>(
-                            qf, parent_code_base, static_cast<int>(neighbor_idx),
-                            triple_x, factor_dq, factor_vq, PARENT_DISTANCE_LIST[parent_idx],
-                            padded_dim, bytes_per_neighbor);
-                        if (group_lane == 0) {
-                            CANDIDATE_DISTANCE[i] = isfinite(est_dist) ? est_dist : FLT_MAX;
-                            if (GPU_SEARCH_STATS) group_dist_est_count++;
-                        }
-                    }
-                    __syncwarp();
-                }
-
-                if (GPU_SEARCH_STATS) {
-                    warp_dist_est_count = group_dist_est_count;
-                    for (int offset = lanes_per_neighbor; offset < WARP_SIZE; offset <<= 1) {
-                        warp_dist_est_count += __shfl_down_sync(FULL_MASK, warp_dist_est_count, offset);
-                    }
-                }
-                if (lane_id == 0 && GPU_SEARCH_STATS) {
-                    local_dist_est_count += warp_dist_est_count;
-                }
-                __syncthreads();
-
                 const uint32_t active_candidate_count = keep_expanding * static_cast<uint32_t>(max_degree);
                 const uint32_t keep_budget_base = active_candidate_count;
                 int keep_count = static_cast<int>(static_cast<float>(keep_budget_base) * (1.0f - prune_ratio));
@@ -542,25 +508,78 @@ void QuantizedPrunedBeamSearch(
                     keep_count = static_cast<int>(active_candidate_count);
                 }
 
-                candidate_by_bitonic_sort_runtime(
-                    CANDIDATE_INDEX, CANDIDATE_DISTANCE, candidate_buffer_size);
-                __syncthreads();
+                const uint32_t valid_candidate_count = count_valid_candidates_warp_reduced(
+                    CANDIDATE_INDEX, CANDIDATE_DISTANCE,
+                    static_cast<int>(candidate_work_count), MAX_INDEX,
+                    valid_candidate_counts_by_warp);
+                const bool keep_all_valid = keep_count >= static_cast<int>(valid_candidate_count);
+                if (!keep_all_valid) {
+                    const int bytes_per_neighbor = padded_dim >> 3;
+                    uint32_t warp_dist_est_count = 0;
 
-                for (int i = tid; i < static_cast<int>(candidate_buffer_size); i += blockDim.x) {
-                    if (i >= keep_count) {
-                        if (CANDIDATE_INDEX[i] != MAX_INDEX) local_pruned_count++;
-                        CANDIDATE_INDEX[i] = MAX_INDEX;
-                        CANDIDATE_DISTANCE[i] = FLT_MAX;
+                    constexpr int lanes_per_neighbor = GPU_RABITQ_FASTSCAN_SUBWARP_LANES;
+                    constexpr int groups_per_warp = WARP_SIZE / lanes_per_neighbor;
+                    const int group_lane = lane_id & (lanes_per_neighbor - 1);
+                    const int warp_group = lane_id / lanes_per_neighbor;
+                    uint32_t group_dist_est_count = 0;
+
+                    for (int base = warp_id * groups_per_warp; base < static_cast<int>(candidate_work_count); base += WARPS_PER_BLOCK * groups_per_warp) {
+                        const int i = base + warp_group;
+                        const bool valid_candidate = i < static_cast<int>(candidate_work_count) && CANDIDATE_INDEX[i] != MAX_INDEX;
+                        if (valid_candidate) {
+                            const uint32_t parent_idx = static_cast<uint32_t>(i) / static_cast<uint32_t>(max_degree);
+                            const uint32_t neighbor_idx = static_cast<uint32_t>(i) - parent_idx * static_cast<uint32_t>(max_degree);
+                            const uint8_t* parent_code_base = reinterpret_cast<const uint8_t*>(
+                                STAGED_CODE_BUFFER + static_cast<size_t>(parent_idx) * parent_code_words);
+                            const float* triple_x = STAGED_FACTOR_BUFFER + i;
+                            const float* factor_dq = STAGED_FACTOR_BUFFER + candidate_buffer_size + i;
+                            const float* factor_vq = STAGED_FACTOR_BUFFER + 2 * candidate_buffer_size + i;
+
+                            DISTANCE_T est_dist = FLT_MAX;
+                            est_dist = scan_one_neighbor_lanes_gpu<lanes_per_neighbor>(
+                                qf, parent_code_base, static_cast<int>(neighbor_idx),
+                                triple_x, factor_dq, factor_vq, PARENT_DISTANCE_LIST[parent_idx],
+                                padded_dim, bytes_per_neighbor);
+                            if (group_lane == 0) {
+                                CANDIDATE_DISTANCE[i] = isfinite(est_dist) ? est_dist : FLT_MAX;
+                                if (GPU_SEARCH_STATS) group_dist_est_count++;
+                            }
+                        }
+                        __syncwarp();
                     }
-                }
-                __syncthreads();
 
-                for (int i = warp_id; i < keep_count; i += WARPS_PER_BLOCK) {
+                    if (GPU_SEARCH_STATS) {
+                        warp_dist_est_count = group_dist_est_count;
+                        for (int offset = lanes_per_neighbor; offset < WARP_SIZE; offset <<= 1) {
+                            warp_dist_est_count += __shfl_down_sync(FULL_MASK, warp_dist_est_count, offset);
+                        }
+                    }
+                    if (lane_id == 0 && GPU_SEARCH_STATS) {
+                        local_dist_est_count += warp_dist_est_count;
+                    }
+                    __syncthreads();
+
+                    candidate_by_bitonic_sort_runtime(
+                        CANDIDATE_INDEX, CANDIDATE_DISTANCE, candidate_buffer_size);
+                    __syncthreads();
+
+                    for (int i = tid; i < static_cast<int>(candidate_buffer_size); i += blockDim.x) {
+                        if (i >= keep_count) {
+                            if (CANDIDATE_INDEX[i] != MAX_INDEX) local_pruned_count++;
+                            CANDIDATE_INDEX[i] = MAX_INDEX;
+                            CANDIDATE_DISTANCE[i] = FLT_MAX;
+                        }
+                    }
+                    __syncthreads();
+                }
+
+                const int admit_scan_count = keep_all_valid ? static_cast<int>(candidate_work_count) : keep_count;
+                for (int i = warp_id; i < admit_scan_count; i += WARPS_PER_BLOCK) {
                     INDEX_T child_id = MAX_INDEX;
                     uint32_t inserted = 0;
                     if (lane_id == 0) {
                         child_id = CANDIDATE_INDEX[i];
-                        if (child_id != MAX_INDEX) {
+                        if (child_id != MAX_INDEX && CANDIDATE_DISTANCE[i] < FLT_MAX) {
                             inserted = hashtable_insert(HASH_TABLE, bitlen, child_id);
                         }
                         if (!inserted) {

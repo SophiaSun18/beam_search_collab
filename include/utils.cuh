@@ -9,7 +9,11 @@
 #include <cub/cub.cuh>
 
 #define FULL_MASK     0xffffffff
+
+#ifndef BLOCK_SIZE
 #define BLOCK_SIZE    256
+#endif
+
 #define WARP_SIZE     32
 #define LOG_WARP_SIZE 5
 #define WARPS_PER_BLOCK (BLOCK_SIZE / WARP_SIZE)
@@ -419,42 +423,49 @@ __device__ void candidate_by_bitonic_sort(
   }
 }
 
+__device__ inline void candidate_by_block_bitonic_sort_runtime(
+    INDEX_T* candidate_indices,
+    DISTANCE_T* candidate_distances,
+    uint32_t candidate_buffer_size) {
+  if (!is_power2_u32(candidate_buffer_size)) {
+    printf("block candidate sort requires power-of-two buffer size, got %u\n",
+           candidate_buffer_size);
+    assert(false);
+  }
+  for (uint32_t k = 2; k <= candidate_buffer_size; k <<= 1) {
+    for (uint32_t j = k >> 1; j > 0; j >>= 1) {
+      for (uint32_t i = threadIdx.x; i < candidate_buffer_size; i += blockDim.x) {
+        const uint32_t ixj = i ^ j;
+        if (ixj > i && ixj < candidate_buffer_size) {
+          const bool up = ((i & k) == 0);
+          const DISTANCE_T di = candidate_distances[i];
+          const DISTANCE_T dj = candidate_distances[ixj];
+          if ((di > dj) == up) {
+            candidate_distances[i] = dj;
+            candidate_distances[ixj] = di;
+            const INDEX_T ti = candidate_indices[i];
+            candidate_indices[i] = candidate_indices[ixj];
+            candidate_indices[ixj] = ti;
+          }
+        }
+      }
+      __syncthreads();
+    }
+  }
+}
+
 __device__ inline void candidate_by_bitonic_sort_runtime(
     INDEX_T* candidate_indices,
     DISTANCE_T* candidate_distances,
     uint32_t candidate_buffer_size) {
-  const uint32_t items_per_thread =
+  const uint32_t warp_items_per_thread =
       (candidate_buffer_size + WARP_SIZE - 1) / WARP_SIZE;
-  if (GPU_RABITQ_USE_BLOCK_CANDIDATE_SORT || items_per_thread > 4) {
-    if (!is_power2_u32(candidate_buffer_size)) {
-      printf("block candidate sort requires power-of-two buffer size, got %u\n",
-             candidate_buffer_size);
-      assert(false);
-    }
-    for (uint32_t k = 2; k <= candidate_buffer_size; k <<= 1) {
-      for (uint32_t j = k >> 1; j > 0; j >>= 1) {
-        for (uint32_t i = threadIdx.x; i < candidate_buffer_size; i += blockDim.x) {
-          const uint32_t ixj = i ^ j;
-          if (ixj > i && ixj < candidate_buffer_size) {
-            const bool up = ((i & k) == 0);
-            const DISTANCE_T di = candidate_distances[i];
-            const DISTANCE_T dj = candidate_distances[ixj];
-            if ((di > dj) == up) {
-              candidate_distances[i] = dj;
-              candidate_distances[ixj] = di;
-              const INDEX_T ti = candidate_indices[i];
-              candidate_indices[i] = candidate_indices[ixj];
-              candidate_indices[ixj] = ti;
-            }
-          }
-        }
-        __syncthreads();
-      }
-    }
-  } else if (items_per_thread <= 1) {
+  if (GPU_RABITQ_USE_BLOCK_CANDIDATE_SORT || warp_items_per_thread > 4) {
+    candidate_by_block_bitonic_sort_runtime(candidate_indices, candidate_distances, candidate_buffer_size);
+  } else if (warp_items_per_thread <= 1) {
     candidate_by_bitonic_sort<1, 0>(
         candidate_indices, candidate_distances, candidate_buffer_size);
-  } else if (items_per_thread <= 2) {
+  } else if (warp_items_per_thread <= 2) {
     candidate_by_bitonic_sort<2, 0>(
         candidate_indices, candidate_distances, candidate_buffer_size);
   } else {
@@ -1863,6 +1874,41 @@ static __device__ inline DISTANCE_T scan_one_neighbor_fastscan_lut_lanes_gpu(
   est_dist += factor_dq[0] * qf.width * result_float;
   est_dist += factor_vq[0] * qf.low_val;
   return est_dist;
+}
+
+template <typename INDEX_T, typename DISTANCE_T>
+static __device__ __forceinline__ uint32_t count_valid_candidates_warp_reduced(
+    const INDEX_T* candidate_index, const DISTANCE_T* candidate_distance,
+    int candidate_count, INDEX_T invalid_index, uint32_t* warp_counts) {
+  const int lane_id = threadIdx.x & (WARP_SIZE - 1);
+  const int warp_id = threadIdx.x / WARP_SIZE;
+
+  if (lane_id == 0) warp_counts[warp_id] = 0;
+  __syncthreads();
+
+  uint32_t warp_valid_count = 0;
+  for (int base = warp_id * WARP_SIZE;
+       base < candidate_count;
+       base += WARPS_PER_BLOCK * WARP_SIZE) {
+    const int i = base + lane_id;
+    const bool valid = i < candidate_count &&
+        candidate_index[i] != invalid_index && candidate_distance[i] < FLT_MAX;
+    warp_valid_count += __popc(__ballot_sync(FULL_MASK, valid));
+  }
+
+  if (lane_id == 0) warp_counts[warp_id] = warp_valid_count;
+  __syncthreads();
+
+  if (warp_id == 0) {
+    uint32_t total = (lane_id < WARPS_PER_BLOCK) ? warp_counts[lane_id] : 0u;
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+      total += __shfl_down_sync(FULL_MASK, total, offset);
+    }
+    if (lane_id == 0) warp_counts[0] = total;
+  }
+  __syncthreads();
+
+  return warp_counts[0];
 }
 
 static __device__ __forceinline__ bool warp_keep_topk_smallest_f32(float value, bool valid, int keep_k) {
