@@ -284,7 +284,8 @@ build_gpu_for_runtime_beams() {
         fi
     done
     local extra_nvflags="${EXTRA_NVFLAGS_OVERRIDE:-}"
-    local generated_nvflags="-DINTERNAL_TOPK=$max_beam -DSEARCH_WIDTH=$SEARCH_WIDTH -DGPU_RABITQ_FASTSCAN_SUBWARP_LANES=$GPU_RABITQ_FASTSCAN_SUBWARP_LANES -DPATHW_WARMUP_RUNS=$GPU_PATHW_WARMUP_RUNS"
+    local internal_topk="${INTERNAL_TOPK_OVERRIDE:-$max_beam}"
+    local generated_nvflags="-DINTERNAL_TOPK=$internal_topk -DSEARCH_WIDTH=$SEARCH_WIDTH -DGPU_RABITQ_FASTSCAN_SUBWARP_LANES=$GPU_RABITQ_FASTSCAN_SUBWARP_LANES -DPATHW_WARMUP_RUNS=$GPU_PATHW_WARMUP_RUNS"
     case "$RUN_TARGET" in
         gpu_rabitq_pruned_spec)
             generated_nvflags+=" -DGPU_RABITQ_PRUNED_SPEC=1 -DGPU_RABITQ_PRUNED_LOCAL_GATE_MIN_WIDTH=$GPU_RABITQ_PRUNED_LOCAL_GATE_MIN_WIDTH -DGPU_RABITQ_PRUNED_LOCAL_GATE_USE_LUT=$GPU_RABITQ_PRUNED_LOCAL_GATE_USE_LUT"
@@ -300,7 +301,7 @@ build_gpu_for_runtime_beams() {
     fi
     echo "Building $gpu_make_target with: $generated_nvflags"
     make "$gpu_make_target" EXTRA_NVFLAGS="$extra_nvflags"
-    echo "Build done for INTERNAL_TOPK=$max_beam."
+    echo "Build done for INTERNAL_TOPK=$internal_topk."
 }
 
 pathw_keep_ratio_from_prune() {

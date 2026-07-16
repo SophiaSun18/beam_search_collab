@@ -18,3 +18,8 @@ archived/
 *profile*
 *process*
 *micro*
+
+# local source snapshots from experiment cleanup
+backups/
+tools/
+work/

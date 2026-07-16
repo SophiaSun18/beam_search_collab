@@ -18,8 +18,8 @@
 #endif
 #endif
 
-#if GPU_RABITQ_PRUNED_SPEC_ADAPTIVE && (SEARCH_WIDTH != 16)
-#error "GPU RaBitQ-pruned adaptive mode requires SEARCH_WIDTH=16 for max-width shared-memory capacity"
+#if GPU_RABITQ_PRUNED_SPEC_ADAPTIVE && (SEARCH_WIDTH < 1)
+#error "GPU RaBitQ-pruned adaptive mode requires SEARCH_WIDTH >= 1"
 #endif
 
 #if !GPU_RABITQ_PRUNED_SPEC_ADAPTIVE && !GPU_RABITQ_PRUNED_SPEC && (SEARCH_WIDTH != 1)
@@ -85,7 +85,8 @@ void QuantizationGraph::gpu_search_pruned(int nq, const float* queries, int K,
   int padded_beam_size = static_cast<int>(gpu_effective_sort_beam_size(static_cast<uint32_t>(beam_sz)));
   const size_t candidate_work_count = static_cast<size_t>(SEARCH_WIDTH) * this->degree_;
 #if GPU_RABITQ_PRUNED_SPEC_ADAPTIVE
-  const size_t candidate_buffer_size = rabitq_pruned_candidate_buffer_size(static_cast<uint32_t>(this->degree_));
+  const size_t candidate_buffer_size = round_up_power2_u32(
+      rabitq_pruned_adaptive_candidate_buffer_capacity(static_cast<uint32_t>(this->degree_)));
 #else
   const size_t candidate_buffer_size = rabitq_pruned_candidate_buffer_size(static_cast<uint32_t>(this->degree_), prune_ratio, approx_ratio);
 #endif
@@ -122,24 +123,47 @@ void QuantizationGraph::gpu_search_pruned(int nq, const float* queries, int K,
   printf("GPU rabitq-pruned mode: %s, search_width=%d, candidate_work_count=%zu, candidate_buffer_size=%zu, hash_bitlen=%d, hash_size=%u\n",
          mode_name, SEARCH_WIDTH, candidate_work_count, candidate_buffer_size, bitlen, hashtable_getsize(bitlen));
 #if GPU_RABITQ_PRUNED_SPEC_ADAPTIVE
-  printf("RaBitQ-pruned adaptive params: width_min=%d, width_start=%d, width_step=%d, width_max=%d, stage_widths=%d/%d/%d, stall_widen=%d, prune_min=%.4f, prune_max=%.4f, prune_policy=base(deg16 %.4f / deg32 %.4f), fill_relax %.4f, escape_tighten %.4f, keep_min=%d, keep_max=%d, target_candidates=%d, fill_rule=100%% beam, admitted_low=<50%% target\n",
-         static_cast<int>(RABITQ_ADAPTIVE_WIDTH_MIN),
-         static_cast<int>(RABITQ_ADAPTIVE_WIDTH_START),
-         static_cast<int>(RABITQ_ADAPTIVE_WIDTH_STEP),
-         static_cast<int>(RABITQ_ADAPTIVE_WIDTH_MAX),
-         static_cast<int>(RABITQ_ADAPTIVE_FILL_WIDTH),
-         static_cast<int>(RABITQ_ADAPTIVE_CRUISE_WIDTH),
-         static_cast<int>(RABITQ_ADAPTIVE_ESCAPE_WIDTH),
-         static_cast<int>(RABITQ_ADAPTIVE_STALL_WIDEN_1),
-         static_cast<double>(RABITQ_ADAPTIVE_PRUNE_MIN),
-         static_cast<double>(RABITQ_ADAPTIVE_PRUNE_MAX),
-         static_cast<double>(RABITQ_ADAPTIVE_BASE_PRUNE_RATIO_DEG16),
-         static_cast<double>(RABITQ_ADAPTIVE_BASE_PRUNE_RATIO_DEG32),
-         static_cast<double>(RABITQ_ADAPTIVE_FILL_PRUNE_RELAX_STEP),
-         static_cast<double>(RABITQ_ADAPTIVE_ESCAPE_PRUNE_TIGHTEN_STEP),
-         static_cast<int>(RABITQ_ADAPTIVE_KEEP_MIN),
-         static_cast<int>(RABITQ_ADAPTIVE_KEEP_MAX),
-         static_cast<int>(RABITQ_ADAPTIVE_TARGET_CANDIDATES));
+  uint32_t adaptive_collect_capacity = static_cast<uint32_t>(RABITQ_ADAPTIVE_BUFFER_BOUND);
+  if (adaptive_collect_capacity > static_cast<uint32_t>(candidate_buffer_size)) {
+    adaptive_collect_capacity = static_cast<uint32_t>(candidate_buffer_size);
+  }
+  const uint32_t phase1_theta = static_cast<uint32_t>(RABITQ_ADAPTIVE_PHASE1_THETA);
+  const uint32_t phase2_theta = static_cast<uint32_t>(RABITQ_ADAPTIVE_PHASE2_THETA);
+  const uint32_t phase1_raw_keep =
+      keep_count_per_parent(static_cast<uint32_t>(this->degree_), static_cast<float>(RABITQ_ADAPTIVE_PHASE1_RHO));
+  const uint32_t phase2_raw_keep =
+      keep_count_per_parent(static_cast<uint32_t>(this->degree_), static_cast<float>(RABITQ_ADAPTIVE_PHASE2_RHO));
+  uint32_t phase1_budget_keep = adaptive_collect_capacity / phase1_theta;
+  uint32_t phase2_budget_keep = adaptive_collect_capacity / phase2_theta;
+  if (phase1_budget_keep < 1) phase1_budget_keep = 1;
+  if (phase2_budget_keep < 1) phase2_budget_keep = 1;
+  if (phase1_budget_keep > static_cast<uint32_t>(this->degree_)) phase1_budget_keep = static_cast<uint32_t>(this->degree_);
+  if (phase2_budget_keep > static_cast<uint32_t>(this->degree_)) phase2_budget_keep = static_cast<uint32_t>(this->degree_);
+  const uint32_t phase1_raw_expected = phase1_theta * phase1_raw_keep;
+  const uint32_t phase2_raw_expected = phase2_theta * phase2_raw_keep;
+  const uint32_t phase1_expected_admit = phase1_theta *
+      ((phase1_raw_keep < phase1_budget_keep) ? phase1_raw_keep : phase1_budget_keep);
+  const uint32_t phase2_expected_admit = phase2_theta *
+      ((phase2_raw_keep < phase2_budget_keep) ? phase2_raw_keep : phase2_budget_keep);
+  printf("RaBitQ-pruned adaptive params: theta=[%d, %d], phase1=(w%d, rho=%.4f, raw=%u, budgeted=%u), phase2=(w%d, rho=%.4f, raw=%u, budgeted=%u), buffer_bound=%d, collect_capacity=%u, budget_ok=(%d,%d), rho=[%.4f, %.4f], head_stall_iters=%d, kth_cutoff=%d\n",
+         static_cast<int>(RABITQ_ADAPTIVE_THETA_MIN),
+         static_cast<int>(RABITQ_ADAPTIVE_THETA_MAX),
+         static_cast<int>(RABITQ_ADAPTIVE_PHASE1_THETA),
+         static_cast<double>(RABITQ_ADAPTIVE_PHASE1_RHO),
+         phase1_raw_expected,
+         phase1_expected_admit,
+         static_cast<int>(RABITQ_ADAPTIVE_PHASE2_THETA),
+         static_cast<double>(RABITQ_ADAPTIVE_PHASE2_RHO),
+         phase2_raw_expected,
+         phase2_expected_admit,
+         static_cast<int>(RABITQ_ADAPTIVE_BUFFER_BOUND),
+         adaptive_collect_capacity,
+         static_cast<int>(phase1_expected_admit <= adaptive_collect_capacity),
+         static_cast<int>(phase2_expected_admit <= adaptive_collect_capacity),
+         static_cast<double>(RABITQ_ADAPTIVE_RHO_MIN),
+         static_cast<double>(RABITQ_ADAPTIVE_RHO_MAX),
+         static_cast<int>(RABITQ_ADAPTIVE_TOP1_WARMUP_STALL_ITERS),
+         static_cast<int>(RABITQ_ADAPTIVE_SEARCH_USE_KTH_CUTOFF));
 #endif
 
   size_t num_threads = BLOCK_SIZE;
@@ -265,6 +289,24 @@ void QuantizationGraph::gpu_search_pruned(int nq, const float* queries, int K,
     std::cout << "total # pruned neighbors: " << total_stats[GPU_SEARCH_STAT_PRUNED] << "\n";
     std::cout << "average # pruned neighbors: "
               << static_cast<double>(total_stats[GPU_SEARCH_STAT_PRUNED]) / active_nq << "\n";
+    const double cycles_to_sec = prop.clockRate > 0 ? 1.0 / (static_cast<double>(prop.clockRate) * 1000.0) : 0.0;
+    const gpu_long_t loop_cycles = total_stats[GPU_SEARCH_STAT_LOOP_CYCLES];
+    const gpu_long_t exact_cycles = total_stats[GPU_SEARCH_STAT_EXACT_CYCLES];
+    const gpu_long_t est_cycles = total_stats[GPU_SEARCH_STAT_EST_CYCLES];
+    const gpu_long_t rq_stage_cycles = total_stats[GPU_SEARCH_STAT_RQ_STAGE_CYCLES];
+    const gpu_long_t eval_cycles = exact_cycles + est_cycles + rq_stage_cycles;
+    const gpu_long_t control_cycles = loop_cycles > eval_cycles ? loop_cycles - eval_cycles : 0;
+    std::cout << "gpu_section_loop_cycles: " << loop_cycles << "\n";
+    std::cout << "gpu_section_exact_cycles: " << exact_cycles << "\n";
+    std::cout << "gpu_section_est_cycles: " << est_cycles << "\n";
+    std::cout << "gpu_section_rq_stage_cycles: " << rq_stage_cycles << "\n";
+    std::cout << "gpu_section_control_cycles: " << control_cycles << "\n";
+#if GPU_RABITQ_PRUNED_SPEC_ADAPTIVE
+    std::cout << "AP total # search expansion steps: "
+              << total_stats[GPU_SEARCH_STAT_OUTER_EXPANSION_STEPS] << "\n";
+    std::cout << "AP average # search expansion steps: "
+              << static_cast<double>(total_stats[GPU_SEARCH_STAT_OUTER_EXPANSION_STEPS]) / active_nq << "\n";
+#endif
   }
   if (gpu_stats != nullptr) {
     gpu_stats->common.total_dc = static_cast<int64_t>(total_stats[GPU_SEARCH_STAT_DIST_CMPS]);
@@ -274,6 +316,18 @@ void QuantizationGraph::gpu_search_pruned(int nq, const float* queries, int K,
     gpu_stats->common.total_iter = static_cast<int64_t>(total_stats[GPU_SEARCH_STAT_ITERATIONS]);
     gpu_stats->common.total_pruned = static_cast<int64_t>(total_stats[GPU_SEARCH_STAT_PRUNED]);
     gpu_stats->common.time_search_total = elapsed;
+    const double cycles_to_sec = prop.clockRate > 0 ? 1.0 / (static_cast<double>(prop.clockRate) * 1000.0) : 0.0;
+    const gpu_long_t loop_cycles = total_stats[GPU_SEARCH_STAT_LOOP_CYCLES];
+    const gpu_long_t exact_cycles = total_stats[GPU_SEARCH_STAT_EXACT_CYCLES];
+    const gpu_long_t est_cycles = total_stats[GPU_SEARCH_STAT_EST_CYCLES];
+    const gpu_long_t rq_stage_cycles = total_stats[GPU_SEARCH_STAT_RQ_STAGE_CYCLES];
+    const gpu_long_t eval_cycles = exact_cycles + est_cycles + rq_stage_cycles;
+    const gpu_long_t control_cycles = loop_cycles > eval_cycles ? loop_cycles - eval_cycles : 0;
+    gpu_stats->common.time_queue_mgmt = static_cast<double>(loop_cycles) * cycles_to_sec;
+    gpu_stats->common.time_dist_comp = static_cast<double>(exact_cycles) * cycles_to_sec;
+    gpu_stats->common.time_dist_est = static_cast<double>(est_cycles) * cycles_to_sec;
+    gpu_stats->common.time_nbr_filter = static_cast<double>(rq_stage_cycles) * cycles_to_sec;
+    gpu_stats->common.time_pruning = static_cast<double>(control_cycles) * cycles_to_sec;
   }
 
   (void)result_vec;
