@@ -97,7 +97,8 @@ __device__ __forceinline__ void pathw_compute_candidates_with_signbit_pruning(
     uint32_t runtime_internal_topk,
     uint32_t& local_exact_count,
     uint32_t& local_est_count,
-    uint32_t& local_pruned_count) {
+    uint32_t& local_pruned_count,
+    bool use_ip) {
     for (uint32_t parent_idx = 0; parent_idx < num_expanders; ++parent_idx) {
         const INDEX_T parent_slot = parent_list[parent_idx];
         const INDEX_T current_node = internal_topk_list[parent_slot] & ~INDEX_MSB_1_MASK;
@@ -172,8 +173,8 @@ __device__ __forceinline__ void pathw_compute_candidates_with_signbit_pruning(
         const uint32_t i = in_range ? work / TEAM_WIDTH : 0;
         const INDEX_T child_id = in_range ? candidate_indices[i] : MAX_INDEX;
         const bool valid_child = in_range && child_id != MAX_INDEX;
-        DISTANCE_T dist = compute_similarity_vector_load_full<TEAM_WIDTH>(
-            dim, data, query, valid_child ? child_id : 0, valid_child);
+        DISTANCE_T dist = compute_metric_vector_load_full<TEAM_WIDTH>(
+            dim, data, query, valid_child ? child_id : 0, valid_child, use_ip);
         if (in_range && (work % TEAM_WIDTH) == 0) {
             candidate_distances[i] = valid_child ? dist : FLT_MAX;
             if (valid_child) local_exact_count++;
@@ -197,7 +198,8 @@ __device__ __forceinline__ void pathw_compute_candidates_plain(
     uint32_t graph_degree,
     uint32_t candidate_work_count,
     uint32_t candidate_buffer_size,
-    uint32_t& local_exact_count) {
+    uint32_t& local_exact_count,
+    bool use_ip) {
     // initialize the candidate buffer and filter out the visited ones
     for (uint32_t i = threadIdx.x; i < candidate_buffer_size; i += blockDim.x) {
         const bool in_work_range = i < candidate_work_count;
@@ -231,8 +233,8 @@ __device__ __forceinline__ void pathw_compute_candidates_plain(
         const uint32_t i = in_range ? work / TEAM_WIDTH : 0;
         const INDEX_T child_id = in_range ? candidate_indices[i] : MAX_INDEX;
         const bool valid_child = in_range && child_id != MAX_INDEX;
-        DISTANCE_T dist = compute_similarity_vector_load_full<TEAM_WIDTH>(
-            dim, data, query, valid_child ? child_id : 0, valid_child);
+        DISTANCE_T dist = compute_metric_vector_load_full<TEAM_WIDTH>(
+            dim, data, query, valid_child ? child_id : 0, valid_child, use_ip);
         if (in_range && (work % TEAM_WIDTH) == 0) {
             candidate_distances[i] = valid_child ? dist : FLT_MAX;
             if (valid_child) local_exact_count++;
@@ -250,7 +252,7 @@ void PathWBeamSearch(
     vid_t* __restrict__ d_results,
     gpu_long_t* d_total_stats,
     vid_t entry_point, GraphGPU<vid_t> gg,
-    float neighbor_keep_ratio, float iteration_prune_ratio)
+    float neighbor_keep_ratio, float iteration_prune_ratio, bool use_ip)
 {
     const int query_id = blockIdx.x;
     if (query_id >= nq || beam_sz <= 0) return;
@@ -391,7 +393,7 @@ void PathWBeamSearch(
                 gg, num_expanders[0], graph_degree, candidate_work_count,
                 candidate_buffer_size, sign_bit_vector_size, packed_dim,
                 neighbor_keep_ratio, logical_beam_size,
-                local_exact_count, local_est_count, local_pruned_count);
+                local_exact_count, local_est_count, local_pruned_count, use_ip);
         } else {
             pathw_compute_candidates_plain<T, TEAM_SIZE>(
                 dim, parent_list_buffer, result_indices_buffer,
@@ -399,7 +401,7 @@ void PathWBeamSearch(
                 result_distances_buffer + padded_beam_size, query_buffer, d_data,
                 visited_hash_buffer, bitlen, gg, num_expanders[0], graph_degree,
                 candidate_work_count, candidate_buffer_size,
-                local_exact_count);
+                local_exact_count, use_ip);
         }
         __syncthreads();
     }

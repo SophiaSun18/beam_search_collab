@@ -65,9 +65,6 @@ void IndexGraph<T>::search_pathw(int nq, const T* queries, int K, T* result_vec,
   auto bitlen = pathw_hash_bitlen_for_topk(padded_beam_size);
   const bool use_ip = (this->metric == METRIC_IP);
   const int active_nq = nq;
-  if (use_ip) {
-    throw std::runtime_error("GPU PathW currently supports L2 only");
-  }
   if (K > beam_size) {
     throw std::runtime_error("GPU PathW requires K <= beam_size");
   }
@@ -173,7 +170,7 @@ void IndexGraph<T>::search_pathw(int nq, const T* queries, int K, T* result_vec,
   PathWBeamSearch<T><<<num_blocks, num_threads, shm_size>>>(
       K, active_nq, dim, beam_size, bitlen, npoints, d_queries, d_data,
       d_sign_bit, d_results, d_total_stats, search_entry_point, gg, neighbor_keep_ratio,
-      iteration_prune_ratio);
+      iteration_prune_ratio, use_ip);
   CUDA_SAFE_CALL(cudaGetLastError());
   CUDA_SAFE_CALL(cudaDeviceSynchronize());
   auto end = std::chrono::high_resolution_clock::now();

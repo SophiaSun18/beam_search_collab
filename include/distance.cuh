@@ -81,6 +81,33 @@ __device__ DISTANCE_T compute_similarity_vector_load_full(
     return norm2;
 }
 
+template<uint32_t TEAM_SIZE>
+__device__ DISTANCE_T compute_metric_vector_load_full(
+    uint32_t dim,
+    const DATA_T* d_dataset_ptr,
+    const DATA_T* query_ptr,
+    INDEX_T child_id,
+    bool valid_child,
+    bool use_ip) {
+    if (!use_ip) {
+        return compute_similarity_vector_load_full<TEAM_SIZE>(
+            dim, d_dataset_ptr, query_ptr, child_id, valid_child);
+    }
+    unsigned lane_id = threadIdx.x % TEAM_SIZE;
+    unsigned int full_mask = 0xffffffff;
+    DISTANCE_T dot = 0;
+    if (valid_child) {
+        const DATA_T* child_data_ptr = d_dataset_ptr + static_cast<size_t>(child_id) * dim;
+        for (uint32_t k = lane_id; k < dim; k += TEAM_SIZE) {
+            dot += query_ptr[k] * child_data_ptr[k];
+        }
+    }
+    for (uint32_t offset = TEAM_SIZE / 2; offset > 0; offset >>= 1) {
+        dot += __shfl_xor_sync(full_mask, dot, offset);
+    }
+    return -dot;
+}
+
 template<uint32_t TEAM_SIZE, uint32_t RATIO = 2>
 __device__ DISTANCE_T compute_similarity_vector_load_partial(
     uint32_t dim,
