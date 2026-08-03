@@ -289,18 +289,6 @@ void QuantizationGraph::gpu_search_pruned(int nq, const float* queries, int K,
     std::cout << "total # pruned neighbors: " << total_stats[GPU_SEARCH_STAT_PRUNED] << "\n";
     std::cout << "average # pruned neighbors: "
               << static_cast<double>(total_stats[GPU_SEARCH_STAT_PRUNED]) / active_nq << "\n";
-    const double cycles_to_sec = prop.clockRate > 0 ? 1.0 / (static_cast<double>(prop.clockRate) * 1000.0) : 0.0;
-    const gpu_long_t loop_cycles = total_stats[GPU_SEARCH_STAT_LOOP_CYCLES];
-    const gpu_long_t exact_cycles = total_stats[GPU_SEARCH_STAT_EXACT_CYCLES];
-    const gpu_long_t est_cycles = total_stats[GPU_SEARCH_STAT_EST_CYCLES];
-    const gpu_long_t rq_stage_cycles = total_stats[GPU_SEARCH_STAT_RQ_STAGE_CYCLES];
-    const gpu_long_t eval_cycles = exact_cycles + est_cycles + rq_stage_cycles;
-    const gpu_long_t control_cycles = loop_cycles > eval_cycles ? loop_cycles - eval_cycles : 0;
-    std::cout << "gpu_section_loop_cycles: " << loop_cycles << "\n";
-    std::cout << "gpu_section_exact_cycles: " << exact_cycles << "\n";
-    std::cout << "gpu_section_est_cycles: " << est_cycles << "\n";
-    std::cout << "gpu_section_rq_stage_cycles: " << rq_stage_cycles << "\n";
-    std::cout << "gpu_section_control_cycles: " << control_cycles << "\n";
 #if GPU_RABITQ_PRUNED_SPEC_ADAPTIVE
     std::cout << "AP total # search expansion steps: "
               << total_stats[GPU_SEARCH_STAT_OUTER_EXPANSION_STEPS] << "\n";
@@ -316,18 +304,6 @@ void QuantizationGraph::gpu_search_pruned(int nq, const float* queries, int K,
     gpu_stats->common.total_iter = static_cast<int64_t>(total_stats[GPU_SEARCH_STAT_ITERATIONS]);
     gpu_stats->common.total_pruned = static_cast<int64_t>(total_stats[GPU_SEARCH_STAT_PRUNED]);
     gpu_stats->common.time_search_total = elapsed;
-    const double cycles_to_sec = prop.clockRate > 0 ? 1.0 / (static_cast<double>(prop.clockRate) * 1000.0) : 0.0;
-    const gpu_long_t loop_cycles = total_stats[GPU_SEARCH_STAT_LOOP_CYCLES];
-    const gpu_long_t exact_cycles = total_stats[GPU_SEARCH_STAT_EXACT_CYCLES];
-    const gpu_long_t est_cycles = total_stats[GPU_SEARCH_STAT_EST_CYCLES];
-    const gpu_long_t rq_stage_cycles = total_stats[GPU_SEARCH_STAT_RQ_STAGE_CYCLES];
-    const gpu_long_t eval_cycles = exact_cycles + est_cycles + rq_stage_cycles;
-    const gpu_long_t control_cycles = loop_cycles > eval_cycles ? loop_cycles - eval_cycles : 0;
-    gpu_stats->common.time_queue_mgmt = static_cast<double>(loop_cycles) * cycles_to_sec;
-    gpu_stats->common.time_dist_comp = static_cast<double>(exact_cycles) * cycles_to_sec;
-    gpu_stats->common.time_dist_est = static_cast<double>(est_cycles) * cycles_to_sec;
-    gpu_stats->common.time_nbr_filter = static_cast<double>(rq_stage_cycles) * cycles_to_sec;
-    gpu_stats->common.time_pruning = static_cast<double>(control_cycles) * cycles_to_sec;
   }
 
   (void)result_vec;
