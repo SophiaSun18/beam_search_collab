@@ -9,6 +9,7 @@
 
 #include <array>
 #include <cassert>
+#include <cfloat>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -308,12 +309,14 @@ inline void appro_dist_impl(
         __m512 fac_dq_v = _mm512_loadu_ps(&fac_dq[i]);
         __m512 fac_vq_v = _mm512_loadu_ps(&fac_vq[i]);
 
+        // SymQG marks zero residuals with FLT_MAX; their distance is the parent's.
+        const __mmask16 zero_residual = _mm512_cmp_ps_mask(tx_v, _mm512_set1_ps(FLT_MAX), _CMP_EQ_OQ);
         tx_v     = _mm512_add_ps(tx_v, sqr_y_v);
         fac_dq_v = _mm512_mul_ps(fac_dq_v, width_v);
         fac_dq_v = _mm512_mul_ps(fac_dq_v, res_v);
         fac_vq_v = _mm512_fmadd_ps(fac_vq_v, vl_v, tx_v);
 
-        _mm512_storeu_ps(&appro_dist[i], _mm512_add_ps(fac_dq_v, fac_vq_v));
+        _mm512_storeu_ps(&appro_dist[i], _mm512_mask_mov_ps(_mm512_add_ps(fac_dq_v, fac_vq_v), zero_residual, sqr_y_v));
     }
 
 #elif defined(__AVX2__)
@@ -327,6 +330,7 @@ inline void appro_dist_impl(
         __m256 fac_dq_v = _mm256_loadu_ps(&fac_dq[i]);
         __m256 fac_vq_v = _mm256_loadu_ps(&fac_vq[i]);
 
+        const __m256 zero_residual = _mm256_cmp_ps(tx_v, _mm256_set1_ps(FLT_MAX), _CMP_EQ_OQ);
         tx_v     = _mm256_add_ps(tx_v, sqr_y_v);
         fac_dq_v = _mm256_mul_ps(fac_dq_v, width_v);
         fac_dq_v = _mm256_mul_ps(fac_dq_v, res_v);
@@ -334,7 +338,7 @@ inline void appro_dist_impl(
 
         _mm256_storeu_ps(
             &appro_dist[i],
-            _mm256_add_ps(_mm256_add_ps(tx_v, fac_dq_v), fac_vq_v)
+            _mm256_blendv_ps(_mm256_add_ps(_mm256_add_ps(tx_v, fac_dq_v), fac_vq_v), sqr_y_v, zero_residual)
         );
     }
 

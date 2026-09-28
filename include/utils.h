@@ -465,7 +465,7 @@ inline float recall_at_k(const vector<int>& ann_result, const int* gt_ptr, int K
     unordered_set<int> ann_set(ann_result.begin(), ann_result.begin() + K);
 
     int hit = 0;
-    for (int i = 0; i < gt_k; i++) {
+    for (int i = 0; i < std::min(K, gt_k); i++) {
         if (ann_set.count(gt_ptr[i])) hit++;
     }
     return float(hit) / K;

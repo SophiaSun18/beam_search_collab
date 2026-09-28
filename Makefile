@@ -67,6 +67,10 @@ preprocess_rabitq: $(SRC_PREPROCESS_RABITQ)
 	$(CXX) $(CXXFLAGS) $^ -o $@
 	mv $@ $(BIN_DIR)/
 
+preprocess_rabitq_seq_lut: $(SRC_PREPROCESS_RABITQ)
+	$(CXX) $(CXXFLAGS) -DBEAM_SEARCH_FASTSCAN_ENABLED=0 -DPREPROCESS_RABITQ_SEQ_LUT_READY=1 $^ -o $@
+	mv $@ $(BIN_DIR)/
+
 prepare_pathw_signbit: $(SRC_PREPARE_PATHW_SIGNBIT)
 	$(CXX) $(CXXFLAGS) $^ -o $@
 	mv $@ $(BIN_DIR)/

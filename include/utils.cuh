@@ -1567,7 +1567,7 @@ static __device__ inline DISTANCE_T estimate_one_neighbor_warp_no_lut_gpu(const 
   const int tid = threadIdx.x;
   const int lane_id = tid % WARP_SIZE;
 
-  if (triple_x == FLT_MAX) return 0.0f;
+  if (triple_x == FLT_MAX) return exact_dist;
 
   int32_t local_sum = 0;
   for (int word = 0; word < padded_dim_ / 64; ++word) {
@@ -1767,7 +1767,7 @@ static __device__ inline void scan_all_neighbors_32_gpu(
   const int lane_id = threadIdx.x & (WARP_SIZE - 1);
   if (lane_id >= active_neighbors) return;
   if (triple_x[lane_id] == FLT_MAX) {
-    appro_dist[lane_id] = 0.0f;
+    appro_dist[lane_id] = exact_dist;
     return;
   }
 
@@ -1797,7 +1797,8 @@ static __device__ inline DISTANCE_T scan_one_neighbor_lanes_gpu(
                 "LANES_PER_NEIGHBOR must be one of 2, 4, 8, 16, or 32");
   const float triple_x_value = triple_x[0];
   if (triple_x_value == FLT_MAX)
-    return 0.0f;
+    // SymQG's zero-residual sentinel denotes a vector identical to the parent.
+    return exact_dist;
 
   const int lane_id = threadIdx.x & (WARP_SIZE - 1);
   const int group_lane = lane_id & (LANES_PER_NEIGHBOR - 1);
@@ -1850,7 +1851,7 @@ static __device__ inline DISTANCE_T scan_one_neighbor_fastscan_lut_lanes_gpu(
                     LANES_PER_NEIGHBOR == 32,
                 "LANES_PER_NEIGHBOR must be one of 2, 4, 8, 16, or 32");
   const float triple_x_value = triple_x[0];
-  if (triple_x_value == FLT_MAX) return FLT_MAX;
+  if (triple_x_value == FLT_MAX) return exact_dist;
 
   const int lane_id = threadIdx.x & (WARP_SIZE - 1);
   const int group_lane = lane_id & (LANES_PER_NEIGHBOR - 1);
@@ -1939,7 +1940,7 @@ static __device__ inline DISTANCE_T scan_one_neighbor_lane_seq_lut_gpu(
     const QueryFactors &qf, const uint8_t *parent_code_base, int neighbor_idx,
     float triple_x, float factor_dq, float factor_vq,
     float exact_dist, int padded_dim, int bytes_per_neighbor) {
-  if (triple_x == FLT_MAX) return FLT_MAX;
+  if (triple_x == FLT_MAX) return exact_dist;
 
   constexpr int lut_layout_neighbors = WARP_SIZE / GPU_RABITQ_FASTSCAN_SEQ_LUT_LAYOUT_LANES;
   const uint8_t *seq_lut_tile = parent_code_base;

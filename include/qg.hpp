@@ -19,7 +19,10 @@
 #include "../include/fastscan_impl.hpp"
 #endif
 
-static constexpr bool FASTSCAN_ENABLED = true;
+#ifndef BEAM_SEARCH_FASTSCAN_ENABLED
+#define BEAM_SEARCH_FASTSCAN_ENABLED 1
+#endif
+static constexpr bool FASTSCAN_ENABLED = (BEAM_SEARCH_FASTSCAN_ENABLED != 0);
 static constexpr bool HUGE_PAGE_ENABLED = false;
 
 class QuantizationGraph {
@@ -197,7 +200,8 @@ public:
     }
 
     float estimated_distance(const QueryFactors& qf, const NeighborFactors& nf, float exact_dist) const {
-        if (nf.triple_x == FLT_MAX) return 0.0f;
+        // A zero-residual neighbor has the same exact query distance as its parent.
+        if (nf.triple_x == FLT_MAX) return exact_dist;
         
         int32_t raw_sum = 0;
         const uint8_t* q = qf.quantized_query;
