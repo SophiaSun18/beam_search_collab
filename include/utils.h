@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <iomanip>
+#include <limits>
 #include <omp.h>
 
 #include "metric.hpp"

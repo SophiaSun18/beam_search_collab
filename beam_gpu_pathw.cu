@@ -134,7 +134,10 @@ void IndexGraph<T>::search_pathw(int nq, const T* queries, int K, T* result_vec,
   }
 
   CUDA_SAFE_CALL(cudaMalloc((void**)&d_queries, query_bytes));
+  const auto query_load_start = std::chrono::high_resolution_clock::now();
   CUDA_SAFE_CALL(cudaMemcpy(d_queries, queries, query_bytes, cudaMemcpyHostToDevice));
+  const auto query_load_end = std::chrono::high_resolution_clock::now();
+  printf("Query H2D time: %.6f ms\n", std::chrono::duration<double, std::milli>(query_load_end - query_load_start).count());
   CUDA_SAFE_CALL(cudaMalloc((void**)&d_data, data_bytes));
   CUDA_SAFE_CALL(cudaMemcpy(d_data, h_data, data_bytes, cudaMemcpyHostToDevice));
   CUDA_SAFE_CALL(cudaMalloc((void**)&d_results, result_bytes));

@@ -101,9 +101,6 @@ void QuantizedBeamSearch(
     const uint32_t candidate_buffer_size = round_up_power2_u32(candidate_work_count);
     const uint32_t logical_beam_size = static_cast<uint32_t>(beam_sz);
     const uint32_t padded_beam_size = gpu_effective_sort_beam_size(logical_beam_size);
-    constexpr unsigned candidate_sort_items_per_thread =
-        (SEARCH_WIDTH <= 1) ? 1 : ((SEARCH_WIDTH <= 2) ? 2 : 4);
-
     // initialize the shared memory
     extern __shared__ char shared_memory[];
     INDEX_T* ALL_INDEX = (INDEX_T*)shared_memory;
@@ -233,7 +230,7 @@ void QuantizedBeamSearch(
         // }
         // __syncthreads();
 
-        dispatch_topk_by_sort_candidates_and_merge<candidate_sort_items_per_thread>(
+        dispatch_topk_by_sort_candidates_and_merge_runtime(
             ALL_INDEX, ALL_DISTANCE, MERGED_TOPK_INDEX, MERGED_TOPK_DISTANCE,
             result_buffer_size, candidate_buffer_size, padded_beam_size, (iter == 0));
         __syncthreads();
@@ -407,9 +404,8 @@ void QuantizedBeamSearch(
                     if (lane_id < active_neighbors) {
                         const uint32_t candidate_idx = candidate_base_in_batch + static_cast<uint32_t>(lane_id);
                         const bool invalid_candidate = CANDIDATE_INDEX[candidate_idx] == MAX_INDEX;
-                        const bool invalid_factor = triple_x[lane_id] == FLT_MAX;
                         const bool invalid_distance = !isfinite(CANDIDATE_DISTANCE[candidate_idx]);
-                        if (invalid_candidate || invalid_factor || invalid_distance) {
+                        if (invalid_candidate || invalid_distance) {
                             CANDIDATE_DISTANCE[candidate_idx] = FLT_MAX;
                         }
                     }
@@ -544,7 +540,7 @@ void QuantizedBeamSearch(
     }
 
     // final sort before writeback
-    dispatch_topk_by_sort_candidates_and_merge<candidate_sort_items_per_thread>(
+    dispatch_topk_by_sort_candidates_and_merge_runtime(
         ALL_INDEX, ALL_DISTANCE, MERGED_TOPK_INDEX, MERGED_TOPK_DISTANCE,
         result_buffer_size, candidate_buffer_size, padded_beam_size, false);
     __syncthreads();
@@ -642,8 +638,7 @@ void QuantizedBeamSearch(
             if (i < static_cast<int>(pool_size)) {
                 d_results[query_id * K + i] = RESULT_POOL_INDEX[i];
             } else {
-                // if there's not enough value in result pool, fill the rest with other top K
-                d_results[query_id * K + i] = TOP_K_INDEX[i] & 0x7fffffff;
+                d_results[query_id * K + i] = MAX_INDEX;
             }
         }
     }

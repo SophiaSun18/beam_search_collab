@@ -94,7 +94,10 @@ void QuantizationGraph::gpu_search(int nq, const float* queries, int K, float* r
   }
 
   CUDA_SAFE_CALL(cudaMalloc((void**)&d_queries, static_cast<size_t>(active_nq) * dim * sizeof(float)));
+  const auto query_load_start = std::chrono::high_resolution_clock::now();
   CUDA_SAFE_CALL(cudaMemcpy(d_queries, queries, static_cast<size_t>(active_nq) * dim * sizeof(float), cudaMemcpyHostToDevice));
+  const auto query_load_end = std::chrono::high_resolution_clock::now();
+  printf("Query H2D time: %.6f ms\n", std::chrono::duration<double, std::milli>(query_load_end - query_load_start).count());
   CUDA_SAFE_CALL(cudaMalloc((void**)&d_qg_data, qg_data_bytes));
   CUDA_SAFE_CALL(cudaMemcpy(d_qg_data, this->get_data_ptr(), qg_data_bytes, cudaMemcpyHostToDevice));
   CUDA_SAFE_CALL(cudaMalloc((void**)&d_qg_signs, qg_signs_bytes));
