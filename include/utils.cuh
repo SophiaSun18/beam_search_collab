@@ -1224,6 +1224,32 @@ __host__ __device__ inline uint32_t hashtable_getsize(const uint32_t bitlen) {
   return 1 << bitlen;
 }
 
+// visited hash bit length for a search shape, ported from FlashGANN include/hash_table.cuh: a reset window holds the
+// restored beam plus candidate_buffer_size new ids per iteration for reset_interval iterations
+__host__ __device__ inline uint32_t hash_bitlen_for_search_workload(
+    uint32_t beam_size, uint32_t candidate_buffer_size, uint32_t reset_interval) {
+  // calibrated shape (beam 32 to 1024, 32 candidates, reset every 16 iterations): 1024 or 2048 slots
+  if (beam_size >= 32u && beam_size <= 1024u &&
+      candidate_buffer_size == 32u && reset_interval == 16u) {
+    return beam_size <= 512u ? 10u : 11u;
+  }
+
+  // other shapes: fit beam_size + candidate_buffer_size * reset_interval keys at load factor at most 3/4
+  const uint64_t required64 = static_cast<uint64_t>(beam_size) + static_cast<uint64_t>(candidate_buffer_size) * reset_interval;
+  const uint32_t required = required64 > 0xffffffffull ? 0xffffffffu : static_cast<uint32_t>(required64);
+  uint32_t target_capacity = (required * 4u + 2u) / 3u;
+  uint32_t capacity = 1u << 8;  // FlashGANN's GPU_HASH_BASE_BITLEN
+  while (capacity < target_capacity) {
+    capacity <<= 1;
+  }
+
+  uint32_t bitlen = 0;
+  while ((1u << bitlen) < capacity) {
+    ++bitlen;
+  }
+  return bitlen;
+}
+
 __device__ inline void hashtable_init(INDEX_T* const table, const unsigned bitlen, unsigned FIRST_TID = 0) {
   if (threadIdx.x < FIRST_TID) return;
   for (uint32_t i = threadIdx.x - FIRST_TID; i < hashtable_getsize(bitlen); i += blockDim.x - FIRST_TID) {
@@ -1400,7 +1426,18 @@ static __device__ GPU_RABITQ_SEARCH_INLINE_ATTR void result_pool_push_unique_uns
     int capacity,
     INDEX_T node,
     DISTANCE_T distance) {
+  if (node == MAX_INDEX || !isfinite(distance)) return;
+
   uint32_t size = *pool_size;
+  for (uint32_t i = 0; i < size; ++i) {
+    if (pool_index[i] == node) {
+      if (distance < pool_distance[i]) {
+        pool_distance[i] = distance;
+        result_pool_recompute_worst(pool_distance, size, worst_idx, worst_dist);
+      }
+      return;
+    }
+  }
 
   if (size < static_cast<uint32_t>(capacity)) {
     pool_index[size] = node;

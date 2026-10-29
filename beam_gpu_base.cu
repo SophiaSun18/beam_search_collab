@@ -44,15 +44,20 @@ void IndexGraph<T>::search(int nq, const T* queries, int K, T *result_vec, vid_t
   auto max_degree = this->maxDeg;
   auto beam_size = beam_sz;
   auto padded_beam_size = static_cast<int>(gpu_effective_sort_beam_size(static_cast<uint32_t>(beam_size)));
-  auto bitlen = GPU_HASH_BITLEN_FOR_TOPK(padded_beam_size);
   const bool use_ip = (this->metric == METRIC_IP);
   printf("Beam search on GPU: K=%d, nq=%d, dim=%d, npoints=%ld, beam_size=%d, padded_beam_size=%d, internal_topk=%d\n",
          K, nq, dim, npoints, beam_size, padded_beam_size, INTERNAL_TOPK);
   printf("Metric: %s\n", metric_name(this->metric));
   const size_t candidate_work_count = static_cast<size_t>(SEARCH_WIDTH) * max_degree;
   const size_t candidate_buffer_size = round_up_power2_u32(candidate_work_count);
-  printf("GPU base speculation: search_width=%d, candidate_work_count=%zu, candidate_buffer_size=%zu\n",
-         SEARCH_WIDTH, candidate_work_count, candidate_buffer_size);
+  // size the visited hash for the beam plus every neighbor of SEARCH_WIDTH parents over one reset window, so a full
+  // table never drops unvisited neighbors as visited
+  auto bitlen = hash_bitlen_for_search_workload(static_cast<uint32_t>(padded_beam_size),
+                                                static_cast<uint32_t>(candidate_work_count), BASE_HASH_RESET_INTERVAL);
+  printf("GPU base speculation: search_width=%d, candidate_work_count=%zu, candidate_buffer_size=%zu, hash_bitlen=%u, "
+         "hash_reset_interval=%d\n",
+         SEARCH_WIDTH, candidate_work_count, candidate_buffer_size, static_cast<unsigned>(bitlen),
+         static_cast<int>(BASE_HASH_RESET_INTERVAL));
 
   size_t num_threads = BLOCK_SIZE;
   size_t num_blocks = nq;
@@ -126,6 +131,8 @@ void IndexGraph<T>::search(int nq, const T* queries, int K, T *result_vec, vid_t
     CUDA_SAFE_CALL(cudaMemcpy(d_sign_bit, h_sign_bit, sign_bit_size * sizeof(uint32_t), cudaMemcpyHostToDevice));
   }
 
+  // the theta-sized visited hash can take the block past the 48 KB default dynamic shared memory
+  CUDA_SAFE_CALL(cudaFuncSetAttribute(BeamSearch<T>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(shm_size)));
   cudaError_t err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
       &numBlocksPerSM, BeamSearch<T>, blockSize, shm_size);
   if (err != cudaSuccess) {

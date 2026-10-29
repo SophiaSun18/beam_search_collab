@@ -13,6 +13,13 @@
 #define PRUNE_CONFIG    0
 #define THRESHOLD_CONFIG    0
 #define HASH_TABLE_CONFIG   1
+// iterations between visited-hash resets: SMALL_HASH_RESET_INTERVAL / SEARCH_WIDTH, so a reset window inserts about as
+// many neighbors as theta 1 does and the hash keeps theta 1's size (and occupancy); -DBASE_HASH_RESET_INTERVAL=16 keeps
+// the fixed interval with a theta-sized hash instead
+#ifndef BASE_HASH_RESET_INTERVAL
+#define BASE_HASH_RESET_INTERVAL \
+    ((SMALL_HASH_RESET_INTERVAL / SEARCH_WIDTH) > 0 ? (SMALL_HASH_RESET_INTERVAL / SEARCH_WIDTH) : 1)
+#endif
 
 static __host__ inline uint32_t calculate_shared_mem_size(int dim, int beam_sz, int max_deg,
                                                            int search_width, int bitlen) {
@@ -41,6 +48,19 @@ static __global__ void init_identity_map(size_t n, vid_t* map) {
 
 static inline std::vector<uint32_t> load_sign_bit(const char* filename) {
     return std::vector<uint32_t>();
+}
+
+// barrier over the first `threads` threads of the block, ported from FlashGANN src/adaptive_search_utils.cuh
+static __device__ __forceinline__ void namedsync(int id, int threads) {
+    asm volatile("bar.sync %0, %1;" :: "r"(id), "r"(threads) : "memory");
+}
+
+// candidate slots to sort, ported from FlashGANN src/adaptive_search.cuh: one warp tile (32) or two (64) when the
+// compacted candidates fit, else the whole buffer
+static __device__ __forceinline__ uint32_t sortwidth(uint32_t buffer, uint32_t live) {
+    if (live <= WARP_SIZE) return buffer < WARP_SIZE ? buffer : WARP_SIZE;
+    if (live <= 2 * WARP_SIZE && buffer > 2 * WARP_SIZE) return 2 * WARP_SIZE;
+    return buffer;
 }
 
 template <typename T>
@@ -92,10 +112,12 @@ void BeamSearch(
 
     // initialize the block-wise total distance computation count
     __shared__ uint32_t keep_expanding;
+    __shared__ uint32_t compact_count;     // unvisited candidates written to the front of the candidate buffer
     __shared__ uint32_t warp_exact_counts[WARPS_PER_BLOCK];
     uint32_t local_exact_count = 0;
     if (tid == 0) {
         hops[0] = 0;
+        compact_count = candidate_buffer_size;     // the first merge sorts the whole starting-point buffer
         if (GPU_SEARCH_STATS) {
             for (int i = 0; i < GPU_SEARCH_STAT_COUNT; i++) {
                 stats[i] = 0;
@@ -141,33 +163,36 @@ void BeamSearch(
     // loop end condition: either entire topK expanded, or reach max iteration limit
     for (int iter = 0; iter < MAX_ITERATIONS; iter++) {
 
-        // forgettable hash table management according to the CARGA paper
-        if (HASH_TABLE_CONFIG) {
-            if ((iter + 1) % SMALL_HASH_RESET_INTERVAL == 0) {
-                hashtable_init(HASH_TABLE, bitlen);
-                __syncthreads();
-                hashtable_restore(HASH_TABLE, bitlen, TOP_K_INDEX, logical_beam_size);
-            }
-            __syncthreads();
-        }
-
-        // use warp level sort to find the actual closest top K elements and update the topK list
+        // use warp level sort to find the actual closest top K elements and update the topK list; only the slots
+        // the compacted candidates need are sorted
+        const uint32_t sort_width = sortwidth(candidate_buffer_size, compact_count);
         dispatch_topk_by_sort_candidates_and_merge_runtime(
             ALL_INDEX, ALL_DISTANCE, MERGED_TOPK_INDEX, MERGED_TOPK_DISTANCE,
-            result_buffer_size, candidate_buffer_size, padded_beam_size, (iter == 0));
+            padded_beam_size + sort_width, sort_width, padded_beam_size, (iter == 0));
         __syncthreads();
 
+        // clear the beam tail and the merged candidates, so no candidate is merged twice
         for (uint32_t i = logical_beam_size + tid; i < padded_beam_size; i += blockDim.x) {
             TOP_K_INDEX[i] = MAX_INDEX;
             TOP_K_DISTANCE[i] = FLT_MAX;
         }
+        for (uint32_t i = tid; i < candidate_buffer_size; i += blockDim.x) {
+            CANDIDATE_INDEX[i] = MAX_INDEX;
+            CANDIDATE_DISTANCE[i] = FLT_MAX;
+        }
         __syncthreads();
-
 
         // warp 0 pick the top-N unexpanded nodes and store in shared memory
         // this already marks the expanded nodes MSB to 1, no need to mark again
+        // meanwhile the other warps reset the visited hash (forgettable hash, CAGRA) and restore the merged beam,
+        // as FlashGANN does, so every beam id stays visited and is never inserted into the beam twice
         if (warp_id == 0) {
             keep_expanding = pick_expanders(SEARCH_WIDTH, PARENT_LIST, logical_beam_size, TOP_K_INDEX);
+            if (lane_id == 0) compact_count = 0;
+        } else if (HASH_TABLE_CONFIG && (iter + 1) % BASE_HASH_RESET_INTERVAL == 0) {
+            hashtable_init(HASH_TABLE, bitlen, WARP_SIZE);
+            namedsync(1, BLOCK_SIZE - WARP_SIZE);
+            hashtable_restore(HASH_TABLE, bitlen, TOP_K_INDEX, logical_beam_size, WARP_SIZE);
         }
         __syncthreads();
         if (!keep_expanding) {
@@ -180,37 +205,23 @@ void BeamSearch(
             stats[GPU_SEARCH_STAT_ITERATIONS] += keep_expanding;
         }
 
-        // collect the neighbors of the expanding nodes and add into candidate list if not visited before
-        // make sure to mark the invalid neighbor using dummy large values
-    for (int i = tid; i < candidate_buffer_size; i += blockDim.x) {
-        const bool in_work = static_cast<uint32_t>(i) < static_cast<uint32_t>(SEARCH_WIDTH) * maxDegree;
-        const uint32_t parent_idx = in_work ? static_cast<uint32_t>(i) / maxDegree : 0;
-        const uint32_t neighbor_idx = in_work ? static_cast<uint32_t>(i) - parent_idx * maxDegree : 0;
-        INDEX_T child_id = MAX_INDEX;
-        if (in_work && parent_idx < keep_expanding) {
+        // collect the neighbors of the expanding nodes; a neighbor not visited before is appended to the front of
+        // the candidate buffer (compaction), the rest of the buffer stays invalid
+        const uint32_t work_count = keep_expanding * maxDegree;
+        for (uint32_t i = tid; i < work_count; i += blockDim.x) {
+            const uint32_t parent_idx = i / maxDegree;
+            const uint32_t neighbor_idx = i - parent_idx * maxDegree;
             const INDEX_T current_node = TOP_K_INDEX[PARENT_LIST[parent_idx]] & 0x7fffffffu;
-            const vid_t* neighbors = gg.N(current_node);
-            child_id = neighbors[neighbor_idx];
-        }
-
-            if (child_id != MAX_INDEX) {    // check if visited already
-                if (hashtable_insert(HASH_TABLE, bitlen, child_id) == 0) {
-                    child_id = MAX_INDEX;
-                    CANDIDATE_DISTANCE[i] = FLT_MAX;
-                } else {
-                    CANDIDATE_DISTANCE[i] = 0;
-                }
+            const INDEX_T child_id = gg.N(current_node)[neighbor_idx];
+            if (child_id != MAX_INDEX && hashtable_insert(HASH_TABLE, bitlen, child_id)) {
+                CANDIDATE_INDEX[atomicAdd(&compact_count, 1u)] = child_id;
             }
-            CANDIDATE_INDEX[i] = child_id;
         }
         __syncthreads();
 
         // all warps work together to compute candidate distance
-        for (int i = warp_id; i < candidate_buffer_size; i += WARPS_PER_BLOCK) {
-            // visited candidates are marked as invalid
-            if (CANDIDATE_INDEX[i] == MAX_INDEX) continue;
-
-            // if current node is new in hash table, compute and store its distance
+        for (int i = warp_id; i < static_cast<int>(compact_count); i += WARPS_PER_BLOCK) {
+            // compute and store the distance of each new candidate
             DISTANCE_T dist = warp_distance(dim, QUERY_BUFFER, d_data + CANDIDATE_INDEX[i] * dim, use_ip);
             if (lane_id == 0) {
                 if (GPU_SEARCH_STATS) local_exact_count++;
@@ -220,10 +231,13 @@ void BeamSearch(
         __syncthreads();
     }
 
-    // final sort before writeback
-    dispatch_topk_by_sort_candidates_and_merge_runtime(
-        ALL_INDEX, ALL_DISTANCE, MERGED_TOPK_INDEX, MERGED_TOPK_DISTANCE,
-        result_buffer_size, candidate_buffer_size, padded_beam_size, false);
+    // final sort before writeback; a loop that ran out of parents already merged and cleared its candidates
+    if (keep_expanding) {
+        const uint32_t sort_width = sortwidth(candidate_buffer_size, compact_count);
+        dispatch_topk_by_sort_candidates_and_merge_runtime(
+            ALL_INDEX, ALL_DISTANCE, MERGED_TOPK_INDEX, MERGED_TOPK_DISTANCE,
+            padded_beam_size + sort_width, sort_width, padded_beam_size, false);
+    }
     __syncthreads();
 
     // return the top K result
